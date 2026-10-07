@@ -220,7 +220,11 @@ public class TestDeviceMergeOnRead {
       }
     }
 
-    assertScanMatches(DeviceMergeOnReadScan.of(table), expectedByK, expectedAll, expectedRows);
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      assertScanMatches(device, expectedByK, expectedAll, expectedRows);
+      // Again on the same scan, which reuses its device buffers and plans.
+      assertScanMatches(device, expectedByK, expectedAll, expectedRows);
+    }
     assertScanMatches(CpuMergeOnReadScan.of(table, 4), expectedByK, expectedAll, expectedRows);
   }
 

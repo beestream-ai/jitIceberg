@@ -32,8 +32,8 @@ public interface MergeOnReadScan {
   AggregateResult aggregate(String groupColumn, String... sumColumns);
 
   /**
-   * {@code SELECT columns} over the live rows, handed over one data file at a time. The rows are
-   * only valid during the call.
+   * {@code SELECT columns} over the live rows, handed over a batch of data files at a time. The
+   * rows are only valid during the call, and the consumer may be called from several threads.
    *
    * @return the number of live rows
    */

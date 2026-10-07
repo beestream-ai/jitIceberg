@@ -92,8 +92,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    */
   private static final long BATCH_ROWS = Long.getLong("iceberg.tornadovm.batch-rows", 8_000_000L);
 
+  /**
+   * Batches in flight at once, each in its own region -- its own buffers, plan and CUDA stream --
+   * so that one batch's file reads and host-to-device copies overlap another's decoding.
+   */
+  private static final int STREAMS = Integer.getInteger("iceberg.tornadovm.streams", 3);
+
   private final Table table;
-  private final Map<String, Region> regions = Maps.newHashMap();
+  private final Map<String, List<Region>> regions = Maps.newHashMap();
   private ScanMetrics metrics = new ScanMetrics();
 
   private DeviceMergeOnReadScan(Table table) {
@@ -122,7 +128,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   @Override
   public void close() {
-    regions.values().forEach(Region::close);
+    regions.values().forEach(list -> list.forEach(Region::close));
     regions.clear();
   }
 
@@ -149,13 +155,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       throw new UnsupportedOperationException("The sum columns must be distinct DOUBLE columns");
     }
     String key = "aggregate:" + groupColumn + ":" + String.join(",", sumColumns);
-    AggregateRegion region =
-        (AggregateRegion)
-            reuse(key, planned, () -> new AggregateRegion(planned, groupColumn, sumColumns));
+    List<Region> streams =
+        reuse(key, planned, () -> new AggregateRegion(planned, groupColumn, sumColumns));
     metrics.plan((System.nanoTime() - start) / 1e6);
 
     AggregateResult result = new AggregateResult(sumColumns.length);
-    region.run(planned, executed -> region.collect(executed, result));
+    run(
+        streams,
+        planned,
+        (region, executed) -> ((AggregateRegion) region).collect(executed, result));
     metrics.total((System.nanoTime() - start) / 1e6);
     return result;
   }
@@ -166,26 +174,91 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     long start = System.nanoTime();
     Planned planned = new Planned(null, columns);
     String key = "materialize:" + String.join(",", columns);
-    MaterializeRegion region =
-        (MaterializeRegion) reuse(key, planned, () -> new MaterializeRegion(planned));
+    List<Region> streams = reuse(key, planned, () -> new MaterializeRegion(planned));
     metrics.plan((System.nanoTime() - start) / 1e6);
-    long live = region.run(planned, executed -> region.collect(executed, consumer));
+    long live =
+        run(
+            streams,
+            planned,
+            (region, executed) -> ((MaterializeRegion) region).collect(executed, consumer));
     metrics.total((System.nanoTime() - start) / 1e6);
     return live;
   }
 
-  /** The region kept for a query shape, rebuilt when this scan outgrows it. */
-  private Region reuse(String key, Planned planned, java.util.function.Supplier<Region> create) {
-    Region region = regions.get(key);
-    if (region != null && region.fits(planned)) {
-      return region;
+  /** The regions kept for a query shape, one a stream, rebuilt when this scan outgrows them. */
+  private List<Region> reuse(
+      String key, Planned planned, java.util.function.Supplier<Region> create) {
+    List<Region> kept = regions.get(key);
+    if (kept != null && kept.get(0).fits(planned)) {
+      return kept;
     }
-    if (region != null) {
-      region.close();
+    if (kept != null) {
+      kept.forEach(Region::close);
     }
-    region = create.get();
-    regions.put(key, region);
-    return region;
+    int streams = Math.max(1, Math.min(STREAMS, planned.batches.size()));
+    List<Region> created = Lists.newArrayList();
+    for (int i = 0; i < streams; i++) {
+      created.add(create.get());
+    }
+    regions.put(key, created);
+    return created;
+  }
+
+  /**
+   * Runs every batch of a query on the given regions, one thread a region taking the next batch as
+   * it finishes one; {@code perBatch} returns the live rows a batch had. Host preparation of every
+   * batch is started up front on its own pool.
+   */
+  private long run(
+      List<Region> streams,
+      Planned planned,
+      java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch) {
+    ExecutorService hostPool = Executors.newFixedThreadPool(HOST_THREADS);
+    java.util.concurrent.atomic.AtomicInteger next =
+        new java.util.concurrent.atomic.AtomicInteger();
+    java.util.concurrent.atomic.AtomicLong liveRows = new java.util.concurrent.atomic.AtomicLong();
+    try {
+      List<CompletableFuture<HostDeletes.FilePrep>> preps = Lists.newArrayList();
+      for (List<FileScanTask> batch : planned.batches) {
+        preps.add(CompletableFuture.supplyAsync(() -> planned.host.prepare(batch), hostPool));
+      }
+      List<java.util.concurrent.Future<?>> workers = Lists.newArrayList();
+      for (Region region : streams) {
+        workers.add(
+            region.thread.submit(
+                () -> {
+                  TornadoExecutionPlan executionPlan = region.plan();
+                  for (int i = next.getAndIncrement();
+                      i < preps.size();
+                      i = next.getAndIncrement()) {
+                    HostDeletes.FilePrep prep = preps.get(i).join();
+                    metrics.deleteLoad(prep.hostNanos() / 1e6);
+                    region.stage(executionPlan, prep, planned.keyNullable);
+                    long deviceStart = System.nanoTime();
+                    TornadoExecutionResult executed = executionPlan.execute();
+                    long copyStart = System.nanoTime();
+                    long rows = perBatch.applyAsLong(region, executed);
+                    long end = System.nanoTime();
+                    metrics.device((copyStart - deviceStart) / 1e6);
+                    metrics.copyBack((end - copyStart) / 1e6);
+                    metrics.batch(prep.rows(), prep.files());
+                    metrics.live(rows);
+                    liveRows.addAndGet(rows);
+                  }
+                }));
+      }
+      for (java.util.concurrent.Future<?> worker : workers) {
+        worker.get();
+      }
+    } catch (java.util.concurrent.ExecutionException e) {
+      throw new IllegalStateException("Device scan failed", e.getCause());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(e);
+    } finally {
+      hostPool.shutdownNow();
+    }
+    return liveRows.get();
   }
 
   /** One query's planning: Iceberg's file tasks, grouped into device batches, and their sizes. */
@@ -284,7 +357,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * The device buffers, host holders and execution plan of one query shape: read, delete
    * application and live-row kernel, which every shape shares, plus what the shape adds.
    */
-  private abstract class Region implements AutoCloseable {
+  private abstract static class Region implements AutoCloseable {
     final String signature;
     final ScanLayout layout;
     final Integer equalityKeyId;
@@ -320,6 +393,20 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     private TornadoExecutionPlan plan;
     private String setOnDevice;
+
+    /**
+     * The one thread that builds, runs and closes this region's plan. TornadoVM keys its CUDA
+     * streams by plan and thread, but caches a library's context -- and with it the stream cuDF
+     * runs on -- by plan alone; a plan run from a second thread would put its copies and kernels on
+     * one stream and its cuDF calls on another, with nothing ordering the two.
+     */
+    final ExecutorService thread =
+        Executors.newSingleThreadExecutor(
+            runnable -> {
+              Thread worker = new Thread(runnable, "tornadovm-region");
+              worker.setDaemon(true);
+              return worker;
+            });
 
     Region(Planned planned) {
       this.signature = planned.signature();
@@ -363,7 +450,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     /** What this shape adds after the live-row kernel. */
     abstract void consumer(TaskGraph graph);
 
-    private TornadoExecutionPlan plan() {
+    TornadoExecutionPlan plan() {
       if (plan == null) {
         TaskGraph graph = shared();
         consumer(graph);
@@ -467,40 +554,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       return graph;
     }
 
-    /** Runs every batch of a query; {@code perBatch} returns the live rows a batch had. */
-    long run(Planned planned, java.util.function.ToLongFunction<TornadoExecutionResult> perBatch) {
-      TornadoExecutionPlan executionPlan = plan();
-      ExecutorService pool = Executors.newFixedThreadPool(HOST_THREADS);
-      long liveRows = 0;
-      try {
-        List<CompletableFuture<HostDeletes.FilePrep>> preps = Lists.newArrayList();
-        for (List<FileScanTask> batch : planned.batches) {
-          preps.add(CompletableFuture.supplyAsync(() -> planned.host.prepare(batch), pool));
-        }
-        for (CompletableFuture<HostDeletes.FilePrep> future : preps) {
-          HostDeletes.FilePrep prep = future.join();
-          metrics.deleteLoad(prep.hostNanos() / 1e6);
-          stage(executionPlan, prep, planned.keyNullable);
-          long deviceStart = System.nanoTime();
-          TornadoExecutionResult executed = executionPlan.execute();
-          long copyStart = System.nanoTime();
-          long rows = perBatch.applyAsLong(executed);
-          long end = System.nanoTime();
-          metrics.device((copyStart - deviceStart) / 1e6);
-          metrics.copyBack((end - copyStart) / 1e6);
-          metrics.batch(prep.rows(), prep.files());
-          metrics.live(rows);
-          liveRows += rows;
-        }
-      } finally {
-        pool.shutdownNow();
-      }
-      return liveRows;
-    }
-
     /** Points the plan's holders and small inputs at one batch. */
-    private void stage(
-        TornadoExecutionPlan executionPlan, HostDeletes.FilePrep prep, boolean keyNullable) {
+    void stage(TornadoExecutionPlan executionPlan, HostDeletes.FilePrep prep, boolean keyNullable) {
       path.setLength(0);
       path.append(prep.path());
       rowsHolder[0] = prep.rows();
@@ -567,13 +622,27 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     @Override
     public void close() {
-      if (plan != null) {
-        try {
-          plan.close();
-        } catch (TornadoExecutionPlanException e) {
-          throw new IllegalStateException(e);
-        }
-        plan = null;
+      try {
+        thread
+            .submit(
+                () -> {
+                  if (plan != null) {
+                    try {
+                      plan.close();
+                    } catch (TornadoExecutionPlanException e) {
+                      throw new IllegalStateException(e);
+                    }
+                    plan = null;
+                  }
+                })
+            .get();
+      } catch (java.util.concurrent.ExecutionException e) {
+        throw new IllegalStateException("Cannot release the device plan", e.getCause());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(e);
+      } finally {
+        thread.shutdown();
       }
     }
   }
@@ -697,7 +766,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /** Projection on the device: live rows are compacted, and only they come back. */
-  private final class MaterializeRegion extends Region {
+  private static final class MaterializeRegion extends Region {
     private final int intSlots;
     private final int longSlots;
     private final int doubleSlots;

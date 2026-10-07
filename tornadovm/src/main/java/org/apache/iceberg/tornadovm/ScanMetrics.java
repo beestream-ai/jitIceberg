@@ -32,40 +32,40 @@ public final class ScanMetrics {
   private long rowsRead;
   private long rowsLive;
 
-  void plan(double millis) {
+  synchronized void plan(double millis) {
     planMillis += millis;
   }
 
   /**
    * Host time spent loading delete files and footers; overlapped with device work when it can be.
    */
-  void deleteLoad(double millis) {
+  synchronized void deleteLoad(double millis) {
     deleteLoadMillis += millis;
   }
 
-  void device(double millis) {
+  synchronized void device(double millis) {
     deviceMillis += millis;
   }
 
-  void copyBack(double millis) {
+  synchronized void copyBack(double millis) {
     copyBackMillis += millis;
   }
 
-  void total(double millis) {
+  synchronized void total(double millis) {
     totalMillis = millis;
   }
 
-  void file(long rows) {
+  synchronized void file(long rows) {
     batch(rows, 1);
   }
 
-  void batch(long rows, long batchFiles) {
+  synchronized void batch(long rows, long batchFiles) {
     batches++;
     files += batchFiles;
     rowsRead += rows;
   }
 
-  void live(long rows) {
+  synchronized void live(long rows) {
     rowsLive += rows;
   }
 
@@ -105,7 +105,7 @@ public final class ScanMetrics {
   public String toString() {
     return String.format(
         Locale.ROOT,
-        "total %.1f ms | plan %.1f, delete+footer load %.1f (host, overlapped), device %.1f, copy-back %.1f"
+        "total %.1f ms | plan %.1f, delete+footer load %.1f (host, overlapped), device %.1f, copy-back %.1f (summed over streams)"
             + " | %d files in %d reads, %d rows read, %d live",
         totalMillis,
         planMillis,

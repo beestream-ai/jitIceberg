@@ -60,7 +60,7 @@ public final class AggregateResult {
   }
 
   /** Merges one file's partial totals for a group, the way a global aggregate merges partials. */
-  void add(int key, long rows, double[] sums) {
+  synchronized void add(int key, long rows, double[] sums) {
     groups.computeIfAbsent(key, ignored -> new Group(columns)).add(rows, sums);
   }
 
