@@ -359,23 +359,28 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     }
 
     @Override
-    public boolean isNull(String column, int row) {
-      return nulls[columnIndex.get(column)][row];
+    public int column(String name) {
+      return columnIndex.get(name);
     }
 
     @Override
-    public int getInt(String column, int row) {
-      return ((int[]) columns[columnIndex.get(column)])[row];
+    public boolean isNull(int column, int row) {
+      return nulls[column][row];
     }
 
     @Override
-    public long getLong(String column, int row) {
-      return ((long[]) columns[columnIndex.get(column)])[row];
+    public int getInt(int column, int row) {
+      return ((int[]) columns[column])[row];
     }
 
     @Override
-    public double getDouble(String column, int row) {
-      return ((double[]) columns[columnIndex.get(column)])[row];
+    public long getLong(int column, int row) {
+      return ((long[]) columns[column])[row];
+    }
+
+    @Override
+    public double getDouble(int column, int row) {
+      return ((double[]) columns[column])[row];
     }
   }
 

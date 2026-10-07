@@ -22,11 +22,30 @@ package org.apache.iceberg.tornadovm;
 public interface LiveRows {
   int rows();
 
-  boolean isNull(String column, int row);
+  /** The index of a column, for the by-index accessors: resolve once, read many rows. */
+  int column(String name);
 
-  int getInt(String column, int row);
+  boolean isNull(int column, int row);
 
-  long getLong(String column, int row);
+  int getInt(int column, int row);
 
-  double getDouble(String column, int row);
+  long getLong(int column, int row);
+
+  double getDouble(int column, int row);
+
+  default boolean isNull(String column, int row) {
+    return isNull(column(column), row);
+  }
+
+  default int getInt(String column, int row) {
+    return getInt(column(column), row);
+  }
+
+  default long getLong(String column, int row) {
+    return getLong(column(column), row);
+  }
+
+  default double getDouble(String column, int row) {
+    return getDouble(column(column), row);
+  }
 }

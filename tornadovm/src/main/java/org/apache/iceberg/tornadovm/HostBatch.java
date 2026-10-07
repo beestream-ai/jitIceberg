@@ -40,6 +40,8 @@ public final class HostBatch implements LiveRows {
   private final LongArray longs;
   private final DoubleArray doubles;
   private final ByteArray valid;
+  private final int[] bases;
+  private final CudfType[] types;
 
   HostBatch(
       ScanLayout layout,
@@ -58,6 +60,13 @@ public final class HostBatch implements LiveRows {
     this.longs = longs;
     this.doubles = doubles;
     this.valid = valid;
+    this.bases = new int[layout.fields().size()];
+    this.types = new CudfType[bases.length];
+    for (int c = 0; c < bases.length; c++) {
+      int fieldId = layout.fields().get(c).fieldId();
+      types[c] = layout.type(fieldId);
+      bases[c] = layout.slot(fieldId) * stride;
+    }
   }
 
   @Override
@@ -69,32 +78,37 @@ public final class HostBatch implements LiveRows {
     return layout.fields();
   }
 
-  private int base(String column, CudfType expected) {
-    int id = idByName.get(column);
-    if (layout.type(id) != expected) {
-      throw new IllegalArgumentException(column + " is " + layout.type(id) + ", not " + expected);
+  /** The column's position in the read, which these accessors take. */
+  @Override
+  public int column(String name) {
+    return layout.readIndex(idByName.get(name));
+  }
+
+  private int base(int column, CudfType expected) {
+    if (types[column] != expected) {
+      throw new IllegalArgumentException(
+          layout.fields().get(column).name() + " is " + types[column] + ", not " + expected);
     }
-    return layout.slot(id) * stride;
+    return bases[column];
   }
 
   @Override
-  public boolean isNull(String column, int row) {
-    return layout.anyOptional()
-        && valid.get(layout.readIndex(idByName.get(column)) * stride + row) == 0;
+  public boolean isNull(int column, int row) {
+    return layout.anyOptional() && valid.get(column * stride + row) == 0;
   }
 
   @Override
-  public int getInt(String column, int row) {
+  public int getInt(int column, int row) {
     return ints.get(base(column, CudfType.INT32) + row);
   }
 
   @Override
-  public long getLong(String column, int row) {
+  public long getLong(int column, int row) {
     return longs.get(base(column, CudfType.INT64) + row);
   }
 
   @Override
-  public double getDouble(String column, int row) {
+  public double getDouble(int column, int row) {
     return doubles.get(base(column, CudfType.FLOAT64) + row);
   }
 }
