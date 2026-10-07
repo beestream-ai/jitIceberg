@@ -29,6 +29,7 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Schema;
@@ -81,7 +82,6 @@ public final class MorTables {
         ImmutableMap.<String, String>builder()
             .putAll(properties)
             .put(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
-            .put(TableProperties.DEFAULT_WRITE_METRICS_MODE, "counts")
             .buildKeepingLast();
     return new HadoopTables(new Configuration())
         .create(schema, PartitionSpec.unpartitioned(), SortOrder.unsorted(), props, location);
@@ -154,6 +154,9 @@ public final class MorTables {
           PositionDeleteWriter<Record> writer =
               Parquet.writeDeletes(newFile(table, "pos-deletes"))
                   .setAll(table.properties())
+                  // As Iceberg's own writer factories do: full bounds on file_path, which is what
+                  // marks a delete file as scoped to one data file.
+                  .metricsConfig(MetricsConfig.forPositionDelete())
                   .withSpec(table.spec())
                   .overwrite()
                   .buildPositionWriter();

@@ -148,7 +148,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       columnIndex.put(readSchema.columns().get(i).name(), i);
     }
     ScanLayout layout = new ScanLayout(table.schema(), equalityKeyId, null, read);
-    HostDeletes host = new HostDeletes(table, layout, equalityKeyId);
+    HostDeletes host = new HostDeletes(table, layout, equalityKeyId, false);
     metrics.plan((System.nanoTime() - start) / 1e6);
 
     boolean keyIsInt = keyName != null && layout.type(equalityKeyId) == CudfType.INT32;

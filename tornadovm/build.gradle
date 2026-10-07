@@ -84,6 +84,7 @@ test {
 // The runtime class path, for scripts that run the benchmarks under the TornadoVM launcher.
 tasks.register('printRuntimeClasspath') {
   def classpath = sourceSets.main.runtimeClasspath
+  dependsOn classpath
   doLast {
     println classpath.asPath
   }

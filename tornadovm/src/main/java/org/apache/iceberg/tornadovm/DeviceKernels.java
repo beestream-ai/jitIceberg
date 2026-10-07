@@ -55,7 +55,13 @@ final class DeviceKernels {
   /** 1 when the equality key column is optional, so its validity bytes have to be consulted. */
   static final int META_KEY_NULLABLE = 4;
 
-  static final int META_SIZE = 5;
+  /** Position-delete entries read on the device for the current batch. */
+  static final int META_POSITION_ROWS = 5;
+
+  /** Runs of those entries, one a data file that has them. */
+  static final int META_POSITION_SEGMENTS = 6;
+
+  static final int META_SIZE = 7;
 
   /**
    * The group key of a deleted or padding row. It is grouped like any other key and dropped on the
@@ -106,6 +112,34 @@ final class DeviceKernels {
         }
       }
       live.set(i, keep);
+    }
+  }
+
+  /**
+   * Applies position-delete files the device read itself: entry {@code j} is a row position within
+   * its data file, and the run of entries it belongs to says where that file starts in the batch.
+   * Runs are few (one a data file of the batch), so each thread finds its own by a short scan. Only
+   * zeroes are written, so threads that delete the same row do not race.
+   *
+   * @param segmentStarts the first entry of each run
+   * @param segmentOffsets the batch row at which each run's data file starts
+   */
+  static void deletePositions(
+      LongArray positions,
+      IntArray meta,
+      IntArray segmentStarts,
+      IntArray segmentOffsets,
+      ByteArray live) {
+    for (@Parallel int j = 0; j < positions.getSize(); j++) {
+      if (j < meta.get(META_POSITION_ROWS)) {
+        int segments = meta.get(META_POSITION_SEGMENTS);
+        int s = 0;
+        while (s + 1 < segments && segmentStarts.get(s + 1) <= j) {
+          s++;
+        }
+        long row = segmentOffsets.get(s) + positions.get(j);
+        live.set((int) row, (byte) 0);
+      }
     }
   }
 

@@ -31,6 +31,7 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.BaseDeleteLoader;
@@ -42,20 +43,27 @@ import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.io.LocalInputFile;
 import org.apache.parquet.schema.MessageType;
 
 /**
- * The host half of a merge-on-read scan: everything about one data file that is metadata rather
- * than data, prepared off the critical path while the device works on the previous file.
+ * The host half of a merge-on-read scan: what one device batch needs to know about its data files
+ * and their deletes, prepared off the critical path while the device works on the previous batch.
+ *
+ * <p>Delete files go one of two ways:
  *
  * <ul>
- *   <li>the file's local path and row count, from the manifest;
- *   <li>which Parquet column each projected field is, from the footer, by field id;
- *   <li>its position deletes or deletion vector, loaded by Iceberg's own {@link BaseDeleteLoader}
- *       and packed into one bit a row;
- *   <li>the equality-delete key set that applies to it, shared between files and loaded once.
+ *   <li><b>read on the device</b> -- file-scoped Parquet position-delete files (the ones whose
+ *       {@link DeleteFile#referencedDataFile()} is the data file, which is what Iceberg writes by
+ *       default) and Parquet equality-delete files over a required key. cuDF reads their {@code
+ *       pos} or key column straight into device memory; the host only names the files.
+ *   <li><b>loaded on the host</b> -- deletion vectors, through Iceberg's own {@link
+ *       BaseDeleteLoader} (a Puffin roaring bitmap is already compact), and anything the device
+ *       path does not cover: partition-scoped position deletes, a nullable equality key, a
+ *       non-Parquet delete file. Positions become one bit a row; keys become a host set that is
+ *       uploaded.
  * </ul>
  *
  * <p>Which delete files apply to which data file -- the sequence-number rules -- is decided by
@@ -64,29 +72,28 @@ import org.apache.parquet.schema.MessageType;
  */
 final class HostDeletes {
 
-  /** One data file, ready for the device. */
+  /** One device batch: one or more data files, read as one. */
   static final class FilePrep {
-    private final String path;
-    private final long rows;
-    private final int[] columns;
-    private final byte[] positionBits;
-    private final EqualitySet equality;
-    private final long hostNanos;
+    private String path;
+    private long rows;
+    private int[] columns;
+    private byte[] positionBits;
+    private EqualitySet equality;
+    private long hostNanos;
+    private int files = 1;
 
-    FilePrep(
-        String path,
-        long rows,
-        int[] columns,
-        byte[] positionBits,
-        EqualitySet equality,
-        long hostNanos) {
-      this.path = path;
-      this.rows = rows;
-      this.columns = columns;
-      this.positionBits = positionBits;
-      this.equality = equality;
-      this.hostNanos = hostNanos;
-    }
+    // Position-delete files read on the device: their pos columns concatenated, and for each run of
+    // them, where its data file starts in the batch.
+    private final StringBuilder positionPaths = new StringBuilder();
+    private long positionRows;
+    private int positionColumn = -1;
+    private final List<Integer> segmentStarts = Lists.newArrayList();
+    private final List<Integer> segmentOffsets = Lists.newArrayList();
+
+    // Equality-delete files read on the device.
+    private String setPaths;
+    private long setRows;
+    private int setColumn = -1;
 
     String path() {
       return path;
@@ -96,16 +103,20 @@ final class HostDeletes {
       return rows;
     }
 
+    int files() {
+      return files;
+    }
+
     int[] columns() {
       return columns;
     }
 
-    /** One bit a row, set when the row is deleted; null when the file has no position deletes. */
+    /** One bit a row, set when the row is deleted; null when nothing was loaded on the host. */
     byte[] positionBits() {
       return positionBits;
     }
 
-    /** The equality-delete keys for this file, or null when none apply. */
+    /** Host-loaded equality keys, or null when none apply or they are read on the device. */
     EqualitySet equality() {
       return equality;
     }
@@ -113,9 +124,47 @@ final class HostDeletes {
     long hostNanos() {
       return hostNanos;
     }
+
+    String positionPaths() {
+      return positionPaths.toString();
+    }
+
+    long positionRows() {
+      return positionRows;
+    }
+
+    int positionColumn() {
+      return positionColumn;
+    }
+
+    List<Integer> segmentStarts() {
+      return segmentStarts;
+    }
+
+    List<Integer> segmentOffsets() {
+      return segmentOffsets;
+    }
+
+    /** Equality-delete files to read on the device, one a line, or null. */
+    String setPaths() {
+      return setPaths;
+    }
+
+    long setRows() {
+      return setRows;
+    }
+
+    int setColumn() {
+      return setColumn;
+    }
+
+    /** The identity of the equality deletes that apply, read either way; empty when none. */
+    String equalityId() {
+      return setPaths != null ? setPaths : equality != null ? equality.id() : "";
+    }
   }
 
-  /** The keys of a set of equality-delete files over one column. */
+  /** The keys of a set of equality-delete files over one column, loaded on the host. */
   static final class EqualitySet {
     private final String id;
     private final long[] keys;
@@ -127,7 +176,6 @@ final class HostDeletes {
       this.hasNull = hasNull;
     }
 
-    /** The delete files' locations, sorted: two files with the same id share one device upload. */
     String id() {
       return id;
     }
@@ -144,13 +192,20 @@ final class HostDeletes {
   private final Table table;
   private final ScanLayout layout;
   private final Integer equalityKeyId;
+  private final boolean deviceDeletes;
   private final BaseDeleteLoader deleteLoader;
   private final Map<String, EqualitySet> equalitySets = Maps.newConcurrentMap();
+  private final Map<String, Integer> columnByPathAndId = Maps.newConcurrentMap();
 
-  HostDeletes(Table table, ScanLayout layout, Integer equalityKeyId) {
+  /**
+   * @param deviceDeletes whether delete files the device can read are left to it; false loads every
+   *     delete on the host, as the CPU scan needs
+   */
+  HostDeletes(Table table, ScanLayout layout, Integer equalityKeyId, boolean deviceDeletes) {
     this.table = table;
     this.layout = layout;
     this.equalityKeyId = equalityKeyId;
+    this.deviceDeletes = deviceDeletes;
     this.deleteLoader = new BaseDeleteLoader(file -> table.io().newInputFile(file.location()));
   }
 
@@ -176,6 +231,22 @@ final class HostDeletes {
     return key;
   }
 
+  /** The equality-delete files that apply to a task, as an identity: tasks with equal ids batch. */
+  static String equalityId(FileScanTask task) {
+    return task.deletes().stream()
+        .filter(delete -> delete.content() == FileContent.EQUALITY_DELETES)
+        .map(DeleteFile::location)
+        .sorted(Comparator.naturalOrder())
+        .collect(Collectors.joining(","));
+  }
+
+  /** Whether the device reads this position-delete file itself. */
+  static boolean readOnDevice(DeleteFile delete, String dataLocation) {
+    return delete.content() == FileContent.POSITION_DELETES
+        && delete.format() == FileFormat.PARQUET
+        && dataLocation.equals(ContentFileUtil.referencedDataFileLocation(delete));
+  }
+
   /** A local path cuDF can open. Object stores are not wired up in this prototype. */
   static String localPath(String location) {
     if (location.startsWith("file:")) {
@@ -187,45 +258,159 @@ final class HostDeletes {
     throw new UnsupportedOperationException("Not a local file: " + location);
   }
 
+  /** One data file. */
   FilePrep prepare(FileScanTask task) {
+    return prepare(List.of(task));
+  }
+
+  /**
+   * Several data files read as one device batch: their paths one a line, their rows concatenated,
+   * their position bitmaps shifted to their offset in the batch. They share one equality-delete set
+   * (batches are formed that way), and their projected columns must sit at the same Parquet
+   * indices, since one read resolves them once.
+   */
+  FilePrep prepare(List<FileScanTask> batch) {
     long start = System.nanoTime();
-    String location = task.file().location();
-    String path = localPath(location);
-    long rows = task.file().recordCount();
-    if (task.file().format() != FileFormat.PARQUET) {
-      throw new UnsupportedOperationException("Not a Parquet data file: " + location);
-    }
-    if (task.start() != 0 || task.length() < task.file().fileSizeInBytes()) {
-      throw new UnsupportedOperationException("Split data files are not supported: " + location);
-    }
-
-    int[] columns = layout.parquetColumns(footerSchema(path), location);
-
-    List<DeleteFile> positionDeletes = Lists.newArrayList();
-    List<DeleteFile> equalityDeletes = Lists.newArrayList();
-    for (DeleteFile delete : task.deletes()) {
-      if (delete.content() == FileContent.EQUALITY_DELETES) {
-        equalityDeletes.add(delete);
-      } else {
-        positionDeletes.add(delete);
+    FilePrep prep = new FilePrep();
+    prep.files = batch.size();
+    StringBuilder paths = new StringBuilder();
+    List<long[]> hostPositions = Lists.newArrayList();
+    long offset = 0;
+    long hostDeleted = 0;
+    for (FileScanTask task : batch) {
+      String location = task.file().location();
+      String path = localPath(location);
+      long rows = task.file().recordCount();
+      if (task.file().format() != FileFormat.PARQUET) {
+        throw new UnsupportedOperationException("Not a Parquet data file: " + location);
       }
-    }
+      if (task.start() != 0 || task.length() < task.file().fileSizeInBytes()) {
+        throw new UnsupportedOperationException("Split data files are not supported: " + location);
+      }
+      int[] columns = layout.parquetColumns(footerSchema(path), location);
+      if (prep.columns == null) {
+        prep.columns = columns;
+      } else if (!Arrays.equals(columns, prep.columns)) {
+        throw new UnsupportedOperationException(
+            "Data files of one batch store the projected columns at different positions: "
+                + location);
+      }
+      if (paths.length() > 0) {
+        paths.append('\n');
+      }
+      paths.append(path);
 
-    byte[] bits = null;
-    if (!positionDeletes.isEmpty()) {
-      PositionDeleteIndex index = deleteLoader.loadPositionDeletes(positionDeletes, location);
-      byte[] packed = new byte[(int) ((rows + 7) / 8)];
-      index.forEach(
-          position -> {
-            if (position < rows) {
-              packed[(int) (position >> 3)] |= (byte) (1 << (position & 7));
+      List<DeleteFile> hostDeletes = Lists.newArrayList();
+      List<DeleteFile> equalityDeletes = Lists.newArrayList();
+      boolean segmentOpen = false;
+      for (DeleteFile delete : task.deletes()) {
+        if (delete.content() == FileContent.EQUALITY_DELETES) {
+          equalityDeletes.add(delete);
+        } else if (deviceDeletes && readOnDevice(delete, location)) {
+          if (!segmentOpen) {
+            prep.segmentStarts.add((int) prep.positionRows);
+            prep.segmentOffsets.add((int) offset);
+            segmentOpen = true;
+          }
+          String deletePath = localPath(delete.location());
+          if (prep.positionPaths.length() > 0) {
+            prep.positionPaths.append('\n');
+          }
+          prep.positionPaths.append(deletePath);
+          prep.positionRows += delete.recordCount();
+          int column = column(deletePath, MetadataColumns.DELETE_FILE_POS.fieldId());
+          if (prep.positionColumn >= 0 && prep.positionColumn != column) {
+            throw new UnsupportedOperationException(
+                "Position-delete files of one batch store pos at different positions");
+          }
+          prep.positionColumn = column;
+        } else {
+          hostDeletes.add(delete);
+        }
+      }
+
+      if (!hostDeletes.isEmpty()) {
+        PositionDeleteIndex index = deleteLoader.loadPositionDeletes(hostDeletes, location);
+        long[] positions = new long[(int) index.cardinality()];
+        int[] count = {0};
+        long base = offset;
+        index.forEach(
+            position -> {
+              if (position < rows && count[0] < positions.length) {
+                positions[count[0]++] = base + position;
+              }
+            });
+        hostPositions.add(Arrays.copyOf(positions, count[0]));
+        hostDeleted += count[0];
+      }
+
+      if (!equalityDeletes.isEmpty() && (prep.setPaths == null && prep.equality == null)) {
+        applyEquality(prep, equalityDeletes);
+      }
+      offset += rows;
+    }
+    prep.path = paths.toString();
+    prep.rows = offset;
+    if (hostDeleted > 0) {
+      byte[] bits = new byte[(int) ((offset + 7) / 8)];
+      for (long[] positions : hostPositions) {
+        for (long position : positions) {
+          bits[(int) (position >> 3)] |= (byte) (1 << (position & 7));
+        }
+      }
+      prep.positionBits = bits;
+    }
+    prep.hostNanos = System.nanoTime() - start;
+    return prep;
+  }
+
+  private void applyEquality(FilePrep prep, List<DeleteFile> deletes) {
+    Types.NestedField key = table.schema().findField(equalityKeyId);
+    boolean allParquet = deletes.stream().allMatch(d -> d.format() == FileFormat.PARQUET);
+    if (deviceDeletes && key.isRequired() && allParquet) {
+      // A required key cannot be null in a delete file either, so the device needs no null flag.
+      List<DeleteFile> sorted = Lists.newArrayList(deletes);
+      sorted.sort(Comparator.comparing(DeleteFile::location));
+      int column = -1;
+      StringBuilder paths = new StringBuilder();
+      long rows = 0;
+      for (DeleteFile delete : sorted) {
+        String path = localPath(delete.location());
+        int own = column(path, equalityKeyId);
+        if (column >= 0 && own != column) {
+          throw new UnsupportedOperationException(
+              "Equality-delete files store the key at different positions");
+        }
+        column = own;
+        if (paths.length() > 0) {
+          paths.append('\n');
+        }
+        paths.append(path);
+        rows += delete.recordCount();
+      }
+      prep.setPaths = paths.toString();
+      prep.setRows = rows;
+      prep.setColumn = column;
+    } else {
+      prep.equality = equalitySet(deletes);
+    }
+  }
+
+  /** The Parquet column index of a field id in a file, from its footer. */
+  private int column(String path, int fieldId) {
+    return columnByPathAndId.computeIfAbsent(
+        path + "#" + fieldId,
+        ignored -> {
+          MessageType schema = footerSchema(path);
+          for (int i = 0; i < schema.getFieldCount(); i++) {
+            org.apache.parquet.schema.Type column = schema.getType(i);
+            if (column.getId() != null && column.getId().intValue() == fieldId) {
+              return i;
             }
-          });
-      bits = packed;
-    }
-
-    EqualitySet equality = equalityDeletes.isEmpty() ? null : equalitySet(equalityDeletes);
-    return new FilePrep(path, rows, columns, bits, equality, System.nanoTime() - start);
+          }
+          throw new UnsupportedOperationException(
+              "Delete file " + path + " has no column with field id " + fieldId);
+        });
   }
 
   private static MessageType footerSchema(String path) {
@@ -281,9 +466,5 @@ final class HostDeletes {
       }
     }
     return new EqualitySet(id, Arrays.copyOf(keys, size), hasNull);
-  }
-
-  Integer equalityKeyId() {
-    return equalityKeyId;
   }
 }

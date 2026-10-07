@@ -27,6 +27,7 @@ public final class ScanMetrics {
   private double deviceMillis;
   private double copyBackMillis;
   private double totalMillis;
+  private long batches;
   private long files;
   private long rowsRead;
   private long rowsLive;
@@ -55,7 +56,12 @@ public final class ScanMetrics {
   }
 
   void file(long rows) {
-    files++;
+    batch(rows, 1);
+  }
+
+  void batch(long rows, long batchFiles) {
+    batches++;
+    files += batchFiles;
     rowsRead += rows;
   }
 
@@ -100,13 +106,14 @@ public final class ScanMetrics {
     return String.format(
         Locale.ROOT,
         "total %.1f ms | plan %.1f, delete+footer load %.1f (host, overlapped), device %.1f, copy-back %.1f"
-            + " | %d files, %d rows read, %d live",
+            + " | %d files in %d reads, %d rows read, %d live",
         totalMillis,
         planMillis,
         deleteLoadMillis,
         deviceMillis,
         copyBackMillis,
         files,
+        batches,
         rowsRead,
         rowsLive);
   }
