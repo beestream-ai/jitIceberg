@@ -23,6 +23,7 @@
 #
 # q3 materializes every live row through Spark's no-op sink, which runs the whole read and drops
 # the rows; its row count and checksum come from one extra, untimed, aggregate.
+import os
 import sys
 import time
 
@@ -34,7 +35,12 @@ spark.sparkContext.setLogLevel("WARN")
 
 print("table,engine,query,run,warmup,millis,live_rows,checksum,breakdown", flush=True)
 for name in tables:
-    spark.read.format("iceberg").load(f"{warehouse}/{name}").createOrReplaceTempView("t")
+    reader = spark.read.format("iceberg")
+    if os.environ.get("SPLIT_SIZE"):
+        # Iceberg packs small files into splits of read.split.target-size (128 MB); a smaller
+        # target gives every core a task when the files are small.
+        reader = reader.option("split-size", os.environ["SPLIT_SIZE"])
+    reader.load(f"{warehouse}/{name}").createOrReplaceTempView("t")
     for run in range(runs):
         start = time.perf_counter()
         if query == "q1":
@@ -46,6 +52,13 @@ for name in tables:
             ).collect()
             rows = sum(r["c"] for r in result)
             checksum = sum(r["a"] + r["b"] + r["d"] + r["e"] for r in result) + len(result)
+        elif query == "q4":
+            # Iceberg's bucket transform as a Spark function, from the catalog run.sh configures.
+            result = spark.sql(
+                "SELECT local.system.bucket(16, id) b, count(*) c, sum(v1) a FROM t GROUP BY b"
+            ).collect()
+            rows = sum(r["c"] for r in result)
+            checksum = sum(r["a"] for r in result) + len(result)
         else:
             spark.sql("SELECT id, k, v1 FROM t").write.format("noop").mode("overwrite").save()
             rows, checksum = None, None

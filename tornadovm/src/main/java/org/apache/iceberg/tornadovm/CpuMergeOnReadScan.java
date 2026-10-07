@@ -43,6 +43,7 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.BucketUtil;
 import uk.ac.manchester.tornado.cudf.enums.CudfType;
 
 /**
@@ -79,6 +80,15 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
 
   @Override
   public AggregateResult aggregate(String groupColumn, String... sumColumns) {
+    return aggregate(groupColumn, 0, sumColumns);
+  }
+
+  @Override
+  public AggregateResult aggregateByBucket(String column, int buckets, String... sumColumns) {
+    return aggregate(column, buckets, sumColumns);
+  }
+
+  private AggregateResult aggregate(String groupColumn, int buckets, String... sumColumns) {
     AggregateResult result = new AggregateResult(sumColumns.length);
     List<String> projection = Lists.newArrayList();
     if (groupColumn != null) {
@@ -87,7 +97,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     projection.addAll(ImmutableList.copyOf(sumColumns));
     run(
         projection,
-        (file, columnIndex) -> new GroupSink(groupColumn, sumColumns, columnIndex),
+        (file, columnIndex) -> new GroupSink(groupColumn, buckets, sumColumns, columnIndex),
         sinks -> {
           synchronized (result) {
             for (GroupSink sink : sinks) {
@@ -232,14 +242,16 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
   /** Grouped COUNT and SUMs over one file's live rows, with SQL's null-skipping SUM. */
   private static final class GroupSink implements Sink {
     private final Integer groupColumn;
+    private final int buckets;
     private final int[] sumColumns;
     private final PrimitiveHash.IntIndex groups = new PrimitiveHash.IntIndex();
     private long[] counts = new long[64];
     private double[] sums;
     private long rows = 0;
 
-    GroupSink(String group, String[] sumNames, Map<String, Integer> columnIndex) {
+    GroupSink(String group, int buckets, String[] sumNames, Map<String, Integer> columnIndex) {
       this.groupColumn = group == null ? null : columnIndex.get(group);
+      this.buckets = buckets;
       this.sumColumns = new int[sumNames.length];
       for (int c = 0; c < sumNames.length; c++) {
         sumColumns[c] = columnIndex.get(sumNames[c]);
@@ -249,7 +261,15 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
 
     @Override
     public void accept(ColumnarBatch batch, int row) {
-      int key = groupColumn == null ? 0 : batch.column(groupColumn).getInt(row);
+      int key;
+      if (groupColumn == null) {
+        key = 0;
+      } else if (buckets > 0) {
+        long value = batch.column(groupColumn).getLong(row);
+        key = (BucketUtil.hash(value) & Integer.MAX_VALUE) % buckets;
+      } else {
+        key = batch.column(groupColumn).getInt(row);
+      }
       int g = groups.indexOf(key);
       if (g == counts.length) {
         counts = java.util.Arrays.copyOf(counts, counts.length * 2);

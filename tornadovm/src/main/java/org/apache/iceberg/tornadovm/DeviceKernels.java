@@ -243,18 +243,22 @@ final class DeviceKernels {
   }
 
   /**
-   * Iceberg's {@code bucket[N]} partition transform over a long column: Murmur3 x86 32-bit of the
-   * value's 8 little-endian bytes, seed 0, made non-negative and taken modulo N -- the same
-   * function as {@code org.apache.iceberg.transforms.Bucket}, so a row lands in the bucket Iceberg
-   * would put it in. Int columns are hashed as longs by the spec, so this covers both.
+   * Groups live rows by Iceberg's {@code bucket[N]} partition transform of a long column: Murmur3
+   * x86 32-bit of the value's 8 little-endian bytes, seed 0, made non-negative and taken modulo N
+   * -- the function of {@code org.apache.iceberg.util.BucketUtil}, so a row lands in the bucket
+   * Iceberg would write it to. Deleted and padding rows get {@link #DEAD_GROUP}.
    */
-  static void bucketLong(LongArray values, int offset, int rows, int buckets, IntArray out) {
-    for (@Parallel int i = 0; i < rows; i++) {
-      long value = values.get(offset + i);
-      int h1 = mixH1(0, mixK1((int) value));
-      h1 = mixH1(h1, mixK1((int) (value >>> 32)));
-      int hash = fmix(h1, 8);
-      out.set(i, (hash & Integer.MAX_VALUE) % buckets);
+  static void bucketGroupKeys(
+      ByteArray live, LongArray longs, int offset, int buckets, IntArray groups) {
+    for (@Parallel int i = 0; i < groups.getSize(); i++) {
+      int key = DEAD_GROUP;
+      if (live.get(i) == 1) {
+        long value = longs.get(offset + i);
+        int h1 = mixH1(0, mixK1((int) value));
+        h1 = mixH1(h1, mixK1((int) (value >>> 32)));
+        key = (fmix(h1, 8) & Integer.MAX_VALUE) % buckets;
+      }
+      groups.set(i, key);
     }
   }
 

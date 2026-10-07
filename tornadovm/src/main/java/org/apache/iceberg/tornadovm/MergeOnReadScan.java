@@ -32,6 +32,13 @@ public interface MergeOnReadScan {
   AggregateResult aggregate(String groupColumn, String... sumColumns);
 
   /**
+   * {@code SELECT bucket(buckets, column), COUNT(*), SUM(c1), ... GROUP BY 1} over the live rows,
+   * with Iceberg's {@code bucket[N]} partition transform of a required LONG column: how many live
+   * rows, and how much of each sum, each bucket of a {@code bucket(N, column)} partitioning holds.
+   */
+  AggregateResult aggregateByBucket(String column, int buckets, String... sumColumns);
+
+  /**
    * {@code SELECT columns} over the live rows, handed over a batch of data files at a time. The
    * rows are only valid during the call, and the consumer may be called from several threads.
    *

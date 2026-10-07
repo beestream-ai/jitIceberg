@@ -134,12 +134,30 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   @Override
   public AggregateResult aggregate(String groupColumn, String... sumColumns) {
+    return aggregate(groupColumn, 0, sumColumns);
+  }
+
+  @Override
+  public AggregateResult aggregateByBucket(String column, int buckets, String... sumColumns) {
+    Types.NestedField field = table.schema().findField(column);
+    if (field.isOptional() || field.type().typeId() != org.apache.iceberg.types.Type.TypeID.LONG) {
+      throw new UnsupportedOperationException(
+          "The bucket column must be a required LONG: " + field);
+    }
+    if (buckets <= 0) {
+      throw new IllegalArgumentException("Invalid bucket count: " + buckets);
+    }
+    return aggregate(column, buckets, sumColumns);
+  }
+
+  /** With {@code buckets > 0}, groups by {@code bucket(buckets, groupColumn)} of a LONG column. */
+  private AggregateResult aggregate(String groupColumn, int buckets, String... sumColumns) {
     if (sumColumns.length == 0) {
       throw new IllegalArgumentException("aggregate needs at least one sum column");
     }
     metrics = new ScanMetrics();
     long start = System.nanoTime();
-    if (groupColumn != null) {
+    if (groupColumn != null && buckets == 0) {
       Types.NestedField key = table.schema().findField(groupColumn);
       if (key.isOptional() || ScanLayout.cudfType(key) != CudfType.INT32) {
         throw new UnsupportedOperationException("The group column must be a required INT: " + key);
@@ -154,9 +172,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     if (planned.layout.slots(CudfType.FLOAT64) != sumColumns.length) {
       throw new UnsupportedOperationException("The sum columns must be distinct DOUBLE columns");
     }
-    String key = "aggregate:" + groupColumn + ":" + String.join(",", sumColumns);
+    String key = "aggregate:" + groupColumn + ":" + buckets + ":" + String.join(",", sumColumns);
     List<Region> streams =
-        reuse(key, planned, () -> new AggregateRegion(planned, groupColumn, sumColumns));
+        reuse(key, planned, () -> new AggregateRegion(planned, groupColumn, buckets, sumColumns));
     metrics.plan((System.nanoTime() - start) / 1e6);
 
     AggregateResult result = new AggregateResult(sumColumns.length);
@@ -651,6 +669,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private final class AggregateRegion extends Region {
     private final int sumColumns;
     private final int groupOffset;
+    private final int buckets;
     private final IntArray groupKeys;
     private final IntArray sumKeys;
     private final DoubleArray sums;
@@ -660,9 +679,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final IntArray countGroups = new IntArray(1);
     private final IntArray validColumn;
 
-    AggregateRegion(Planned planned, String groupColumn, String[] sumNames) {
+    AggregateRegion(Planned planned, String groupColumn, int buckets, String[] sumNames) {
       super(planned);
       this.sumColumns = sumNames.length;
+      this.buckets = buckets;
       this.groupOffset =
           groupColumn == null
               ? -1
@@ -682,7 +702,18 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     @Override
     void consumer(TaskGraph graph) {
-      graph.task("groups", DeviceKernels::groupKeys, live, ints, groupOffset, groupKeys);
+      if (buckets > 0) {
+        graph.task(
+            "buckets",
+            DeviceKernels::bucketGroupKeys,
+            live,
+            longs,
+            groupOffset,
+            buckets,
+            groupKeys);
+      } else {
+        graph.task("groups", DeviceKernels::groupKeys, live, ints, groupOffset, groupKeys);
+      }
       if (layout.anyOptional()) {
         graph
             .transferToDevice(DataTransferMode.FIRST_EXECUTION, validColumn)

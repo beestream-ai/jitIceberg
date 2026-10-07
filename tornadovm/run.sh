@@ -20,10 +20,10 @@
 # Merge-on-read benchmarks: the GPU scan, the same algorithm on the CPU, Iceberg's own reader, Spark.
 #
 #   run.sh gen      <warehouse> <files> <rowsPerFile>
-#   run.sh gpu      <warehouse> <q1|q2|q3> <runs> <table>...     TornadoVM JVM, CUDA device
-#   run.sh cpu      <warehouse> <q1|q2|q3> <runs> <table>...     plain JVM, all cores (THREADS=n)
-#   run.sh generics <warehouse> <q1|q2|q3> <runs> <table>...     plain JVM, IcebergGenerics, 1 thread
-#   run.sh spark    <warehouse> <q1|q2|q3> <runs> <table>...     Spark local[*] + iceberg-spark-runtime
+#   run.sh gpu      <warehouse> <q1|q2|q3|q4> <runs> <table>...     TornadoVM JVM, CUDA device
+#   run.sh cpu      <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, all cores (THREADS=n)
+#   run.sh generics <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, IcebergGenerics, 1 thread
+#   run.sh spark    <warehouse> <q1|q2|q3|q4> <runs> <table>...     Spark local[*] + iceberg-spark-runtime
 #
 # Needs: TORNADOVM_HOME (a TornadoVM SDK with the cuDF shim), JAVA_HOME (JDK 21), libcudf on
 # LD_LIBRARY_PATH; for spark, SPARK_HOME and ICEBERG_SPARK_JAR.
@@ -66,6 +66,9 @@ case "$mode" in
         exec "$SPARK_HOME/bin/spark-submit" --master "local[${THREADS:-$(nproc)}]" \
             --driver-memory "$HEAP" --jars "$ICEBERG_SPARK_JAR" \
             --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+            --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
+            --conf spark.sql.catalog.local.type=hadoop \
+            --conf spark.sql.catalog.local.warehouse="$(dirname "$1")" \
             --conf spark.ui.enabled=false \
             "$HERE/spark_bench.py" "$@"
         ;;

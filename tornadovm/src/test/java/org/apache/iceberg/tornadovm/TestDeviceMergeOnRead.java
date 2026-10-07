@@ -202,6 +202,11 @@ public class TestDeviceMergeOnRead {
   private static void assertMatchesIceberg(Table table) throws IOException {
     table.refresh();
     Map<Integer, double[]> expectedByK = new TreeMap<>();
+    Map<Integer, double[]> expectedByBucket = new TreeMap<>();
+    org.apache.iceberg.transforms.Transform<Long, Integer> bucket =
+        org.apache.iceberg.transforms.Transforms.bucket(16);
+    java.util.function.Function<Long, Integer> bucketOf =
+        bucket.bind(org.apache.iceberg.types.Types.LongType.get());
     double[] expectedAll = new double[2];
     List<String> expectedRows = Lists.newArrayList();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
@@ -217,6 +222,13 @@ public class TestDeviceMergeOnRead {
         Object v1 = record.getField("v1");
         expectedAll[1] += v1 == null ? 0.0 : (Double) v1;
         expectedRows.add(record.getField("id") + "/" + k + "/" + v1);
+        if (record.getField("id") != null) {
+          double[] byBucket =
+              expectedByBucket.computeIfAbsent(
+                  bucketOf.apply((Long) record.getField("id")), ignored -> new double[2]);
+          byBucket[0] += 1;
+          byBucket[1] += v1 == null ? 0.0 : (Double) v1;
+        }
       }
     }
 
@@ -224,8 +236,30 @@ public class TestDeviceMergeOnRead {
       assertScanMatches(device, expectedByK, expectedAll, expectedRows);
       // Again on the same scan, which reuses its device buffers and plans.
       assertScanMatches(device, expectedByK, expectedAll, expectedRows);
+      if (table.schema().findField("id").isRequired()) {
+        assertBucketsMatch(device, expectedByBucket);
+      }
     }
-    assertScanMatches(CpuMergeOnReadScan.of(table, 4), expectedByK, expectedAll, expectedRows);
+    MergeOnReadScan cpu = CpuMergeOnReadScan.of(table, 4);
+    assertScanMatches(cpu, expectedByK, expectedAll, expectedRows);
+    if (table.schema().findField("id").isRequired()) {
+      assertBucketsMatch(cpu, expectedByBucket);
+    }
+  }
+
+  /** bucket(16, id) as Iceberg's own Transforms.bucket computes it. */
+  private static void assertBucketsMatch(MergeOnReadScan scan, Map<Integer, double[]> expected) {
+    AggregateResult buckets = scan.aggregateByBucket("id", 16, "v1");
+    assertThat(buckets.groups().keySet()).isEqualTo(expected.keySet());
+    for (Map.Entry<Integer, double[]> entry : expected.entrySet()) {
+      AggregateResult.Group group = buckets.groups().get(entry.getKey());
+      assertThat(group.count())
+          .as("rows in bucket %s", entry.getKey())
+          .isEqualTo((long) entry.getValue()[0]);
+      assertThat(group.sums()[0])
+          .as("v1 in bucket %s", entry.getKey())
+          .isCloseTo(entry.getValue()[1], org.assertj.core.data.Offset.offset(1e-6));
+    }
   }
 
   private static void assertScanMatches(

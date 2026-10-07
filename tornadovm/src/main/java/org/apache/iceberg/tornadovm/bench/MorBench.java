@@ -43,7 +43,9 @@ import org.apache.iceberg.tornadovm.MergeOnReadScan;
  * <ul>
  *   <li>q1 -- {@code SELECT count(*), sum(v1)};
  *   <li>q2 -- {@code SELECT k, count(*), sum(v1), sum(v2), sum(v3), sum(v4) GROUP BY k};
- *   <li>q3 -- {@code SELECT id, k, v1}, every live row copied into host arrays.
+ *   <li>q3 -- {@code SELECT id, k, v1}, every live row copied into host arrays;
+ *   <li>q4 -- {@code SELECT bucket(16, id), count(*), sum(v1) GROUP BY 1}, Iceberg's bucket
+ *       partition transform.
  * </ul>
  *
  * <p>The first run of each table is a warm-up (TornadoVM's JIT compiles the kernels, the page cache
@@ -117,6 +119,10 @@ public final class MorBench {
         AggregateResult result = scan.aggregate("k", SUMS);
         yield new double[] {result.rows(), sum(result) + result.groups().size()};
       }
+      case "q4" -> {
+        AggregateResult result = scan.aggregateByBucket("id", 16, "v1");
+        yield new double[] {result.rows(), sum(result) + result.groups().size()};
+      }
       case "q3" -> {
         LongAdder ids = new LongAdder();
         DoubleAdder values = new DoubleAdder();
@@ -165,6 +171,11 @@ public final class MorBench {
         rows++;
         switch (query) {
           case "q1" -> checksum += (Double) record.getField("v1");
+          case "q4" -> {
+            long id = (Long) record.getField("id");
+            groups.add((org.apache.iceberg.util.BucketUtil.hash(id) & Integer.MAX_VALUE) % 16);
+            checksum += (Double) record.getField("v1");
+          }
           case "q2" -> {
             groups.add((Integer) record.getField("k"));
             for (String sum : SUMS) {
