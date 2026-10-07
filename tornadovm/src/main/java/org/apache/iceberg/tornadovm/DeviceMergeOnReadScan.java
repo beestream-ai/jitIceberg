@@ -86,6 +86,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   private static final int HOST_THREADS = 8;
 
+  /** Characters of paths one batch may name in one holder: data files, delete files. */
+  private static final int PATH_CAPACITY = 1 << 16;
+
   /**
    * Rows a device batch may hold. Files are grouped up to this many rows into one read, because a
    * read of one small file is mostly latency; a file larger than this is a batch on its own.
@@ -385,19 +388,22 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final int positionCapacity;
     final int maxFiles;
 
-    final StringBuilder path = new StringBuilder();
+    // The path holders are handed to TornadoVM, which serializes a holder object the first time it
+    // transfers it and sizes that buffer then; a holder whose array later grows overflows it. So
+    // each holder gets a fixed capacity up front, and a longer path list is refused.
+    final StringBuilder path = new StringBuilder(PATH_CAPACITY);
     final long[] rowsHolder = new long[1];
     final int[] columns;
     final int[] probeSizes = new int[2];
     final IntArray meta = new IntArray(DeviceKernels.META_SIZE);
     final ByteArray positionBits;
-    final StringBuilder positionPath = new StringBuilder();
+    final StringBuilder positionPath = new StringBuilder(PATH_CAPACITY);
     final long[] positionRowsHolder = new long[1];
     final int[] positionColumn = new int[1];
     final LongArray positions;
     final IntArray segmentStarts;
     final IntArray segmentOffsets;
-    final StringBuilder setPath = new StringBuilder();
+    final StringBuilder setPath = new StringBuilder(PATH_CAPACITY);
     final long[] setRowsHolder = new long[1];
     final int[] setColumn = new int[1];
     final ByteArray inSet;
@@ -575,7 +581,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     /** Points the plan's holders and small inputs at one batch. */
     void stage(TornadoExecutionPlan executionPlan, HostDeletes.FilePrep prep, boolean keyNullable) {
       path.setLength(0);
-      path.append(prep.path());
+      hold(path, prep.path());
       rowsHolder[0] = prep.rows();
       System.arraycopy(prep.columns(), 0, columns, 0, columns.length);
       meta.set(DeviceKernels.META_ROWS, (int) prep.rows());
@@ -588,7 +594,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
 
       positionPath.setLength(0);
-      positionPath.append(prep.positionPaths());
+      hold(positionPath, prep.positionPaths());
       positionRowsHolder[0] = prep.positionRows();
       positionColumn[0] = Math.max(0, prep.positionColumn());
       meta.set(DeviceKernels.META_POSITION_ROWS, (int) prep.positionRows());
@@ -605,7 +611,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       setRowsHolder[0] = 0;
       if (!equalityId.isEmpty() && !equalityId.equals(setOnDevice)) {
         if (prep.setPaths() != null) {
-          setPath.append(prep.setPaths());
+          hold(setPath, prep.setPaths());
           setRowsHolder[0] = prep.setRows();
           setColumn[0] = prep.setColumn();
           probeSizes[1] = (int) prep.setRows();
@@ -616,6 +622,17 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
         setOnDevice = equalityId;
       }
+    }
+
+    private static void hold(StringBuilder holder, String paths) {
+      if (paths.length() >= PATH_CAPACITY) {
+        throw new UnsupportedOperationException(
+            "A batch names "
+                + paths.length()
+                + " characters of paths; the limit is "
+                + PATH_CAPACITY);
+      }
+      holder.append(paths);
     }
 
     /** Puts a host-loaded equality-delete set on the device. */
