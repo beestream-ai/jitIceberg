@@ -1,0 +1,7 @@
+NVIDIA GeForce RTX 4090, 610.57.04, 24564 MiB
+CPU(s):                               32
+Model name:                           13th Gen Intel(R) Core(TM) i9-13900K
+Thread(s) per core:                   2
+Socket(s):                            1
+               total        used        free      shared  buff/cache   available
+Mem:              62           6          51           0           4          55
