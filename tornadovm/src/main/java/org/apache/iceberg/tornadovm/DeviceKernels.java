@@ -1,0 +1,248 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.iceberg.tornadovm;
+
+import uk.ac.manchester.tornado.api.annotations.Parallel;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
+import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.api.types.arrays.LongArray;
+
+/**
+ * The Iceberg-specific parts of a merge-on-read scan, as TornadoVM kernels.
+ *
+ * <p>These are plain Java methods: TornadoVM JIT-compiles them to CUDA at the first execution of
+ * the plan that holds them. cuDF does the work that needs cross-row cooperation (Parquet decoding,
+ * the equality-delete hash probe, grouping, compaction); what is left is per-row and specific to
+ * the table format, and is written here once, in Java.
+ *
+ * <p>Every kernel runs over the plan's capacity rather than the current file's row count, because a
+ * plan is built once and reused for every file; {@code meta[META_ROWS]} says how many rows are
+ * real.
+ */
+final class DeviceKernels {
+
+  /** Rows in the current file. */
+  static final int META_ROWS = 0;
+
+  /** 1 when the current file has position deletes or a deletion vector. */
+  static final int META_HAS_POSITION_DELETES = 1;
+
+  /** 1 when the current file has equality deletes to apply. */
+  static final int META_HAS_EQUALITY_DELETES = 2;
+
+  /**
+   * 1 when the equality-delete set contains a null key, which deletes every row whose key is null.
+   */
+  static final int META_EQUALITY_SET_HAS_NULL = 3;
+
+  /** 1 when the equality key column is optional, so its validity bytes have to be consulted. */
+  static final int META_KEY_NULLABLE = 4;
+
+  static final int META_SIZE = 5;
+
+  /**
+   * The group key of a deleted or padding row. It is grouped like any other key and dropped on the
+   * host, which lets cuDF's group-by run over the plan's whole capacity without a compaction first.
+   */
+  static final int DEAD_GROUP = Integer.MIN_VALUE;
+
+  private DeviceKernels() {}
+
+  /**
+   * Merge-on-read in one pass: a row is live when it is a real row, its position is not set in the
+   * file's deletion bitmap, and its key is not in the equality-delete set.
+   *
+   * <p>Equality deletes follow Iceberg's semantics for nulls: a null in the delete set deletes rows
+   * whose key is null, and a null key is never deleted by a non-null entry.
+   *
+   * @param positionBits one bit a row, bit {@code i & 7} of byte {@code i >> 3}; set means deleted
+   * @param inEqualitySet one byte a row from cuDF's set probe; read only when the file has equality
+   *     deletes
+   * @param valid validity bytes from the Parquet read; read only when the key is nullable
+   * @param keyValidOffset where the key column's validity bytes start in {@code valid}
+   */
+  static void liveRows(
+      IntArray meta,
+      ByteArray positionBits,
+      ByteArray inEqualitySet,
+      ByteArray valid,
+      int keyValidOffset,
+      ByteArray live) {
+    for (@Parallel int i = 0; i < live.getSize(); i++) {
+      byte keep = 0;
+      if (i < meta.get(META_ROWS)) {
+        keep = 1;
+        if (meta.get(META_HAS_POSITION_DELETES) == 1
+            && ((positionBits.get(i >> 3) >> (i & 7)) & 1) == 1) {
+          keep = 0;
+        }
+        if (meta.get(META_HAS_EQUALITY_DELETES) == 1) {
+          boolean keyIsNull =
+              meta.get(META_KEY_NULLABLE) == 1 && valid.get(keyValidOffset + i) == 0;
+          if (keyIsNull) {
+            if (meta.get(META_EQUALITY_SET_HAS_NULL) == 1) {
+              keep = 0;
+            }
+          } else if (inEqualitySet.get(i) == 1) {
+            keep = 0;
+          }
+        }
+      }
+      live.set(i, keep);
+    }
+  }
+
+  /**
+   * The key each row is grouped under: its value of the group column, or {@link #DEAD_GROUP} when
+   * the row is deleted. With no group column ({@code keyOffset < 0}) every live row is group 0.
+   */
+  static void groupKeys(ByteArray live, IntArray ints, int keyOffset, IntArray groups) {
+    for (@Parallel int i = 0; i < groups.getSize(); i++) {
+      int key = DEAD_GROUP;
+      if (live.get(i) == 1) {
+        key = keyOffset < 0 ? 0 : ints.get(keyOffset + i);
+      }
+      groups.set(i, key);
+    }
+  }
+
+  /**
+   * Zeroes the nulls of optional value columns, so that cuDF's SUM ignores them as SQL's does.
+   *
+   * @param validColumn for each FP64 slot, the index of its column in the validity bytes, or -1 for
+   *     a required column
+   */
+  static void zeroNulls(
+      DoubleArray doubles, ByteArray valid, IntArray validColumn, int slots, int stride) {
+    for (@Parallel int i = 0; i < stride; i++) {
+      for (int s = 0; s < slots; s++) {
+        int column = validColumn.get(s);
+        if (column >= 0 && valid.get(column * stride + i) == 0) {
+          doubles.set(s * stride + i, 0.0);
+        }
+      }
+    }
+  }
+
+  /** Moves the surviving rows of every INT32 slot to the front, in their original order. */
+  static void gatherInts(
+      IntArray positions, IntArray count, IntArray source, int slots, int stride, IntArray target) {
+    for (@Parallel int j = 0; j < stride; j++) {
+      if (j < count.get(0)) {
+        int row = positions.get(j);
+        for (int s = 0; s < slots; s++) {
+          target.set(s * stride + j, source.get(s * stride + row));
+        }
+      }
+    }
+  }
+
+  /** {@link #gatherInts} for INT64 slots. */
+  static void gatherLongs(
+      IntArray positions,
+      IntArray count,
+      LongArray source,
+      int slots,
+      int stride,
+      LongArray target) {
+    for (@Parallel int j = 0; j < stride; j++) {
+      if (j < count.get(0)) {
+        int row = positions.get(j);
+        for (int s = 0; s < slots; s++) {
+          target.set(s * stride + j, source.get(s * stride + row));
+        }
+      }
+    }
+  }
+
+  /** {@link #gatherInts} for FP64 slots. */
+  static void gatherDoubles(
+      IntArray positions,
+      IntArray count,
+      DoubleArray source,
+      int slots,
+      int stride,
+      DoubleArray target) {
+    for (@Parallel int j = 0; j < stride; j++) {
+      if (j < count.get(0)) {
+        int row = positions.get(j);
+        for (int s = 0; s < slots; s++) {
+          target.set(s * stride + j, source.get(s * stride + row));
+        }
+      }
+    }
+  }
+
+  /** {@link #gatherInts} for validity bytes. */
+  static void gatherBytes(
+      IntArray positions,
+      IntArray count,
+      ByteArray source,
+      int slots,
+      int stride,
+      ByteArray target) {
+    for (@Parallel int j = 0; j < stride; j++) {
+      if (j < count.get(0)) {
+        int row = positions.get(j);
+        for (int s = 0; s < slots; s++) {
+          target.set(s * stride + j, source.get(s * stride + row));
+        }
+      }
+    }
+  }
+
+  /**
+   * Iceberg's {@code bucket[N]} partition transform over a long column: Murmur3 x86 32-bit of the
+   * value's 8 little-endian bytes, seed 0, made non-negative and taken modulo N -- the same
+   * function as {@code org.apache.iceberg.transforms.Bucket}, so a row lands in the bucket Iceberg
+   * would put it in. Int columns are hashed as longs by the spec, so this covers both.
+   */
+  static void bucketLong(LongArray values, int offset, int rows, int buckets, IntArray out) {
+    for (@Parallel int i = 0; i < rows; i++) {
+      long value = values.get(offset + i);
+      int h1 = mixH1(0, mixK1((int) value));
+      h1 = mixH1(h1, mixK1((int) (value >>> 32)));
+      int hash = fmix(h1, 8);
+      out.set(i, (hash & Integer.MAX_VALUE) % buckets);
+    }
+  }
+
+  private static int mixK1(int k) {
+    int k1 = k * 0xcc9e2d51;
+    k1 = (k1 << 15) | (k1 >>> 17);
+    return k1 * 0x1b873593;
+  }
+
+  private static int mixH1(int h, int k1) {
+    int h1 = h ^ k1;
+    h1 = (h1 << 13) | (h1 >>> 19);
+    return h1 * 5 + 0xe6546b64;
+  }
+
+  private static int fmix(int h, int length) {
+    int h1 = h ^ length;
+    h1 ^= h1 >>> 16;
+    h1 *= 0x85ebca6b;
+    h1 ^= h1 >>> 13;
+    h1 *= 0xc2b2ae35;
+    h1 ^= h1 >>> 16;
+    return h1;
+  }
+}

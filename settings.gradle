@@ -70,6 +70,13 @@ project(':delta-lake').name = 'iceberg-delta-lake'
 project(':open-api').name = 'iceberg-open-api'
 project(':mr').name = 'iceberg-mr'
 
+// GPU merge-on-read through TornadoVM and RAPIDS cuDF. Built only where a TornadoVM SDK is set up,
+// because its API jars come from that SDK rather than from a repository.
+if (System.getenv('TORNADOVM_HOME') != null) {
+  include 'tornadovm'
+  project(':tornadovm').name = 'iceberg-tornadovm'
+}
+
 if (null != System.getProperty("allModules")) {
   System.setProperty("flinkVersions", System.getProperty("knownFlinkVersions"))
   System.setProperty("sparkVersions", System.getProperty("knownSparkVersions"))
