@@ -220,8 +220,15 @@ public class TestDeviceMergeOnRead {
       }
     }
 
-    DeviceMergeOnReadScan scan = DeviceMergeOnReadScan.of(table);
+    assertScanMatches(DeviceMergeOnReadScan.of(table), expectedByK, expectedAll, expectedRows);
+    assertScanMatches(CpuMergeOnReadScan.of(table, 4), expectedByK, expectedAll, expectedRows);
+  }
 
+  private static void assertScanMatches(
+      MergeOnReadScan scan,
+      Map<Integer, double[]> expectedByK,
+      double[] expectedAll,
+      List<String> expectedRows) {
     AggregateResult grouped = scan.aggregate("k", SUMS);
     assertThat(grouped.groups().keySet()).isEqualTo(expectedByK.keySet());
     for (Map.Entry<Integer, double[]> entry : expectedByK.entrySet()) {
@@ -246,7 +253,7 @@ public class TestDeviceMergeOnRead {
           .isCloseTo(expectedAll[1], org.assertj.core.data.Offset.offset(1e-6));
     }
 
-    List<String> rows = Lists.newArrayList();
+    List<String> rows = java.util.Collections.synchronizedList(Lists.newArrayList());
     long live =
         scan.materialize(
             ImmutableList.of("id", "k", "v1"),

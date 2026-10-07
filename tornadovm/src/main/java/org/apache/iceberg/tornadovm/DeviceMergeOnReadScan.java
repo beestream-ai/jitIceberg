@@ -72,7 +72,7 @@ import uk.ac.manchester.tornado.cudf.enums.CudfType;
  * LONG column. Anything else is refused with {@link UnsupportedOperationException} rather than
  * answered wrongly.
  */
-public final class DeviceMergeOnReadScan {
+public final class DeviceMergeOnReadScan implements MergeOnReadScan {
 
   private static final int HOST_THREADS = 4;
 
@@ -98,7 +98,7 @@ public final class DeviceMergeOnReadScan {
     }
   }
 
-  /** The metrics of the last scan. */
+  @Override
   public ScanMetrics metrics() {
     return metrics;
   }
@@ -108,6 +108,7 @@ public final class DeviceMergeOnReadScan {
    * live rows. With a null group column, one group keyed 0. Sum columns must be DOUBLE; nulls are
    * skipped as SQL skips them. The group column must be a required INT.
    */
+  @Override
   public AggregateResult aggregate(String groupColumn, String... sumColumns) {
     if (sumColumns.length == 0) {
       throw new IllegalArgumentException("aggregate needs at least one sum column");
@@ -237,7 +238,8 @@ public final class DeviceMergeOnReadScan {
    *
    * @return the number of live rows
    */
-  public long materialize(List<String> columns, Consumer<HostBatch> consumer) {
+  @Override
+  public long materialize(List<String> columns, Consumer<LiveRows> consumer) {
     Scan scan = new Scan(null, columns);
     ScanLayout layout = scan.layout;
     int capacity = scan.capacity;

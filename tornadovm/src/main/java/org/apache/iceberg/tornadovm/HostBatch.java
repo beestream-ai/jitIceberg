@@ -31,7 +31,7 @@ import uk.ac.manchester.tornado.cudf.enums.CudfType;
  * The live rows of one data file, copied back from the device: column-major, one typed buffer a
  * physical type, each column at element {@code slot * stride}.
  */
-public final class HostBatch {
+public final class HostBatch implements LiveRows {
   private final ScanLayout layout;
   private final Map<String, Integer> idByName;
   private final int rows;
@@ -60,6 +60,7 @@ public final class HostBatch {
     this.valid = valid;
   }
 
+  @Override
   public int rows() {
     return rows;
   }
@@ -76,19 +77,23 @@ public final class HostBatch {
     return layout.slot(id) * stride;
   }
 
+  @Override
   public boolean isNull(String column, int row) {
     return layout.anyOptional()
         && valid.get(layout.readIndex(idByName.get(column)) * stride + row) == 0;
   }
 
+  @Override
   public int getInt(String column, int row) {
     return ints.get(base(column, CudfType.INT32) + row);
   }
 
+  @Override
   public long getLong(String column, int row) {
     return longs.get(base(column, CudfType.INT64) + row);
   }
 
+  @Override
   public double getDouble(String column, int row) {
     return doubles.get(base(column, CudfType.FLOAT64) + row);
   }
