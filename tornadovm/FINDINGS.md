@@ -20,7 +20,7 @@
 ## Summary
 
 On 100M rows (64 Parquet files) with every kind of Iceberg delete, the GPU scan is **2-3x faster than
-the same algorithm on all 32 CPU threads, and 2-3x faster than Spark 3.5**:
+the same algorithm on all 32 CPU threads, and 1.4-3x faster than Spark 3.5**:
 
 - **Equality deletes:** the gap widens to **4-6x vs the CPU and 8-23x vs Spark**. At 10M equality
   deletes, Spark runs out of memory with a 40 GB heap.
@@ -141,8 +141,8 @@ how fast data reaches the device, not by the merge-on-read logic.
   - `readParquetColumns` (cuDF): 9.7 ms of 11.1 ms;
   - the two cuDF group-bys: 0.8 ms;
   - each TornadoVM kernel: about 20 us.
-- **Batching:** 1M-row reads are latency-bound. Reading 8M rows of several files in one cuDF call
-  took Q2 from about 700 ms to 470 ms.
+- **Batching:** 1M-row reads are latency-bound. Reading several files in one cuDF call took the
+  device time of Q2 on 4M rows from about 65 ms to 40 ms.
 - **Streams:** three batches in flight, each in its own region with its own CUDA stream, overlap
   file reads and copies with decoding. That took Q2 from 470 ms to 290 ms, about 10.7 GB/s of
   Parquet.
