@@ -44,12 +44,16 @@ LABEL = {
 
 runs = defaultdict(list)
 answers = defaultdict(set)
+failed = set()
 for path in glob.glob(os.path.join(sys.argv[1], "*-q*.csv")):
     with open(path) as f:
         for row in csv.DictReader(f):
+            key = (row["table"], row["engine"], row["query"])
+            if row["run"] == "failed":
+                failed.add(key)
+                continue
             if not row.get("millis"):
                 continue
-            key = (row["table"], row["engine"], row["query"])
             if row["warmup"] == "no":
                 runs[key].append(float(row["millis"]))
             answers[(row["table"], row["query"])].add((row["engine"], row["live_rows"], row["checksum"]))
@@ -86,7 +90,12 @@ for query, title in [
             continue
         rows = next(iter(r for _, r, _ in answers[(table, query)]))
         cells = [LABEL[table], f"{int(rows):,}"]
-        cells += [f"{medians[e]:,.0f}" if e in medians else "" for e in present]
+        def cell(e):
+            if e in medians:
+                return f"{medians[e]:,.0f}"
+            return "failed (OOM)" if (table, e, query) in failed else ""
+
+        cells += [cell(e) for e in present]
         cells += [f"{medians[e] / medians['gpu']:.1f}x" if e in medians else "" for e in present if e != "gpu"]
         cells.append(agree(table, query))
         print("| " + " | ".join(cells) + " |")

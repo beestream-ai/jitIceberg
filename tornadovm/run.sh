@@ -52,7 +52,12 @@ case "$mode" in
     gpu)
         CP="$(classpath)"
         # The argfile puts TornadoVM on the module path; -da for TornadoVM packages, see build.gradle.
-        exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" -Xmx"$HEAP" \
+        # tornado.device.memory is TornadoVM's own device budget (4 GB by default); buffers a closed
+        # plan released stay counted against it until reused by the same access type.
+        # The heap stays under 32 GB: TornadoVM serializes object arguments (the path holders)
+        # assuming compressed oops, which a larger heap turns off.
+        exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" -Xmx"${GPU_HEAP:-24g}" \
+            -Dtornado.device.memory="${TORNADO_DEVICE_MEMORY:-20GB}" \
             -da:tornado... -da:uk.ac.manchester.tornado... -cp "$CP" \
             org.apache.iceberg.tornadovm.bench.MorBench "$1" gpu "${@:2}"
         ;;
