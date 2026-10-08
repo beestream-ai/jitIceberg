@@ -44,6 +44,35 @@ merge-on-read, filters and compaction.
 **Bound:** the device time goes to cuDF reading and, for compaction, writing Parquet. The
 TornadoVM kernels that apply Iceberg's deletes, filters and transforms take microseconds a batch.
 
+## Round 2: Spark RAPIDS, z-order, multi-column deletes, strings, TPC-H (2026-10-08)
+
+Full results are in `mikepapadim/iceberg-tornado-operf` (`results/sweep2`). In all 87 cells
+(10M/100M/500M x Q1/Q2/Q4/compaction/z-order, plus TPC-H SF10 Q1/Q6), every engine that finishes
+returns the same answer, and the GPU is fastest in every cell.
+
+**Against the 32-thread CPU (same algorithm):** 1.2–9.3x at 10M, 1.8–6.9x at 100M, 1.9–6.2x at 500M.
+The footer and delete-set cache took warm Q1 at 10M from 105 ms to 21 ms.
+
+**Against Spark RAPIDS 26.08** (same GPU, Iceberg 1.10.2, the newest it accepts):
+- scans: 2.4–5.7x at 100M, 1.7–5.1x at 500M;
+- TPC-H: 3.6–6.9x;
+- it fails on v3 deletion vectors (it reads the Puffin file as Parquet) and cannot run
+  `rewrite_data_files`.
+
+**Against Spark 3.5:**
+- compaction: 1.3–3.6x;
+- z-order: 4.2–8.8x (13.7 s vs 65–122 s at 500M);
+- runs out of memory on 10M equality keys at every scale.
+
+**TPC-H SF10 Q1** (position deletes): GPU 129 ms, Spark 666 ms, RAPIDS 643 ms, IcebergGenerics 9.6 s.
+
+**TornadoVM PRs:**
+- #1206 `sortKeys`, approved;
+- #1207 `sortedOrderLongs`, `readParquetStringColumns`, `groupAggregateLongs`;
+- #1208 sketcher race: the static `methodAccesses` field let sketches built concurrently swap
+  argument accesses. It surfaced as an `ArrayIndexOutOfBoundsException` in `compileTask` during
+  the 500M z-order run. The new test fails 5 of 5 runs before the fix and passes 8 of 8 after.
+
 ## Scale sweep, sorted probe and v3 lineage (2026-10-08)
 
 - **Scale sweep:** 10M, 100M and 500M rows, across GPU, CPU and Spark, for Q1, Q2, Q4 and
