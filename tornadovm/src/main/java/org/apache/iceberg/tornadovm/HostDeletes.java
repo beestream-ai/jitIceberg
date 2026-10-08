@@ -219,7 +219,14 @@ final class HostDeletes {
   private final boolean deviceDeletes;
   private final BaseDeleteLoader deleteLoader;
   private final Map<String, EqualitySet> equalitySets = Maps.newConcurrentMap();
-  private final Map<String, Integer> columnByPathAndId = Maps.newConcurrentMap();
+
+  // Parquet footers and column positions, kept across scans: Iceberg never rewrites a file in
+  // place,
+  // so a path names the same bytes for as long as it exists. Small (a schema a file), and bounded.
+  private static final com.github.benmanes.caffeine.cache.Cache<String, MessageType> FOOTERS =
+      com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(200_000).build();
+  private static final com.github.benmanes.caffeine.cache.Cache<String, Integer> COLUMNS =
+      com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(200_000).build();
 
   /**
    * @param deviceDeletes whether delete files the device can read are left to it; false loads every
@@ -435,7 +442,7 @@ final class HostDeletes {
 
   /** The Parquet column index of a field id in a file, from its footer. */
   private int column(String path, int fieldId) {
-    return columnByPathAndId.computeIfAbsent(
+    return COLUMNS.get(
         path + "#" + fieldId,
         ignored -> {
           MessageType schema = footerSchema(path);
@@ -451,6 +458,10 @@ final class HostDeletes {
   }
 
   private static MessageType footerSchema(String path) {
+    return FOOTERS.get(path, HostDeletes::readFooterSchema);
+  }
+
+  private static MessageType readFooterSchema(String path) {
     try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(Paths.get(path)))) {
       return reader.getFileMetaData().getSchema();
     } catch (IOException e) {

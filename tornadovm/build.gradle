@@ -44,6 +44,7 @@ dependencies {
   implementation project(':iceberg-data')
   implementation project(':iceberg-parquet')
   implementation project(':iceberg-arrow')
+  implementation libs.caffeine
 
   implementation(libs.parquet.hadoop) {
     exclude group: 'org.apache.avro', module: 'avro'
