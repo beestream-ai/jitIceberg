@@ -78,8 +78,8 @@ public final class MorBench {
               ? DeviceMergeOnReadScan.of(table, filter)
               : "cpu".equals(engine) ? CpuMergeOnReadScan.of(table, threads, filter) : null;
       for (int run = 0; run < runs; run++) {
-        if ("rewrite".equals(query)) {
-          rewriteRun(table, (DeviceMergeOnReadScan) scan, run, args[t], threads);
+        if ("rewrite".equals(query) || "zorder".equals(query)) {
+          rewriteRun(table, (DeviceMergeOnReadScan) scan, run, args[t], threads, query);
           continue;
         }
         long start = System.nanoTime();
@@ -166,11 +166,13 @@ public final class MorBench {
    * the files the rewrite wrote, so every run starts from the same merge-on-read table.
    */
   private static void rewriteRun(
-      Table table, DeviceMergeOnReadScan scan, int run, String name, int threads) {
+      Table table, DeviceMergeOnReadScan scan, int run, String name, int threads, String query) {
     table.refresh();
     long snapshot = table.currentSnapshot().snapshotId();
     long start = System.nanoTime();
-    DeviceMergeOnReadScan.RewriteResult result = scan.rewriteDataFiles();
+    // zorder: the same compaction, each file written in Iceberg's Z-order of (k, v1).
+    DeviceMergeOnReadScan.RewriteResult result =
+        "zorder".equals(query) ? scan.rewriteDataFilesZOrder("k", "v1") : scan.rewriteDataFiles();
     double millis = (System.nanoTime() - start) / 1e6;
     table.refresh();
     double[] check = run(CpuMergeOnReadScan.of(table, threads), "q2");
@@ -186,8 +188,9 @@ public final class MorBench {
     System.out.println(
         String.format(
             Locale.ROOT,
-            "%s,gpu,rewrite,%d,%s,%.1f,%d,%.6e,\"%s; %d data + %d delete files -> %d files\"",
+            "%s,gpu,%s,%d,%s,%.1f,%d,%.6e,\"%s; %d data + %d delete files -> %d files\"",
             name,
+            query,
             run,
             run == 0 ? "yes" : "no",
             millis,

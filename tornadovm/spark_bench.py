@@ -38,7 +38,7 @@ spark = SparkSession.builder.appName("mor-bench").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
 print("table,engine,query,run,warmup,millis,live_rows,checksum,breakdown", flush=True)
-def rewrite_run(name, run):
+def rewrite_run(name, run, query="rewrite"):
     # Compaction: rewrite every file with its deletes applied, check Q2's answer on the result,
     # then restore the snapshot the table had and delete the files the rewrite wrote, so every run
     # starts from the same merge-on-read table.
@@ -52,7 +52,9 @@ def rewrite_run(name, run):
         "'target-file-size-bytes','134217728'",
     )
     start = time.perf_counter()
-    spark.sql(f"CALL local.system.rewrite_data_files(table => '{namespace}.{name}', options => map({options}))").collect()
+    # zorder: the same compaction, sorting each file group by Iceberg's Z-order of (k, v1).
+    sort = ", strategy => 'sort', sort_order => 'zorder(k, v1)'" if query == "zorder" else ""
+    spark.sql(f"CALL local.system.rewrite_data_files(table => '{namespace}.{name}'{sort}, options => map({options}))").collect()
     millis = (time.perf_counter() - start) * 1000
     spark.sql(f"REFRESH TABLE {table}")
     result = spark.sql(
@@ -66,13 +68,13 @@ def rewrite_run(name, run):
         local = path[len("file:"):] if path.startswith("file:") else path
         if os.path.exists(local):
             os.remove(local)
-    print(f"{name},{engine},rewrite,{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"{len(added)} files\"", flush=True)
+    print(f"{name},{engine},{query},{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"{len(added)} files\"", flush=True)
 
 
 for name in tables:
-    if query == "rewrite":
+    if query in ("rewrite", "zorder"):
         for run in range(runs):
-            rewrite_run(name, run)
+            rewrite_run(name, run, query)
         continue
     reader = spark.read.format("iceberg")
     if os.environ.get("SPLIT_SIZE"):
