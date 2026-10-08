@@ -30,6 +30,8 @@ import time
 from pyspark.sql import SparkSession
 
 warehouse, query, runs, tables = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
+# The catalog's warehouse is the warehouse's parent, so its tables are <warehouse name>.<table>.
+namespace = os.path.basename(warehouse.rstrip("/"))
 spark = SparkSession.builder.appName("mor-bench").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
@@ -38,7 +40,7 @@ def rewrite_run(name, run):
     # Compaction: rewrite every file with its deletes applied, check Q2's answer on the result,
     # then restore the snapshot the table had and delete the files the rewrite wrote, so every run
     # starts from the same merge-on-read table.
-    table = f"local.wh.{name}"
+    table = f"local.{namespace}.{name}"
     snapshot = spark.sql(f"SELECT snapshot_id FROM {table}.refs WHERE name = 'main'").collect()[0][0]
     before = {r[0] for r in spark.sql(f"SELECT file_path FROM {table}.files").collect()}
     options = os.environ.get(
@@ -48,7 +50,7 @@ def rewrite_run(name, run):
         "'target-file-size-bytes','134217728'",
     )
     start = time.perf_counter()
-    spark.sql(f"CALL local.system.rewrite_data_files(table => 'wh.{name}', options => map({options}))").collect()
+    spark.sql(f"CALL local.system.rewrite_data_files(table => '{namespace}.{name}', options => map({options}))").collect()
     millis = (time.perf_counter() - start) * 1000
     spark.sql(f"REFRESH TABLE {table}")
     result = spark.sql(
@@ -57,7 +59,7 @@ def rewrite_run(name, run):
     rows = sum(r["c"] for r in result)
     checksum = sum(r["a"] + r["b"] + r["d"] + r["e"] for r in result) + len(result)
     added = [r[0] for r in spark.sql(f"SELECT file_path FROM {table}.files").collect() if r[0] not in before]
-    spark.sql(f"CALL local.system.set_current_snapshot('wh.{name}', {snapshot})").collect()
+    spark.sql(f"CALL local.system.set_current_snapshot('{namespace}.{name}', {snapshot})").collect()
     for path in added:
         local = path[len("file:"):] if path.startswith("file:") else path
         if os.path.exists(local):

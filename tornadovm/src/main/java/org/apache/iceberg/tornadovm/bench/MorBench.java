@@ -178,8 +178,11 @@ public final class MorBench {
     for (org.apache.iceberg.DataFile file : table.currentSnapshot().addedDataFiles(table.io())) {
       added.add(file.location());
     }
-    table.manageSnapshots().rollbackTo(snapshot).commit();
-    added.forEach(table.io()::deleteFile);
+    // -Diceberg.tornadovm.keep-rewrite=true keeps the rewrite, for checking it with other readers.
+    if (!Boolean.getBoolean("iceberg.tornadovm.keep-rewrite")) {
+      table.manageSnapshots().rollbackTo(snapshot).commit();
+      added.forEach(table.io()::deleteFile);
+    }
     System.out.println(
         String.format(
             Locale.ROOT,
