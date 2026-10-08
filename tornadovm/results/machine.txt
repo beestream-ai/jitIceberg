@@ -4,4 +4,4 @@ Model name:                           13th Gen Intel(R) Core(TM) i9-13900K
 Thread(s) per core:                   2
 Socket(s):                            1
                total        used        free      shared  buff/cache   available
-Mem:              62           6          51           0           4          55
+Mem:              62           8          44           0           9          53

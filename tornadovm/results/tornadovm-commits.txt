@@ -1,0 +1,8 @@
+04828f863 Merge branches 'feat/cudf-write-parquet', 'fix/device-memory-reclaim' and 'fix/tile-view-bytearray-rank3' into local/iceberg-integration
+418dc7d80 [cudf] writeParquetColumns: write device buffers to a Parquet file
+710b1a594 [runtime] Release the device buffers of device-only intermediates when a plan is freed
+2f3eb7b5d [api][cuda][opencl] Register no compiler plugin for a method that does not exist
+669e1922a Merge pull request #1200 from mikepapadim/feat/cudf-iceberg
+4a2866368 [runtime] Pass a library task's text arguments by reference, not as device objects
+63cf528cf [cudf] readParquetColumns: several files in one read; an empty holder reads nothing
+362c62cfb [cudf] Typed, nullable Parquet reads and set membership, for lakehouse merge-on-read

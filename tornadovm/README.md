@@ -39,7 +39,10 @@ try (DeviceMergeOnReadScan scan = DeviceMergeOnReadScan.of(table)) {
   AggregateResult byK = scan.aggregate("k", "v1", "v2");          // GROUP BY k: COUNT(*), SUM(v1), SUM(v2)
   AggregateResult buckets = scan.aggregateByBucket("id", 16, "v1"); // GROUP BY bucket(16, id)
   long live = scan.materialize(List.of("id", "k", "v1"), rows -> { ... }); // live rows, on the host
+  scan.rewriteDataFiles();                                        // compaction: deletes applied, files rewritten
 }
+// Filters: Iceberg prunes files, the device applies the residual.
+DeviceMergeOnReadScan.of(table, Expressions.and(lessThan("id", 25_000_000L), greaterThan("v2", 0.5)));
 ```
 
 Each query goes through these steps:
