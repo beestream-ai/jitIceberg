@@ -38,6 +38,7 @@ import org.apache.iceberg.arrow.vectorized.ArrowReader;
 import org.apache.iceberg.arrow.vectorized.ColumnVector;
 import org.apache.iceberg.arrow.vectorized.ColumnarBatch;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -62,15 +63,22 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
 
   private final Table table;
   private final int threads;
+  private final Expression filter;
   private ScanMetrics metrics = new ScanMetrics();
 
-  private CpuMergeOnReadScan(Table table, int threads) {
+  private CpuMergeOnReadScan(Table table, int threads, Expression filter) {
     this.table = table;
     this.threads = threads;
+    this.filter = filter;
   }
 
   public static CpuMergeOnReadScan of(Table table, int threads) {
-    return new CpuMergeOnReadScan(table, threads);
+    return new CpuMergeOnReadScan(table, threads, Expressions.alwaysTrue());
+  }
+
+  /** Same contract as {@link DeviceMergeOnReadScan#of(Table, Expression)}. */
+  public static CpuMergeOnReadScan of(Table table, int threads, Expression filter) {
+    return new CpuMergeOnReadScan(table, threads, filter);
   }
 
   @Override
@@ -113,7 +121,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
   public long materialize(List<String> columns, Consumer<LiveRows> consumer) {
     return run(
         columns,
-        (file, columnIndex) -> new RowSink(columnIndex, file.recordCount()),
+        (file, columnIndex) -> new RowSink(columnIndex, file.recordCount(), table.schema()),
         sinks -> {
           for (RowSink sink : sinks) {
             consumer.accept(sink);
@@ -137,13 +145,20 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     metrics = new ScanMetrics();
     long start = System.nanoTime();
     List<FileScanTask> tasks;
-    try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+    try (CloseableIterable<FileScanTask> planned = table.newScan().filter(filter).planFiles()) {
       tasks = Lists.newArrayList(planned);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
     Integer equalityKeyId = HostDeletes.equalityKeyId(tasks);
     List<String> read = Lists.newArrayList(projection);
+    for (int fieldId : DevicePredicate.fieldIds(filter, table.schema())) {
+      String name = table.schema().findField(fieldId).name();
+      if (!read.contains(name)) {
+        read.add(name);
+      }
+    }
+    boolean filtered = filter.op() != Expression.Operation.TRUE;
     String keyName = null;
     if (equalityKeyId != null) {
       keyName = table.schema().findField(equalityKeyId).name();
@@ -183,6 +198,13 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
                               equality.id(), ignored -> new PrimitiveHash.LongSet(equality.keys()));
                   boolean setHasNull = equality != null && equality.hasNull();
                   S sink = factory.create(task.file(), columnIndex);
+                  RowFilter rowFilter =
+                      filtered
+                          ? new RowFilter(
+                              DevicePredicate.compile(task.residual(), table.schema()),
+                              table.schema(),
+                              columnIndex)
+                          : null;
                   try (ArrowReader reader =
                           new ArrowReader(table.newScan().select(read), BATCH_ROWS, true);
                       CloseableIterator<ColumnarBatch> batches =
@@ -208,6 +230,9 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
                           } else if (set.contains(keyIsInt ? key.getInt(r) : key.getLong(r))) {
                             continue;
                           }
+                        }
+                        if (rowFilter != null && !rowFilter.test(batch, r)) {
+                          continue;
                         }
                         sink.accept(batch, r);
                       }
@@ -237,6 +262,116 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     }
     metrics.total((System.nanoTime() - start) / 1e6);
     return live;
+  }
+
+  /**
+   * The residual filter as the device evaluates it -- the same compiled terms -- read straight from
+   * Arrow vectors without boxing a value per row.
+   */
+  private static final class RowFilter {
+    private final int[] columns;
+    private final int[] kinds;
+    private final int[] ops;
+    private final long[][] longs;
+    private final double[][] doubles;
+
+    RowFilter(
+        DevicePredicate predicate, org.apache.iceberg.Schema schema, Map<String, Integer> index) {
+      List<DevicePredicate.Term> terms = predicate.terms();
+      this.columns = new int[terms.size()];
+      this.kinds = new int[terms.size()];
+      this.ops = new int[terms.size()];
+      this.longs = new long[terms.size()][];
+      this.doubles = new double[terms.size()][];
+      for (int t = 0; t < terms.size(); t++) {
+        DevicePredicate.Term term = terms.get(t);
+        ops[t] = term.op();
+        if (term.op() == DevicePredicate.OP_FALSE) {
+          continue;
+        }
+        columns[t] = index.get(schema.findField(term.fieldId()).name());
+        kinds[t] = term.kind().code();
+        longs[t] = term.longs();
+        doubles[t] = term.doubles();
+      }
+    }
+
+    boolean test(ColumnarBatch batch, int row) {
+      for (int t = 0; t < ops.length; t++) {
+        int op = ops[t];
+        if (op == DevicePredicate.OP_FALSE) {
+          return false;
+        }
+        ColumnVector vector = batch.column(columns[t]);
+        boolean isNull = vector.isNullAt(row);
+        if (op == DevicePredicate.OP_IS_NULL) {
+          if (!isNull) {
+            return false;
+          }
+        } else if (op == DevicePredicate.OP_NOT_NULL) {
+          if (isNull) {
+            return false;
+          }
+        } else if (isNull) {
+          // Iceberg's evaluator orders nulls first, as the device kernel does.
+          if (op != DevicePredicate.OP_LT
+              && op != DevicePredicate.OP_LT_EQ
+              && op != DevicePredicate.OP_NOT_EQ) {
+            return false;
+          }
+        } else if (kinds[t] == CudfType.FLOAT64.code()) {
+          if (!compare(vector.getDouble(row), op, doubles[t])) {
+            return false;
+          }
+        } else {
+          long value = kinds[t] == CudfType.INT64.code() ? vector.getLong(row) : vector.getInt(row);
+          if (!compare(value, op, longs[t])) {
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    private static boolean compare(double value, int op, double[] constants) {
+      if (op == DevicePredicate.OP_IN) {
+        for (double constant : constants) {
+          if (value == constant) {
+            return true;
+          }
+        }
+        return false;
+      }
+      double constant = constants[0];
+      return switch (op) {
+        case DevicePredicate.OP_LT -> value < constant;
+        case DevicePredicate.OP_LT_EQ -> value <= constant;
+        case DevicePredicate.OP_GT -> value > constant;
+        case DevicePredicate.OP_GT_EQ -> value >= constant;
+        case DevicePredicate.OP_EQ -> value == constant;
+        default -> value != constant;
+      };
+    }
+
+    private static boolean compare(long value, int op, long[] constants) {
+      if (op == DevicePredicate.OP_IN) {
+        for (long constant : constants) {
+          if (value == constant) {
+            return true;
+          }
+        }
+        return false;
+      }
+      long constant = constants[0];
+      return switch (op) {
+        case DevicePredicate.OP_LT -> value < constant;
+        case DevicePredicate.OP_LT_EQ -> value <= constant;
+        case DevicePredicate.OP_GT -> value > constant;
+        case DevicePredicate.OP_GT_EQ -> value >= constant;
+        case DevicePredicate.OP_EQ -> value == constant;
+        default -> value != constant;
+      };
+    }
   }
 
   /** Grouped COUNT and SUMs over one file's live rows, with SQL's null-skipping SUM. */
@@ -307,12 +442,17 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     private final boolean[][] nulls;
     private int rows = 0;
 
-    RowSink(Map<String, Integer> columnIndex, long capacity) {
+    RowSink(Map<String, Integer> columnIndex, long capacity, org.apache.iceberg.Schema schema) {
       this.columnIndex = columnIndex;
       this.columns = new Object[columnIndex.size()];
       this.nulls = new boolean[columnIndex.size()][];
       this.capacityHint = (int) capacity;
+      this.types = new CudfType[columnIndex.size()];
+      columnIndex.forEach(
+          (name, index) -> types[index] = ScanLayout.cudfType(schema.findField(name)));
     }
+
+    private final CudfType[] types;
 
     private final int capacityHint;
 
@@ -321,7 +461,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       for (int c = 0; c < columns.length; c++) {
         ColumnVector vector = batch.column(c);
         if (columns[c] == null) {
-          columns[c] = allocate(vector, capacityHint);
+          columns[c] = allocate(types[c], capacityHint);
           nulls[c] = new boolean[capacityHint];
         }
         boolean isNull = vector.isNullAt(row);
@@ -341,16 +481,13 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       rows++;
     }
 
-    private static Object allocate(ColumnVector vector, int capacity) {
-      org.apache.arrow.vector.FieldVector arrow = vector.getFieldVector();
-      if (arrow instanceof org.apache.arrow.vector.BigIntVector
-          || arrow instanceof org.apache.arrow.vector.TimeStampVector) {
-        return new long[capacity];
-      } else if (arrow instanceof org.apache.arrow.vector.IntVector
-          || arrow instanceof org.apache.arrow.vector.DateDayVector) {
-        return new int[capacity];
-      }
-      return new double[capacity];
+    /** The column's array, by its Iceberg type: the Arrow vector class depends on the encoding. */
+    private static Object allocate(CudfType type, int capacity) {
+      return switch (type) {
+        case INT64 -> new long[capacity];
+        case INT32 -> new int[capacity];
+        case FLOAT64 -> new double[capacity];
+      };
     }
 
     @Override

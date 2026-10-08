@@ -188,6 +188,79 @@ public class TestDeviceMergeOnRead {
     assertMatchesIceberg(table);
   }
 
+  /**
+   * Filters: Iceberg prunes files with the filter's statistics, the device applies the residual to
+   * the rows that survive the deletes. Ranges, IN, inequality and constants of every column type.
+   */
+  @Test
+  public void testFilters() throws IOException {
+    Table table = MorTables.create(temp.resolve("filters").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 1000, 2500, 700);
+    MorTables.deletePositions(
+        table,
+        files,
+        ImmutableList.of(everyNth(1000, 10), randomPositions(2500, 0.3, 4), new long[0]));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(5L, 7L, 1_000_123L, 2_000_699L));
+
+    // Prunes the first file by its id bounds; the rest is a residual.
+    assertMatchesIceberg(
+        table, org.apache.iceberg.expressions.Expressions.greaterThanOrEqual("id", 1_000_000L));
+    // Prunes all but the second file.
+    assertMatchesIceberg(
+        table,
+        org.apache.iceberg.expressions.Expressions.and(
+            org.apache.iceberg.expressions.Expressions.greaterThan("id", 1_000_100L),
+            org.apache.iceberg.expressions.Expressions.lessThan("id", 1_002_000L)));
+    // Residual only: every file has some rows each way.
+    assertMatchesIceberg(
+        table,
+        org.apache.iceberg.expressions.Expressions.and(
+            org.apache.iceberg.expressions.Expressions.in("k", 1, 3, 5),
+            org.apache.iceberg.expressions.Expressions.lessThanOrEqual("v1", 400.0),
+            org.apache.iceberg.expressions.Expressions.notEqual("v3", 2.0)));
+    // Nothing matches.
+    assertMatchesIceberg(table, org.apache.iceberg.expressions.Expressions.equal("v4", 2.0));
+  }
+
+  /** Filters on optional columns: a comparison with a null does not hold; IS [NOT] NULL do. */
+  @Test
+  public void testFiltersOnNulls() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.required(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("filternulls").toString(), schema, 2);
+    DataFile file =
+        MorTables.writeDataFile(
+            table,
+            3000,
+            i -> {
+              Record record = row(schema, 0, i);
+              if (i % 5 == 0) {
+                record.setField("id", null);
+              }
+              if (i % 4 == 0) {
+                record.setField("v1", null);
+              }
+              return record;
+            });
+    MorTables.append(table, ImmutableList.of(file));
+    MorTables.deletePositions(table, ImmutableList.of(file), ImmutableList.of(everyNth(3000, 9)));
+    assertMatchesIceberg(table, org.apache.iceberg.expressions.Expressions.notNull("v1"));
+    assertMatchesIceberg(table, org.apache.iceberg.expressions.Expressions.isNull("id"));
+    assertMatchesIceberg(
+        table, org.apache.iceberg.expressions.Expressions.greaterThan("v1", 100.0));
+    assertMatchesIceberg(
+        table,
+        org.apache.iceberg.expressions.Expressions.and(
+            org.apache.iceberg.expressions.Expressions.notEqual("id", 10L),
+            org.apache.iceberg.expressions.Expressions.lessThan("k", 4)));
+  }
+
   /** An equality key of type INT, which the device probes as 32-bit keys. */
   @Test
   public void testIntEqualityKey() throws IOException {
@@ -200,6 +273,11 @@ public class TestDeviceMergeOnRead {
   // ---------------------------------------------------------------------------------------------
 
   private static void assertMatchesIceberg(Table table) throws IOException {
+    assertMatchesIceberg(table, org.apache.iceberg.expressions.Expressions.alwaysTrue());
+  }
+
+  private static void assertMatchesIceberg(
+      Table table, org.apache.iceberg.expressions.Expression filter) throws IOException {
     table.refresh();
     Map<Integer, double[]> expectedByK = new TreeMap<>();
     Map<Integer, double[]> expectedByBucket = new TreeMap<>();
@@ -209,7 +287,7 @@ public class TestDeviceMergeOnRead {
         bucket.bind(org.apache.iceberg.types.Types.LongType.get());
     double[] expectedAll = new double[2];
     List<String> expectedRows = Lists.newArrayList();
-    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
       for (Record record : records) {
         int k = (Integer) record.getField("k");
         double[] totals = expectedByK.computeIfAbsent(k, ignored -> new double[1 + SUMS.length]);
@@ -232,7 +310,7 @@ public class TestDeviceMergeOnRead {
       }
     }
 
-    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table, filter)) {
       assertScanMatches(device, expectedByK, expectedAll, expectedRows);
       // Again on the same scan, which reuses its device buffers and plans.
       assertScanMatches(device, expectedByK, expectedAll, expectedRows);
@@ -240,7 +318,7 @@ public class TestDeviceMergeOnRead {
         assertBucketsMatch(device, expectedByBucket);
       }
     }
-    MergeOnReadScan cpu = CpuMergeOnReadScan.of(table, 4);
+    MergeOnReadScan cpu = CpuMergeOnReadScan.of(table, 4, filter);
     assertScanMatches(cpu, expectedByK, expectedAll, expectedRows);
     if (table.schema().findField("id").isRequired()) {
       assertBucketsMatch(cpu, expectedByBucket);

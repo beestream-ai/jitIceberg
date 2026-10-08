@@ -144,6 +144,121 @@ final class DeviceKernels {
   }
 
   /**
+   * Applies a scan's residual filter to the live rows: a conjunction of compiled terms (see {@link
+   * DevicePredicate}), each a column compared with constants. A row stays live only if every term
+   * holds. Nulls follow Iceberg's row evaluator, which orders them first.
+   */
+  static void filterRows(
+      IntArray terms,
+      LongArray longConstants,
+      DoubleArray doubleConstants,
+      IntArray ints,
+      LongArray longs,
+      DoubleArray doubles,
+      ByteArray valid,
+      int stride,
+      ByteArray live) {
+    for (@Parallel int i = 0; i < live.getSize(); i++) {
+      if (live.get(i) == 1) {
+        int count = terms.get(0);
+        boolean keep = true;
+        for (int t = 0; t < count; t++) {
+          int base = 1 + t * DevicePredicate.TERM_INTS;
+          int kind = terms.get(base);
+          int op = terms.get(base + 1);
+          int offset = terms.get(base + 2);
+          int validColumn = terms.get(base + 3);
+          int first = terms.get(base + 4);
+          int constants = terms.get(base + 5);
+          boolean isNull = validColumn >= 0 && valid.get(validColumn * stride + i) == 0;
+          boolean pass;
+          if (op == DevicePredicate.OP_FALSE) {
+            pass = false;
+          } else if (op == DevicePredicate.OP_IS_NULL) {
+            pass = isNull;
+          } else if (op == DevicePredicate.OP_NOT_NULL) {
+            pass = !isNull;
+          } else if (isNull) {
+            // Iceberg's own evaluator compares with nulls first: a null is below every value.
+            pass =
+                op == DevicePredicate.OP_LT
+                    || op == DevicePredicate.OP_LT_EQ
+                    || op == DevicePredicate.OP_NOT_EQ;
+          } else if (kind == 2) {
+            pass = compareDouble(doubles.get(offset + i), op, doubleConstants, first, constants);
+          } else if (kind == 1) {
+            pass = compareLong(longs.get(offset + i), op, longConstants, first, constants);
+          } else {
+            pass = compareLong(ints.get(offset + i), op, longConstants, first, constants);
+          }
+          keep = keep && pass;
+        }
+        if (!keep) {
+          live.set(i, (byte) 0);
+        }
+      }
+    }
+  }
+
+  private static boolean compareLong(
+      long value, int op, LongArray constants, int first, int count) {
+    boolean pass;
+    if (op == DevicePredicate.OP_IN) {
+      pass = false;
+      for (int c = 0; c < count; c++) {
+        if (value == constants.get(first + c)) {
+          pass = true;
+        }
+      }
+    } else {
+      long constant = constants.get(first);
+      if (op == DevicePredicate.OP_LT) {
+        pass = value < constant;
+      } else if (op == DevicePredicate.OP_LT_EQ) {
+        pass = value <= constant;
+      } else if (op == DevicePredicate.OP_GT) {
+        pass = value > constant;
+      } else if (op == DevicePredicate.OP_GT_EQ) {
+        pass = value >= constant;
+      } else if (op == DevicePredicate.OP_EQ) {
+        pass = value == constant;
+      } else {
+        pass = value != constant;
+      }
+    }
+    return pass;
+  }
+
+  private static boolean compareDouble(
+      double value, int op, DoubleArray constants, int first, int count) {
+    boolean pass;
+    if (op == DevicePredicate.OP_IN) {
+      pass = false;
+      for (int c = 0; c < count; c++) {
+        if (value == constants.get(first + c)) {
+          pass = true;
+        }
+      }
+    } else {
+      double constant = constants.get(first);
+      if (op == DevicePredicate.OP_LT) {
+        pass = value < constant;
+      } else if (op == DevicePredicate.OP_LT_EQ) {
+        pass = value <= constant;
+      } else if (op == DevicePredicate.OP_GT) {
+        pass = value > constant;
+      } else if (op == DevicePredicate.OP_GT_EQ) {
+        pass = value >= constant;
+      } else if (op == DevicePredicate.OP_EQ) {
+        pass = value == constant;
+      } else {
+        pass = value != constant;
+      }
+    }
+    return pass;
+  }
+
+  /**
    * The key each row is grouped under: its value of the group column, or {@link #DEAD_GROUP} when
    * the row is deleted. With no group column ({@code keyOffset < 0}) every live row is group 0.
    */

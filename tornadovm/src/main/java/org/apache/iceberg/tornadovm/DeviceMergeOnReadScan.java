@@ -32,6 +32,8 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -102,15 +104,26 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private static final int STREAMS = Integer.getInteger("iceberg.tornadovm.streams", 3);
 
   private final Table table;
+  private final Expression filter;
   private final Map<String, List<Region>> regions = Maps.newHashMap();
   private ScanMetrics metrics = new ScanMetrics();
 
-  private DeviceMergeOnReadScan(Table table) {
+  private DeviceMergeOnReadScan(Table table, Expression filter) {
     this.table = table;
+    this.filter = filter;
   }
 
   public static DeviceMergeOnReadScan of(Table table) {
-    return new DeviceMergeOnReadScan(table);
+    return new DeviceMergeOnReadScan(table, Expressions.alwaysTrue());
+  }
+
+  /**
+   * A scan of the rows that match {@code filter}. Iceberg prunes files with it while planning, and
+   * the device applies each file's residual -- what statistics could not decide -- to every row.
+   * See {@link DevicePredicate} for what a residual may contain.
+   */
+  public static DeviceMergeOnReadScan of(Table table, Expression filter) {
+    return new DeviceMergeOnReadScan(table, filter);
   }
 
   /**
@@ -172,8 +185,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
     }
     Planned planned = new Planned(groupColumn, ImmutableList.copyOf(sumColumns));
-    if (planned.layout.slots(CudfType.FLOAT64) != sumColumns.length) {
-      throw new UnsupportedOperationException("The sum columns must be distinct DOUBLE columns");
+    // The group-by reads the first sumColumns slots of the FP64 buffer, so the sum columns have to
+    // be those slots, in order; columns only the filter reads come after them.
+    for (int c = 0; c < sumColumns.length; c++) {
+      if (planned.layout.slot(table.schema().findField(sumColumns[c]).fieldId()) != c) {
+        throw new UnsupportedOperationException("The sum columns must be distinct DOUBLE columns");
+      }
     }
     String key = "aggregate:" + groupColumn + ":" + buckets + ":" + String.join(",", sumColumns);
     List<Region> streams =
@@ -255,6 +272,18 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                     HostDeletes.FilePrep prep = preps.get(i).join();
                     metrics.deleteLoad(prep.hostNanos() / 1e6);
                     region.stage(executionPlan, prep, planned.keyNullable);
+                    if (region.filtered) {
+                      planned
+                          .batchFilters
+                          .get(i)
+                          .encode(
+                              region.layout,
+                              table.schema(),
+                              region.capacity,
+                              region.filterTerms,
+                              region.filterLongs,
+                              region.filterDoubles);
+                    }
                     long deviceStart = System.nanoTime();
                     TornadoExecutionResult executed = executionPlan.execute();
                     long copyStart = System.nanoTime();
@@ -294,16 +323,26 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int equalityCapacity;
     private final int positionCapacity;
     private final int maxFiles;
+    private final boolean filtered;
+    private final List<DevicePredicate> batchFilters = Lists.newArrayList();
 
     Planned(String groupColumn, List<String> projection) {
       List<FileScanTask> tasks;
-      try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+      try (CloseableIterable<FileScanTask> planned = table.newScan().filter(filter).planFiles()) {
         tasks = Lists.newArrayList(planned);
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }
       this.equalityKeyId = HostDeletes.equalityKeyId(tasks);
-      this.layout = new ScanLayout(table.schema(), equalityKeyId, groupColumn, projection);
+      this.filtered = filter.op() != Expression.Operation.TRUE;
+      List<String> read = Lists.newArrayList(projection);
+      for (int fieldId : DevicePredicate.fieldIds(filter, table.schema())) {
+        String name = table.schema().findField(fieldId).name();
+        if (!read.contains(name)) {
+          read.add(name);
+        }
+      }
+      this.layout = new ScanLayout(table.schema(), equalityKeyId, groupColumn, read);
       this.host = new HostDeletes(table, layout, equalityKeyId, true);
       this.equalityKeyType = equalityKeyId == null ? null : layout.type(equalityKeyId);
       this.keyNullable =
@@ -314,7 +353,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       String currentSet = null;
       for (FileScanTask task : tasks) {
         long rows = task.file().recordCount();
-        String set = HostDeletes.equalityId(task);
+        // Files batch together only if they share their equality deletes and their residual.
+        String set = HostDeletes.equalityId(task) + "|" + task.residual();
         if (!current.isEmpty() && (currentRows + rows > BATCH_ROWS || !set.equals(currentSet))) {
           batches.add(current);
           current = Lists.newArrayList();
@@ -326,6 +366,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       if (!current.isEmpty()) {
         batches.add(current);
+      }
+      for (List<FileScanTask> batch : batches) {
+        batchFilters.add(
+            filtered
+                ? DevicePredicate.compile(batch.get(0).residual(), table.schema())
+                : DevicePredicate.alwaysTrue());
       }
 
       long maxRows = 1;
@@ -370,7 +416,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         Types.NestedField field = layout.fields().get(c);
         signature.append(field.fieldId()).append(field.isOptional() ? "?" : "").append(',');
       }
-      return signature.append(equalityKeyId).append(keyNullable).toString();
+      return signature.append(equalityKeyId).append(keyNullable).append(filtered).toString();
     }
   }
 
@@ -406,6 +452,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final StringBuilder setPath = new StringBuilder(PATH_CAPACITY);
     final long[] setRowsHolder = new long[1];
     final int[] setColumn = new int[1];
+    final boolean filtered;
+    final IntArray filterTerms =
+        new IntArray(1 + DevicePredicate.TERM_INTS * DevicePredicate.MAX_TERMS);
+    final LongArray filterLongs = new LongArray(DevicePredicate.MAX_CONSTANTS);
+    final DoubleArray filterDoubles = new DoubleArray(DevicePredicate.MAX_CONSTANTS);
     final ByteArray inSet;
     final IntArray setInts;
     final LongArray setLongs;
@@ -434,6 +485,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     Region(Planned planned) {
       this.signature = planned.signature();
+      this.filtered = planned.filtered;
       this.layout = planned.layout;
       this.equalityKeyId = planned.equalityKeyId;
       this.equalityKeyType = planned.equalityKeyType;
@@ -575,6 +627,23 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
               segmentStarts,
               segmentOffsets,
               live);
+      if (filtered) {
+        graph
+            .transferToDevice(
+                DataTransferMode.EVERY_EXECUTION, filterTerms, filterLongs, filterDoubles)
+            .task(
+                "filter",
+                DeviceKernels::filterRows,
+                filterTerms,
+                filterLongs,
+                filterDoubles,
+                ints,
+                longs,
+                doubles,
+                valid,
+                capacity,
+                live);
+      }
       return graph;
     }
 
