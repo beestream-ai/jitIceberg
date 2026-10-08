@@ -44,6 +44,26 @@ merge-on-read, filters and compaction.
 **Bound:** the device time goes to cuDF reading and, for compaction, writing Parquet. The
 TornadoVM kernels that apply Iceberg's deletes, filters and transforms take microseconds a batch.
 
+## Scale sweep, sorted probe and v3 lineage (2026-10-08)
+
+- **Scale sweep:** 10M, 100M and 500M rows, across GPU, CPU and Spark, for Q1, Q2, Q4 and
+  compaction. All 66 cells give the same answers on every engine. Full results and the report are
+  in the private repo `mikepapadim/iceberg-tornado-operf`.
+  - **10M rows:** the GPU's fixed cost of about 100 ms per query loses to the CPU when deletes are
+    light.
+  - **100M rows and up:** the GPU wins every cell.
+  - **500M rows:** Q2 takes 1.3–1.7 s on the GPU. Spark takes 4.0–4.2 s without equality deletes
+    and 19–24 s with them. Compaction takes 12.3–12.5 s on the GPU and 17.7–45.2 s on Spark.
+- **Sorted equality-delete probe** (TornadoVM #1206), now the default. The key set is sorted once
+  with cuDF, then a TornadoVM kernel binary-searches it for every batch. At 100M rows with 10M
+  equality deletes, Q1 went from 215 ms to 146 ms.
+- **v3 compaction** writes `_row_id` and `_last_updated_sequence_number`. A kernel computes them
+  from each data file's first row id plus the row position, and from the file's data sequence
+  number. Files that already store lineage are refused.
+  - Spark reads lineage identical to what it read before the rewrite: 9,499,832 rows, all ids
+    distinct, same hash.
+  - At 100M rows the v3 rewrite takes 2.66 s on the GPU and 3.74 s on Spark.
+
 ## What runs where
 
 **CPU (Iceberg's own planning)**
