@@ -261,6 +261,89 @@ public class TestDeviceMergeOnRead {
             org.apache.iceberg.expressions.Expressions.lessThan("k", 4)));
   }
 
+  /**
+   * Compaction on the device: every row Iceberg's reader returns before, it returns after, from new
+   * files written by libcudf with no delete files left; the files carry Iceberg's field ids and
+   * their footers' metrics.
+   */
+  @Test
+  public void testRewriteDataFiles() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.optional(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("rewrite").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              2000 + 500 * f,
+              i -> {
+                Record record = row(schema, index, i);
+                if (i % 6 == 0) {
+                  record.setField("v1", null);
+                }
+                if (i % 7 == 0) {
+                  record.setField("v4", null);
+                }
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table,
+        files,
+        ImmutableList.of(everyNth(2000, 5), randomPositions(2500, 0.2, 9), new long[0]));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(3L, 1_000_004L, 2_000_100L, 2_000_101L));
+
+    table.refresh();
+    List<String> before = rows(table);
+    DeviceMergeOnReadScan.RewriteResult result;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      result = device.rewriteDataFiles();
+    }
+    table.refresh();
+
+    assertThat(result.dataFilesRemoved()).isEqualTo(3);
+    assertThat(result.deleteFilesRemoved()).isEqualTo(3); // two position-delete files, one equality
+    assertThat(result.rows()).isEqualTo(before.size());
+    long recorded = 0;
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        table.newScan().includeColumnStats().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        assertThat(task.deletes()).isEmpty();
+        assertThat(task.file().location()).contains("gpu-rewrite-");
+        assertThat(task.file().lowerBounds()).containsKey(1); // footer statistics, by field id
+        recorded += task.file().recordCount();
+      }
+    }
+    assertThat(recorded).isEqualTo(before.size());
+    assertThat(rows(table)).containsExactlyElementsOf(before);
+    assertMatchesIceberg(table);
+  }
+
+  private static List<String> rows(Table table) throws IOException {
+    List<String> rows = Lists.newArrayList();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        // Only the table's columns: a read that applies position deletes also carries _pos.
+        StringBuilder row = new StringBuilder();
+        for (Types.NestedField field : table.schema().columns()) {
+          row.append(record.getField(field.name())).append('|');
+        }
+        rows.add(row.toString());
+      }
+    }
+    rows.sort(String::compareTo);
+    return rows;
+  }
+
   /** An equality key of type INT, which the device probes as 32-bit keys. */
   @Test
   public void testIntEqualityKey() throws IOException {

@@ -28,9 +28,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -53,6 +55,7 @@ import uk.ac.manchester.tornado.api.types.arrays.TornadoNativeArray;
 import uk.ac.manchester.tornado.cudf.Cudf;
 import uk.ac.manchester.tornado.cudf.enums.CudfAggregation;
 import uk.ac.manchester.tornado.cudf.enums.CudfType;
+import uk.ac.manchester.tornado.cudf.enums.ParquetColumnType;
 
 /**
  * A merge-on-read scan of an Iceberg table on an NVIDIA GPU.
@@ -223,6 +226,100 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     return live;
   }
 
+  /** What {@link #rewriteDataFiles()} did. */
+  public static final class RewriteResult {
+    private final int dataFilesRemoved;
+    private final int deleteFilesRemoved;
+    private final int dataFilesAdded;
+    private final long rows;
+
+    RewriteResult(int dataFilesRemoved, int deleteFilesRemoved, int dataFilesAdded, long rows) {
+      this.dataFilesRemoved = dataFilesRemoved;
+      this.deleteFilesRemoved = deleteFilesRemoved;
+      this.dataFilesAdded = dataFilesAdded;
+      this.rows = rows;
+    }
+
+    public int dataFilesRemoved() {
+      return dataFilesRemoved;
+    }
+
+    public int deleteFilesRemoved() {
+      return deleteFilesRemoved;
+    }
+
+    public int dataFilesAdded() {
+      return dataFilesAdded;
+    }
+
+    public long rows() {
+      return rows;
+    }
+  }
+
+  /**
+   * Compacts the table on the device: merge-on-read into copy-on-write.
+   *
+   * <p>Every data file is read with its deletes applied, as a scan reads it; the live rows of each
+   * batch are compacted and written, still on the device, to a new ZSTD Parquet file by libcudf --
+   * with Iceberg's field ids, so Iceberg reads it back by id. The files' metrics come from the
+   * footers libcudf wrote. One {@code RewriteFiles} commit then swaps every old data file and every
+   * delete file for the new files, validated against the snapshot that was planned, so a concurrent
+   * commit fails it rather than being lost.
+   *
+   * <p>Format version 2 only: a v3 table's rewrite also has to carry each row's lineage ({@code
+   * _row_id}), which this does not write yet.
+   */
+  public RewriteResult rewriteDataFiles() {
+    if (filter.op() != Expression.Operation.TRUE) {
+      throw new UnsupportedOperationException("A rewrite of part of a table is not supported");
+    }
+    int formatVersion =
+        ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
+    if (formatVersion >= 3) {
+      throw new UnsupportedOperationException(
+          "Rewriting a v3 table needs row lineage, which the device writer does not carry yet");
+    }
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    List<String> columns = Lists.newArrayList();
+    for (Types.NestedField field : table.schema().columns()) {
+      if (field.type().typeId() == org.apache.iceberg.types.Type.TypeID.TIME) {
+        throw new UnsupportedOperationException("TIME columns cannot be written on the device");
+      }
+      ScanLayout.cudfType(field); // refuses what the device cannot read
+      columns.add(field.name());
+    }
+    Planned planned = new Planned(null, columns);
+    List<Region> streams = reuse("rewrite", planned, () -> new RewriteRegion(planned));
+    metrics.plan((System.nanoTime() - start) / 1e6);
+
+    List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
+    long rows =
+        run(
+            streams,
+            planned,
+            (region, executed) -> ((RewriteRegion) region).collect(executed, written));
+
+    java.util.Set<String> deletesSeen = new java.util.HashSet<>();
+    RewriteFiles rewrite = table.newRewrite();
+    if (planned.snapshotId != null) {
+      rewrite.validateFromSnapshot(planned.snapshotId);
+    }
+    for (FileScanTask task : planned.tasks) {
+      rewrite.deleteFile(task.file());
+      for (DeleteFile delete : task.deletes()) {
+        if (deletesSeen.add(delete.location())) {
+          rewrite.deleteFile(delete);
+        }
+      }
+    }
+    written.forEach(rewrite::addFile);
+    rewrite.commit();
+    metrics.total((System.nanoTime() - start) / 1e6);
+    return new RewriteResult(planned.tasks.size(), deletesSeen.size(), written.size(), rows);
+  }
+
   /** The regions kept for a query shape, one a stream, rebuilt when this scan outgrows them. */
   private List<Region> reuse(
       String key, Planned planned, java.util.function.Supplier<Region> create) {
@@ -314,6 +411,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   /** One query's planning: Iceberg's file tasks, grouped into device batches, and their sizes. */
   private final class Planned {
     private final List<List<FileScanTask>> batches = Lists.newArrayList();
+    private final List<FileScanTask> tasks;
+    private final Long snapshotId;
     private final ScanLayout layout;
     private final HostDeletes host;
     private final Integer equalityKeyId;
@@ -327,9 +426,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final List<DevicePredicate> batchFilters = Lists.newArrayList();
 
     Planned(String groupColumn, List<String> projection) {
-      List<FileScanTask> tasks;
+      this.snapshotId =
+          table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
       try (CloseableIterable<FileScanTask> planned = table.newScan().filter(filter).planFiles()) {
-        tasks = Lists.newArrayList(planned);
+        this.tasks = Lists.newArrayList(planned);
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }
@@ -648,7 +748,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     /** Points the plan's holders and small inputs at one batch. */
+    /** What a shape sets up per batch, after the shared staging; nothing by default. */
+    void stageOutput() {}
+
     void stage(TornadoExecutionPlan executionPlan, HostDeletes.FilePrep prep, boolean keyNullable) {
+      stageOutput();
       path.setLength(0);
       hold(path, prep.path());
       rowsHolder[0] = prep.rows();
@@ -883,7 +987,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /** Projection on the device: live rows are compacted, and only they come back. */
-  private static final class MaterializeRegion extends Region {
+  private static class MaterializeRegion extends Region {
     private final int intSlots;
     private final int longSlots;
     private final int doubleSlots;
@@ -895,6 +999,26 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final DoubleArray outDoubles;
     private final ByteArray outValid;
     private final Map<String, Integer> idByName = Maps.newHashMap();
+
+    IntArray liveCount() {
+      return liveCount;
+    }
+
+    IntArray outInts() {
+      return outInts;
+    }
+
+    LongArray outLongs() {
+      return outLongs;
+    }
+
+    DoubleArray outDoubles() {
+      return outDoubles;
+    }
+
+    ByteArray outValid() {
+      return outValid;
+    }
 
     MaterializeRegion(Planned planned) {
       super(planned);
@@ -985,6 +1109,101 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         executed.transferToHost(
             new DataRange(array).withOffset((long) s * capacity).withSize(rows));
       }
+    }
+  }
+
+  /** Compaction: the live rows of a batch, compacted and written to a new Parquet file. */
+  private final class RewriteRegion extends MaterializeRegion {
+    private final StringBuilder outputPath = new StringBuilder(PATH_CAPACITY);
+    private final String names;
+    private final int[] fieldIds;
+    private final ParquetColumnType[] types;
+    private final boolean[] optional;
+    private String location;
+
+    RewriteRegion(Planned planned) {
+      super(planned);
+      List<Types.NestedField> fields = layout.fields();
+      this.fieldIds = new int[fields.size()];
+      this.types = new ParquetColumnType[fields.size()];
+      this.optional = new boolean[fields.size()];
+      StringBuilder joined = new StringBuilder();
+      for (int c = 0; c < fields.size(); c++) {
+        Types.NestedField field = fields.get(c);
+        fieldIds[c] = field.fieldId();
+        optional[c] = field.isOptional();
+        types[c] =
+            switch (field.type().typeId()) {
+              case INTEGER -> ParquetColumnType.INT32;
+              case DATE -> ParquetColumnType.DATE;
+              case LONG -> ParquetColumnType.INT64;
+              case TIMESTAMP -> ParquetColumnType.TIMESTAMP_MICROS;
+              case DOUBLE -> ParquetColumnType.FLOAT64;
+              default ->
+                  throw new UnsupportedOperationException(
+                      "Cannot write " + field + " on the device");
+            };
+        if (c > 0) {
+          joined.append('\n');
+        }
+        joined.append(field.name());
+      }
+      this.names = joined.toString();
+    }
+
+    @Override
+    void consumer(TaskGraph graph) {
+      super.consumer(graph);
+      graph.libraryTask(
+          "write",
+          Cudf::writeParquetColumns,
+          outputPath,
+          names,
+          fieldIds,
+          types,
+          optional,
+          new long[] {-1},
+          liveCount(),
+          capacity,
+          outInts(),
+          outLongs(),
+          outDoubles(),
+          outValid(),
+          2,
+          0);
+    }
+
+    /** A new file a batch, where Iceberg's location provider puts data files. */
+    @Override
+    void stageOutput() {
+      location =
+          table
+              .locationProvider()
+              .newDataLocation("gpu-rewrite-" + java.util.UUID.randomUUID() + ".parquet");
+      outputPath.setLength(0);
+      outputPath.append(HostDeletes.localPath(location));
+    }
+
+    /** The batch's file as an Iceberg data file, with metrics from the footer libcudf wrote. */
+    long collect(TornadoExecutionResult executed, List<DataFile> written) {
+      executed.transferToHost(liveCount());
+      int rows = liveCount().get(0);
+      org.apache.iceberg.io.InputFile file = table.io().newInputFile(location);
+      if (rows == 0) {
+        table.io().deleteFile(location);
+        return 0;
+      }
+      org.apache.iceberg.Metrics fileMetrics =
+          org.apache.iceberg.parquet.ParquetUtil.fileMetrics(
+              file, org.apache.iceberg.MetricsConfig.forTable(table));
+      written.add(
+          org.apache.iceberg.DataFiles.builder(table.spec())
+              .withPath(location)
+              .withFormat(org.apache.iceberg.FileFormat.PARQUET)
+              .withFileSizeInBytes(file.getLength())
+              .withMetrics(fileMetrics)
+              .build());
+      return rows;
     }
   }
 }
