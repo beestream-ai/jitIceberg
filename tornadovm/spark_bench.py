@@ -34,7 +34,42 @@ spark = SparkSession.builder.appName("mor-bench").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
 print("table,engine,query,run,warmup,millis,live_rows,checksum,breakdown", flush=True)
+def rewrite_run(name, run):
+    # Compaction: rewrite every file with its deletes applied, check Q2's answer on the result,
+    # then restore the snapshot the table had and delete the files the rewrite wrote, so every run
+    # starts from the same merge-on-read table.
+    table = f"local.wh.{name}"
+    snapshot = spark.sql(f"SELECT snapshot_id FROM {table}.refs WHERE name = 'main'").collect()[0][0]
+    before = {r[0] for r in spark.sql(f"SELECT file_path FROM {table}.files").collect()}
+    options = os.environ.get(
+        "REWRITE_OPTIONS",
+        "'rewrite-all','true','remove-dangling-deletes','true',"
+        "'max-file-group-size-bytes','268435456','max-concurrent-file-group-rewrites','32',"
+        "'target-file-size-bytes','134217728'",
+    )
+    start = time.perf_counter()
+    spark.sql(f"CALL local.system.rewrite_data_files(table => 'wh.{name}', options => map({options}))").collect()
+    millis = (time.perf_counter() - start) * 1000
+    spark.sql(f"REFRESH TABLE {table}")
+    result = spark.sql(
+        f"SELECT k, count(*) c, sum(v1) a, sum(v2) b, sum(v3) d, sum(v4) e FROM {table} GROUP BY k"
+    ).collect()
+    rows = sum(r["c"] for r in result)
+    checksum = sum(r["a"] + r["b"] + r["d"] + r["e"] for r in result) + len(result)
+    added = [r[0] for r in spark.sql(f"SELECT file_path FROM {table}.files").collect() if r[0] not in before]
+    spark.sql(f"CALL local.system.set_current_snapshot('wh.{name}', {snapshot})").collect()
+    for path in added:
+        local = path[len("file:"):] if path.startswith("file:") else path
+        if os.path.exists(local):
+            os.remove(local)
+    print(f"{name},spark,rewrite,{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"{len(added)} files\"", flush=True)
+
+
 for name in tables:
+    if query == "rewrite":
+        for run in range(runs):
+            rewrite_run(name, run)
+        continue
     reader = spark.read.format("iceberg")
     if os.environ.get("SPLIT_SIZE"):
         # Iceberg packs small files into splits of read.split.target-size (128 MB); a smaller

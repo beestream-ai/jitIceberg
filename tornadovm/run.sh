@@ -57,7 +57,7 @@ case "$mode" in
         # The heap stays under 32 GB: TornadoVM serializes object arguments (the path holders)
         # assuming compressed oops, which a larger heap turns off.
         exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" -Xmx"${GPU_HEAP:-24g}" \
-            -Dtornado.device.memory="${TORNADO_DEVICE_MEMORY:-20GB}" \
+            -Dtornado.device.memory="${TORNADO_DEVICE_MEMORY:-20GB}" --add-opens=java.base/java.nio=ALL-UNNAMED \
             -da:tornado... -da:uk.ac.manchester.tornado... -cp "$CP" \
             org.apache.iceberg.tornadovm.bench.MorBench "$1" gpu "${@:2}"
         ;;

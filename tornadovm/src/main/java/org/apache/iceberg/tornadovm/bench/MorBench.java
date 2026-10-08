@@ -30,6 +30,7 @@ import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.tornadovm.AggregateResult;
 import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
@@ -77,6 +78,10 @@ public final class MorBench {
               ? DeviceMergeOnReadScan.of(table, filter)
               : "cpu".equals(engine) ? CpuMergeOnReadScan.of(table, threads, filter) : null;
       for (int run = 0; run < runs; run++) {
+        if ("rewrite".equals(query)) {
+          rewriteRun(table, (DeviceMergeOnReadScan) scan, run, args[t], threads);
+          continue;
+        }
         long start = System.nanoTime();
         double[] answer;
         String breakdown = "";
@@ -153,6 +158,42 @@ public final class MorBench {
       }
       default -> throw new IllegalArgumentException("Unknown query " + query);
     };
+  }
+
+  /**
+   * One timed compaction: rewrite on the device, check the rewritten table with an independent CPU
+   * scan (Q2's answer must not change), then roll the table back to the snapshot it had and delete
+   * the files the rewrite wrote, so every run starts from the same merge-on-read table.
+   */
+  private static void rewriteRun(
+      Table table, DeviceMergeOnReadScan scan, int run, String name, int threads) {
+    table.refresh();
+    long snapshot = table.currentSnapshot().snapshotId();
+    long start = System.nanoTime();
+    DeviceMergeOnReadScan.RewriteResult result = scan.rewriteDataFiles();
+    double millis = (System.nanoTime() - start) / 1e6;
+    table.refresh();
+    double[] check = run(CpuMergeOnReadScan.of(table, threads), "q2");
+    List<String> added = Lists.newArrayList();
+    for (org.apache.iceberg.DataFile file : table.currentSnapshot().addedDataFiles(table.io())) {
+      added.add(file.location());
+    }
+    table.manageSnapshots().rollbackTo(snapshot).commit();
+    added.forEach(table.io()::deleteFile);
+    System.out.println(
+        String.format(
+            Locale.ROOT,
+            "%s,gpu,rewrite,%d,%s,%.1f,%d,%.6e,\"%s; %d data + %d delete files -> %d files\"",
+            name,
+            run,
+            run == 0 ? "yes" : "no",
+            millis,
+            (long) check[0],
+            check[1],
+            scan.metrics(),
+            result.dataFilesRemoved(),
+            result.deleteFilesRemoved(),
+            result.dataFilesAdded()));
   }
 
   /** Q5's filter: ids are ascending file by file, so the id bound prunes three files in four. */

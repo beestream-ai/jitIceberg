@@ -1169,8 +1169,30 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           outLongs(),
           outDoubles(),
           outValid(),
-          2,
+          codec(),
           0);
+    }
+
+    /**
+     * The table's Parquet codec ({@code write.parquet.compression-codec}, ZSTD by default), or the
+     * {@code iceberg.tornadovm.write-codec} override; the device writer has ZSTD, Snappy and none.
+     */
+    private int codec() {
+      String codec =
+          System.getProperty(
+              "iceberg.tornadovm.write-codec",
+              table
+                  .properties()
+                  .getOrDefault(
+                      org.apache.iceberg.TableProperties.PARQUET_COMPRESSION,
+                      org.apache.iceberg.TableProperties.PARQUET_COMPRESSION_DEFAULT));
+      return switch (codec.toLowerCase(java.util.Locale.ROOT)) {
+        case "zstd" -> 2;
+        case "snappy" -> 1;
+        case "uncompressed", "none" -> 0;
+        default ->
+            throw new UnsupportedOperationException("The device writer has no " + codec + " codec");
+      };
     }
 
     /** A new file a batch, where Iceberg's location provider puts data files. */
