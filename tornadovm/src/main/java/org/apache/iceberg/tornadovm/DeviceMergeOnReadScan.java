@@ -91,6 +91,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   private static final int HOST_THREADS = 8;
 
+  private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.debug");
+
   /** Characters of paths one batch may name in one holder: data files, delete files. */
   private static final int PATH_CAPACITY = 1 << 16;
 
@@ -385,6 +387,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                     TornadoExecutionResult executed = executionPlan.execute();
                     long copyStart = System.nanoTime();
                     long rows = perBatch.applyAsLong(region, executed);
+                    if (DEBUG) {
+                      System.err.printf(
+                          "[mor] batch %d region %d files %d rows %d live %d%n",
+                          i, System.identityHashCode(region), prep.files(), prep.rows(), rows);
+                    }
                     long end = System.nanoTime();
                     metrics.device((copyStart - deviceStart) / 1e6);
                     metrics.copyBack((end - copyStart) / 1e6);

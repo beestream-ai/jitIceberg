@@ -45,7 +45,7 @@ LABEL = {
 runs = defaultdict(list)
 answers = defaultdict(set)
 failed = set()
-for path in glob.glob(os.path.join(sys.argv[1], "*-q*.csv")):
+for path in glob.glob(os.path.join(sys.argv[1], "*-q*.csv")) + glob.glob(os.path.join(sys.argv[1], "*-rewrite.csv")):
     with open(path) as f:
         for row in csv.DictReader(f):
             key = (row["table"], row["engine"], row["query"])
@@ -76,6 +76,7 @@ for query, title in [
     ("q3", "Q3 `SELECT id, k, v1` -- every live row materialized on the host"),
     ("q4", "Q4 `SELECT bucket(16, id), count(*), sum(v1) GROUP BY 1` -- Iceberg's bucket transform"),
     ("q5", "Q5 `SELECT k, count(*), sum(v1) WHERE id < 25000000 AND v2 > 0.5 GROUP BY k` -- file pruning + residual filter"),
+    ("rewrite", "Compaction -- rewrite every data file with its deletes applied (GPU: rewriteDataFiles; Spark: rewrite_data_files); answer = Q2 on the rewritten table"),
 ]:
     present = [e for e in ENGINES if any((t, e, query) in runs for t in TABLES)]
     if not present:
