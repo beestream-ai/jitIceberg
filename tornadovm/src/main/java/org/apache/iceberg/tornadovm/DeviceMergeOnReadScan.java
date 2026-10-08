@@ -32,6 +32,7 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
@@ -277,8 +278,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * delete file for the new files, validated against the snapshot that was planned, so a concurrent
    * commit fails it rather than being lost.
    *
-   * <p>Format version 2 only: a v3 table's rewrite also has to carry each row's lineage ({@code
-   * _row_id}), which this does not write yet.
+   * <p>A v3 table's rewrite also writes each row's lineage -- {@code _row_id} and {@code
+   * _last_updated_sequence_number}, which the old files left to inheritance -- as columns of the
+   * new files, so rows keep them. Data files that already store lineage columns are refused.
    */
   public RewriteResult rewriteDataFiles() {
     if (filter.op() != Expression.Operation.TRUE) {
@@ -286,10 +288,6 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
     int formatVersion =
         ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
-    if (formatVersion >= 3) {
-      throw new UnsupportedOperationException(
-          "Rewriting a v3 table needs row lineage, which the device writer does not carry yet");
-    }
     metrics = new ScanMetrics();
     long start = System.nanoTime();
     List<String> columns = Lists.newArrayList();
@@ -301,7 +299,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       columns.add(field.name());
     }
     Planned planned = new Planned(null, columns);
-    List<Region> streams = reuse("rewrite", planned, () -> new RewriteRegion(planned));
+    List<Region> streams =
+        reuse(
+            "rewrite" + (formatVersion >= 3 ? "-lineage" : ""),
+            planned,
+            () -> new RewriteRegion(planned, formatVersion >= 3));
     metrics.plan((System.nanoTime() - start) / 1e6);
 
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
@@ -783,12 +785,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       return graph;
     }
 
-    /** Points the plan's holders and small inputs at one batch. */
-    /** What a shape sets up per batch, after the shared staging; nothing by default. */
-    void stageOutput() {}
+    /** What a shape sets up per batch, before the shared staging; nothing by default. */
+    void stageOutput(HostDeletes.FilePrep prep) {}
 
+    /** Points the plan's holders and small inputs at one batch. */
     void stage(TornadoExecutionPlan executionPlan, HostDeletes.FilePrep prep, boolean keyNullable) {
-      stageOutput();
+      stageOutput(prep);
       path.setLength(0);
       hold(path, prep.path());
       rowsHolder[0] = prep.rows();
@@ -1045,6 +1047,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       return liveCount;
     }
 
+    IntArray compacted() {
+      return compacted;
+    }
+
+    int longSlots() {
+      return longSlots;
+    }
+
     IntArray outInts() {
       return outInts;
     }
@@ -1062,6 +1072,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     MaterializeRegion(Planned planned) {
+      this(planned, 0);
+    }
+
+    /** {@code extraLongSlots} more INT64 output slots, after the gathered ones, for a subclass. */
+    MaterializeRegion(Planned planned, int extraLongSlots) {
       super(planned);
       this.intSlots = layout.slots(CudfType.INT32);
       this.longSlots = layout.slots(CudfType.INT64);
@@ -1069,7 +1084,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.validSlots = layout.anyOptional() ? layout.fields().size() : 0;
       this.compacted = new IntArray(capacity);
       this.outInts = new IntArray(Math.max(1L, (long) intSlots * capacity));
-      this.outLongs = new LongArray(Math.max(1L, (long) longSlots * capacity));
+      this.outLongs = new LongArray(Math.max(1L, (long) (longSlots + extraLongSlots) * capacity));
       this.outDoubles = new DoubleArray(Math.max(1L, (long) doubleSlots * capacity));
       this.outValid = new ByteArray(Math.max(1L, (long) validSlots * capacity));
       for (Types.NestedField field : layout.fields()) {
@@ -1160,11 +1175,28 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int[] fieldIds;
     private final ParquetColumnType[] types;
     private final boolean[] optional;
+    private final boolean lineage;
+    private final IntArray fileStarts;
+    private final IntArray fileCount = new IntArray(1);
+    private final LongArray firstRowIds;
+    private final LongArray sequences;
     private String location;
 
-    RewriteRegion(Planned planned) {
-      super(planned);
-      List<Types.NestedField> fields = layout.fields();
+    /**
+     * {@code lineage}: a v3 table's rewrite, which also writes each row's {@code _row_id} and
+     * {@code _last_updated_sequence_number}, as two INT64 columns after the table's.
+     */
+    RewriteRegion(Planned planned, boolean lineage) {
+      super(planned, lineage ? 2 : 0);
+      this.lineage = lineage;
+      this.fileStarts = new IntArray(maxFiles);
+      this.firstRowIds = new LongArray(maxFiles);
+      this.sequences = new LongArray(maxFiles);
+      List<Types.NestedField> fields = Lists.newArrayList(layout.fields());
+      if (lineage) {
+        fields.add(MetadataColumns.ROW_ID);
+        fields.add(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER);
+      }
       this.fieldIds = new int[fields.size()];
       this.types = new ParquetColumnType[fields.size()];
       this.optional = new boolean[fields.size()];
@@ -1172,7 +1204,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       for (int c = 0; c < fields.size(); c++) {
         Types.NestedField field = fields.get(c);
         fieldIds[c] = field.fieldId();
-        optional[c] = field.isOptional();
+        // Lineage is written for every row, so its columns carry no nulls.
+        optional[c] = field.isOptional() && c < layout.fields().size();
         types[c] =
             switch (field.type().typeId()) {
               case INTEGER -> ParquetColumnType.INT32;
@@ -1195,6 +1228,23 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     @Override
     void consumer(TaskGraph graph) {
       super.consumer(graph);
+      if (lineage) {
+        graph
+            .transferToDevice(
+                DataTransferMode.EVERY_EXECUTION, fileStarts, fileCount, firstRowIds, sequences)
+            .task(
+                "lineage",
+                DeviceKernels::lineage,
+                compacted(),
+                liveCount(),
+                fileStarts,
+                fileCount,
+                firstRowIds,
+                sequences,
+                longSlots(),
+                capacity,
+                outLongs());
+      }
       graph.libraryTask(
           "write",
           Cudf::writeParquetColumns,
@@ -1238,7 +1288,26 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     /** A new file a batch, where Iceberg's location provider puts data files. */
     @Override
-    void stageOutput() {
+    void stageOutput(HostDeletes.FilePrep prep) {
+      if (lineage) {
+        if (prep.storedLineage()) {
+          throw new UnsupportedOperationException(
+              "A data file already stores row lineage columns; rewriting it again is not supported");
+        }
+        List<Integer> starts = prep.fileStarts();
+        fileCount.set(0, starts.size());
+        for (int f = 0; f < starts.size(); f++) {
+          Long firstRowId = prep.firstRowIds().get(f);
+          Long sequence = prep.sequences().get(f);
+          if (firstRowId == null || sequence == null) {
+            throw new UnsupportedOperationException(
+                "A data file of a v3 table has no first row id or data sequence number");
+          }
+          fileStarts.set(f, starts.get(f));
+          firstRowIds.set(f, firstRowId);
+          sequences.set(f, sequence);
+        }
+      }
       location =
           table
               .locationProvider()

@@ -95,6 +95,12 @@ final class HostDeletes {
     private long setRows;
     private int setColumn = -1;
 
+    // Each data file's start in the batch, first row id and data sequence number (v3 lineage).
+    private final List<Integer> fileStarts = Lists.newArrayList();
+    private final List<Long> firstRowIds = Lists.newArrayList();
+    private final List<Long> sequences = Lists.newArrayList();
+    private boolean storedLineage;
+
     String path() {
       return path;
     }
@@ -123,6 +129,24 @@ final class HostDeletes {
 
     long hostNanos() {
       return hostNanos;
+    }
+
+    List<Integer> fileStarts() {
+      return fileStarts;
+    }
+
+    /** The data files' first row ids; an entry is null where the table assigned none. */
+    List<Long> firstRowIds() {
+      return firstRowIds;
+    }
+
+    List<Long> sequences() {
+      return sequences;
+    }
+
+    /** True when a data file of the batch stores lineage columns of its own. */
+    boolean storedLineage() {
+      return storedLineage;
     }
 
     String positionPaths() {
@@ -287,7 +311,17 @@ final class HostDeletes {
       if (task.start() != 0 || task.length() < task.file().fileSizeInBytes()) {
         throw new UnsupportedOperationException("Split data files are not supported: " + location);
       }
-      int[] columns = layout.parquetColumns(footerSchema(path), location);
+      MessageType footer = footerSchema(path);
+      int[] columns = layout.parquetColumns(footer, location);
+      for (int i = 0; i < footer.getFieldCount(); i++) {
+        org.apache.parquet.schema.Type column = footer.getType(i);
+        if (column.getId() != null
+            && (column.getId().intValue() == MetadataColumns.ROW_ID.fieldId()
+                || column.getId().intValue()
+                    == MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId())) {
+          prep.storedLineage = true;
+        }
+      }
       if (prep.columns == null) {
         prep.columns = columns;
       } else if (!Arrays.equals(columns, prep.columns)) {
@@ -299,6 +333,9 @@ final class HostDeletes {
         paths.append('\n');
       }
       paths.append(path);
+      prep.fileStarts.add((int) offset);
+      prep.firstRowIds.add(task.file().firstRowId());
+      prep.sequences.add(task.file().dataSequenceNumber());
 
       List<DeleteFile> hostDeletes = Lists.newArrayList();
       List<DeleteFile> equalityDeletes = Lists.newArrayList();

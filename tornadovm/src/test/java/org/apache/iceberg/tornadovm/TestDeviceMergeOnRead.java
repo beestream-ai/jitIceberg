@@ -328,6 +328,59 @@ public class TestDeviceMergeOnRead {
     assertMatchesIceberg(table);
   }
 
+  /**
+   * A v3 rewrite keeps every row's lineage: {@code _row_id} and {@code
+   * _last_updated_sequence_number} read the same after it as before, though before they were
+   * inherited from each file's first row id and sequence number and after they are stored.
+   */
+  @Test
+  public void testRewriteDataFilesV3KeepsLineage() throws IOException {
+    Table table = MorTables.create(temp.resolve("rewrite-v3").toString(), MorTables.SCHEMA, 3);
+    List<DataFile> first = writeFiles(table, 0, 3000, 1200);
+    List<DataFile> second = writeFiles(table, 2, 2200); // a later commit: other ids and sequence
+    MorTables.deletePositions(
+        table, first, ImmutableList.of(randomPositions(3000, 0.1, 4), everyNth(1200, 4)));
+    MorTables.deletePositions(table, second, ImmutableList.of(everyNth(2200, 9)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(11L, 1_000_013L, 2_000_017L));
+
+    table.refresh();
+    Map<Long, String> before = lineage(table);
+    assertThat(before.values()).doesNotContainNull();
+    DeviceMergeOnReadScan.RewriteResult result;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      result = device.rewriteDataFiles();
+    }
+    table.refresh();
+
+    assertThat(result.dataFilesRemoved()).isEqualTo(3);
+    assertThat(result.rows()).isEqualTo(before.size());
+    Map<Long, String> after = lineage(table);
+    assertThat(after).isEqualTo(before);
+    assertMatchesIceberg(table);
+  }
+
+  /** {@code id -> _row_id|_last_updated_sequence_number} of every live row. */
+  private static Map<Long, String> lineage(Table table) throws IOException {
+    Schema projection =
+        org.apache.iceberg.types.TypeUtil.join(
+            table.schema(),
+            new Schema(
+                org.apache.iceberg.MetadataColumns.ROW_ID,
+                org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER));
+    Map<Long, String> lineage = new TreeMap<>();
+    try (CloseableIterable<Record> records =
+        IcebergGenerics.read(table).project(projection).build()) {
+      for (Record record : records) {
+        Object rowId = record.getField("_row_id");
+        Object sequence = record.getField("_last_updated_sequence_number");
+        lineage.put(
+            (Long) record.getField("id"),
+            rowId == null || sequence == null ? null : rowId + "|" + sequence);
+      }
+    }
+    return lineage;
+  }
+
   private static List<String> rows(Table table) throws IOException {
     List<String> rows = Lists.newArrayList();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {

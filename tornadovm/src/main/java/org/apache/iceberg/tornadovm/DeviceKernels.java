@@ -353,6 +353,37 @@ final class DeviceKernels {
     }
   }
 
+  /**
+   * The v3 row lineage of each compacted row, into two INT64 slots of {@code target} from {@code
+   * slot}: {@code _row_id}, the first row id of the row's data file plus its position there, and
+   * {@code _last_updated_sequence_number}, the file's data sequence number -- what a reader would
+   * have inherited, written out so the rewritten rows keep it. {@code fileStarts} holds where each
+   * of the batch's {@code files[0]} data files starts, in order.
+   */
+  static void lineage(
+      IntArray positions,
+      IntArray count,
+      IntArray fileStarts,
+      IntArray files,
+      LongArray firstRowIds,
+      LongArray sequences,
+      int slot,
+      int stride,
+      LongArray target) {
+    for (@Parallel int j = 0; j < stride; j++) {
+      if (j < count.get(0)) {
+        int row = positions.get(j);
+        int n = files.get(0);
+        int f = 0;
+        while (f + 1 < n && fileStarts.get(f + 1) <= row) {
+          f++;
+        }
+        target.set(slot * stride + j, firstRowIds.get(f) + (row - fileStarts.get(f)));
+        target.set((slot + 1) * stride + j, sequences.get(f));
+      }
+    }
+  }
+
   /** {@link #gatherInts} for INT64 slots. */
   static void gatherLongs(
       IntArray positions,
