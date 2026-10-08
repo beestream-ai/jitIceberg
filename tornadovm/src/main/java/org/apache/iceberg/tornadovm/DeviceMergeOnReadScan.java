@@ -95,13 +95,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * Rows a device batch may hold. Files are grouped up to this many rows into one read, because a
    * read of one small file is mostly latency; a file larger than this is a batch on its own.
    */
-  private static final long BATCH_ROWS = Long.getLong("iceberg.tornadovm.batch-rows", 8_000_000L);
+  private static final long BATCH_ROWS = Long.getLong("iceberg.tornadovm.batch-rows", 4_000_000L);
 
   /**
    * Batches in flight at once, each in its own region -- its own buffers, plan and CUDA stream --
    * so that one batch's file reads and host-to-device copies overlap another's decoding.
    */
-  private static final int STREAMS = Integer.getInteger("iceberg.tornadovm.streams", 3);
+  private static final int STREAMS = Integer.getInteger("iceberg.tornadovm.streams", 4);
 
   private final Table table;
   private final Expression filter;
