@@ -259,6 +259,56 @@ final class DeviceKernels {
   }
 
   /**
+   * The equality-delete probe over a set sorted on the device: one byte a row, 1 when the row's key
+   * (slot 0 of the INT64 buffer) is in the first {@code size[0]} sorted keys. A binary search: the
+   * set is sorted once and every batch after it searches the same copy.
+   */
+  static void probeSortedLongs(LongArray sorted, IntArray size, LongArray keys, ByteArray found) {
+    for (@Parallel int i = 0; i < found.getSize(); i++) {
+      long key = keys.get(i);
+      int low = 0;
+      int high = size.get(0) - 1;
+      byte hit = 0;
+      while (low <= high) {
+        int mid = (low + high) >>> 1;
+        long value = sorted.get(mid);
+        if (value < key) {
+          low = mid + 1;
+        } else if (value > key) {
+          high = mid - 1;
+        } else {
+          hit = 1;
+          low = high + 1;
+        }
+      }
+      found.set(i, hit);
+    }
+  }
+
+  /** {@link #probeSortedLongs} for INT32 keys. */
+  static void probeSortedInts(IntArray sorted, IntArray size, IntArray keys, ByteArray found) {
+    for (@Parallel int i = 0; i < found.getSize(); i++) {
+      int key = keys.get(i);
+      int low = 0;
+      int high = size.get(0) - 1;
+      byte hit = 0;
+      while (low <= high) {
+        int mid = (low + high) >>> 1;
+        int value = sorted.get(mid);
+        if (value < key) {
+          low = mid + 1;
+        } else if (value > key) {
+          high = mid - 1;
+        } else {
+          hit = 1;
+          low = high + 1;
+        }
+      }
+      found.set(i, hit);
+    }
+  }
+
+  /**
    * The key each row is grouped under: its value of the group column, or {@link #DEAD_GROUP} when
    * the row is deleted. With no group column ({@code keyOffset < 0}) every live row is group 0.
    */

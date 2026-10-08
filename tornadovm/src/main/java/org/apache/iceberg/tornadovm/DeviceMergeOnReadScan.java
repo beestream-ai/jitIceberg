@@ -93,6 +93,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.debug");
 
+  /**
+   * How equality deletes are probed: {@code sorted} (the default) sorts the delete keys on the
+   * device once a set and binary-searches them from a kernel on every batch; {@code hash} uses
+   * cuDF's contains, which hashes the set again on every batch.
+   */
+  private static final boolean SORTED_PROBE =
+      !"hash".equals(System.getProperty("iceberg.tornadovm.probe", "sorted"));
+
   /** Characters of paths one batch may name in one holder: data files, delete files. */
   private static final int PATH_CAPACITY = 1 << 16;
 
@@ -567,6 +575,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final ByteArray inSet;
     final IntArray setInts;
     final LongArray setLongs;
+    final IntArray sortedInts;
+    final LongArray sortedLongs;
+    final int[] sortSize = new int[1];
+    final IntArray setSize = new IntArray(1);
     final IntArray ints;
     final LongArray longs;
     final DoubleArray doubles;
@@ -613,6 +625,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           new IntArray(equality && equalityKeyType == CudfType.INT32 ? equalityCapacity : 1);
       this.setLongs =
           new LongArray(equality && equalityKeyType == CudfType.INT64 ? equalityCapacity : 1);
+      boolean sortedInt = equality && SORTED_PROBE && equalityKeyType == CudfType.INT32;
+      boolean sortedLong = equality && SORTED_PROBE && equalityKeyType == CudfType.INT64;
+      this.sortedInts = new IntArray(sortedInt ? equalityCapacity : 1);
+      this.sortedLongs = new LongArray(sortedLong ? equalityCapacity : 1);
       this.ints = new IntArray(Math.max(1L, (long) layout.slots(CudfType.INT32) * capacity));
       this.longs = new LongArray(Math.max(1L, (long) layout.slots(CudfType.INT64) * capacity));
       this.doubles =
@@ -709,7 +725,20 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             new ByteArray(1),
             false);
         // The key is slot 0 of its type, so the probe reads it from offset 0.
-        if (intKey) {
+        if (SORTED_PROBE) {
+          // Sorted once a set (sortSize is 0 when the set has not changed), then a binary search
+          // from a kernel for every batch: no hash table rebuilt per batch.
+          graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, setSize);
+          if (intKey) {
+            graph
+                .libraryTask("sortSet", Cudf::sortKeys, sortSize, setInts, sortedInts)
+                .task("probe", DeviceKernels::probeSortedInts, sortedInts, setSize, ints, inSet);
+          } else {
+            graph
+                .libraryTask("sortSet", Cudf::sortKeys, sortSize, setLongs, sortedLongs)
+                .task("probe", DeviceKernels::probeSortedLongs, sortedLongs, setSize, longs, inSet);
+          }
+        } else if (intKey) {
           graph.libraryTask("probe", Cudf::containedIn, probeSizes, ints, setInts, inSet);
         } else {
           graph.libraryTask("probe", Cudf::containedIn, probeSizes, longs, setLongs, inSet);
@@ -789,6 +818,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       meta.set(DeviceKernels.META_KEY_NULLABLE, keyNullable ? 1 : 0);
       setPath.setLength(0);
       setRowsHolder[0] = 0;
+      sortSize[0] = 0;
       if (!equalityId.isEmpty() && !equalityId.equals(setOnDevice)) {
         if (prep.setPaths() != null) {
           hold(setPath, prep.setPaths());
@@ -796,9 +826,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           setColumn[0] = prep.setColumn();
           probeSizes[1] = (int) prep.setRows();
           meta.set(DeviceKernels.META_EQUALITY_SET_HAS_NULL, 0);
+          sortSize[0] = probeSizes[1];
+          setSize.set(0, probeSizes[1]);
         } else {
           upload(executionPlan, prep.equality());
           meta.set(DeviceKernels.META_EQUALITY_SET_HAS_NULL, prep.equality().hasNull() ? 1 : 0);
+          sortSize[0] = probeSizes[1];
+          setSize.set(0, probeSizes[1]);
         }
         setOnDevice = equalityId;
       }
