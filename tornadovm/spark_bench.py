@@ -52,6 +52,12 @@ for name in tables:
             ).collect()
             rows = sum(r["c"] for r in result)
             checksum = sum(r["a"] + r["b"] + r["d"] + r["e"] for r in result) + len(result)
+        elif query == "q5":
+            result = spark.sql(
+                "SELECT k, count(*) c, sum(v1) a FROM t WHERE id < 25000000 AND v2 > 0.5 GROUP BY k"
+            ).collect()
+            rows = sum(r["c"] for r in result)
+            checksum = sum(r["a"] for r in result) + len(result)
         elif query == "q4":
             # Iceberg's bucket transform as a Spark function, from the catalog run.sh configures.
             result = spark.sql(

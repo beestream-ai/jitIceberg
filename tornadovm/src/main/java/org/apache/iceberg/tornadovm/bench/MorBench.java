@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.LongAdder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.tornadovm.AggregateResult;
@@ -69,10 +71,11 @@ public final class MorBench {
       Table table = MorTables.load(warehouse + "/" + args[t]);
       // One scan object a table, as an engine keeps its operators: a device scan keeps its buffers
       // and compiled plan between runs, so only the first run of a table pays for them.
+      Expression filter = filterOf(query);
       MergeOnReadScan scan =
           "gpu".equals(engine)
-              ? DeviceMergeOnReadScan.of(table)
-              : "cpu".equals(engine) ? CpuMergeOnReadScan.of(table, threads) : null;
+              ? DeviceMergeOnReadScan.of(table, filter)
+              : "cpu".equals(engine) ? CpuMergeOnReadScan.of(table, threads, filter) : null;
       for (int run = 0; run < runs; run++) {
         long start = System.nanoTime();
         double[] answer;
@@ -123,6 +126,10 @@ public final class MorBench {
         AggregateResult result = scan.aggregateByBucket("id", 16, "v1");
         yield new double[] {result.rows(), sum(result) + result.groups().size()};
       }
+      case "q5" -> {
+        AggregateResult result = scan.aggregate("k", "v1");
+        yield new double[] {result.rows(), sum(result) + result.groups().size()};
+      }
       case "q3" -> {
         LongAdder ids = new LongAdder();
         DoubleAdder values = new DoubleAdder();
@@ -148,6 +155,15 @@ public final class MorBench {
     };
   }
 
+  /** Q5's filter: ids are ascending file by file, so the id bound prunes three files in four. */
+  static Expression filterOf(String query) {
+    if ("q5".equals(query)) {
+      return Expressions.and(
+          Expressions.lessThan("id", 25_000_000L), Expressions.greaterThan("v2", 0.5));
+    }
+    return Expressions.alwaysTrue();
+  }
+
   private static double sum(AggregateResult result) {
     double total = 0;
     for (AggregateResult.Group group : result.groups().values()) {
@@ -165,11 +181,14 @@ public final class MorBench {
             ? ImmutableList.of("id", "k", "v1")
             : "q1".equals(query)
                 ? ImmutableList.of("v1")
-                : ImmutableList.of("k", "v1", "v2", "v3", "v4");
+                : "q4".equals(query)
+                    ? ImmutableList.of("id", "v1")
+                    : ImmutableList.of("id", "k", "v1", "v2", "v3", "v4");
     long rows = 0;
     double checksum = 0;
     java.util.Set<Integer> groups = new java.util.HashSet<>();
-    try (CloseableIterable<Record> records = IcebergGenerics.read(table).select(columns).build()) {
+    try (CloseableIterable<Record> records =
+        IcebergGenerics.read(table).select(columns).where(filterOf(query)).build()) {
       for (Record record : records) {
         rows++;
         switch (query) {
@@ -177,6 +196,10 @@ public final class MorBench {
           case "q4" -> {
             long id = (Long) record.getField("id");
             groups.add((org.apache.iceberg.util.BucketUtil.hash(id) & Integer.MAX_VALUE) % 16);
+            checksum += (Double) record.getField("v1");
+          }
+          case "q5" -> {
+            groups.add((Integer) record.getField("k"));
             checksum += (Double) record.getField("v1");
           }
           case "q2" -> {

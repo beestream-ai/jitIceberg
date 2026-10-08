@@ -75,6 +75,7 @@ for query, title in [
     ("q2", "Q2 `SELECT k, count(*), sum(v1..v4) GROUP BY k` (1000 groups)"),
     ("q3", "Q3 `SELECT id, k, v1` -- every live row materialized on the host"),
     ("q4", "Q4 `SELECT bucket(16, id), count(*), sum(v1) GROUP BY 1` -- Iceberg's bucket transform"),
+    ("q5", "Q5 `SELECT k, count(*), sum(v1) WHERE id < 25000000 AND v2 > 0.5 GROUP BY k` -- file pruning + residual filter"),
 ]:
     present = [e for e in ENGINES if any((t, e, query) in runs for t in TABLES)]
     if not present:
