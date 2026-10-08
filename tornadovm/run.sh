@@ -99,7 +99,7 @@ case "$mode" in
             --conf spark.rapids.sql.explain="${RAPIDS_EXPLAIN:-NOT_ON_GPU}" \
             --conf spark.rapids.sql.concurrentGpuTasks="${RAPIDS_TASKS:-2}" \
             --conf spark.rapids.memory.pinnedPool.size=4g \
-            --conf spark.rapids.sql.format.iceberg.enabled=true \
+            --conf spark.rapids.sql.format.iceberg.enabled=true ${RAPIDS_CONF:-} \
             --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
             --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
             --conf spark.sql.catalog.local.type=hadoop \
