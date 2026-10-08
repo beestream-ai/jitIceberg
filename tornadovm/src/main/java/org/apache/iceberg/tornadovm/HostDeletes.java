@@ -205,7 +205,7 @@ final class HostDeletes {
     private final long[] hashes;
     private final long[] keys; // column c at c * size
     private final byte[] nulls; // column c at c * size
-    private int[] order; // by hash, for the host probe; built on first use
+    private volatile int[] table; // open addressing on the hash, for the host probe; built once
 
     KeySet(String id, int columns, int size, long[] hashes, long[] keys, byte[] nulls) {
       this.id = id;
@@ -241,27 +241,22 @@ final class HostDeletes {
     }
 
     /**
-     * Whether a key is in the set, as the device decides it: hash, then every entry with that hash
-     * compared column by column, a null equal to a null.
+     * Whether a key is in the set: the host probe, for the CPU scan. The device binary-searches
+     * sorted hashes; a CPU does better with an open-addressing table on the same hash, so the
+     * baseline uses that. Every candidate is compared column by column, a null equal to a null.
      */
     boolean contains(long[] key, byte[] isNull) {
-      int[] byHash = order();
+      int[] slots = table();
       long hash = DeviceKernels.KEY_HASH_SEED;
       for (int c = 0; c < columns; c++) {
         hash = DeviceKernels.keyHash(hash, key[c], isNull[c]);
       }
-      int lo = 0;
-      int hi = size;
-      while (lo < hi) {
-        int mid = (lo + hi) >>> 1;
-        if (hashes[byHash[mid]] < hash) {
-          lo = mid + 1;
-        } else {
-          hi = mid;
+      int mask = slots.length - 1;
+      for (int at = (int) hash & mask; slots[at] != 0; at = (at + 1) & mask) {
+        int entry = slots[at] - 1;
+        if (hashes[entry] != hash) {
+          continue;
         }
-      }
-      for (int j = lo; j < size && hashes[byHash[j]] == hash; j++) {
-        int entry = byHash[j];
         boolean same = true;
         for (int c = 0; c < columns && same; c++) {
           byte entryNull = nulls[c * size + entry];
@@ -274,16 +269,25 @@ final class HostDeletes {
       return false;
     }
 
-    private synchronized int[] order() {
-      if (order == null) {
-        order =
-            java.util.stream.IntStream.range(0, size)
-                .boxed()
-                .sorted(Comparator.comparingLong(i -> hashes[i]))
-                .mapToInt(Integer::intValue)
-                .toArray();
+    private int[] table() {
+      int[] built = table;
+      return built != null ? built : buildTable();
+    }
+
+    private synchronized int[] buildTable() {
+      if (table == null) {
+        int[] slots = new int[Integer.highestOneBit(Math.max(2, size * 2 - 1)) << 1];
+        int mask = slots.length - 1;
+        for (int entry = 0; entry < size; entry++) {
+          int at = (int) hashes[entry] & mask;
+          while (slots[at] != 0) {
+            at = (at + 1) & mask;
+          }
+          slots[at] = entry + 1;
+        }
+        table = slots;
       }
-      return order;
+      return table;
     }
   }
 

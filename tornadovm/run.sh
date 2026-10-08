@@ -49,6 +49,11 @@ case "$mode" in
         exec "$JAVA_HOME/bin/java" -Xmx"$HEAP" --enable-preview -cp "$CP" \
             org.apache.iceberg.tornadovm.bench.GenerateTables "$@"
         ;;
+    addcomposite)
+        CP="$(classpath):$(ls "$TORNADOVM_HOME"/share/java/tornado/tornado-{api,cudf}-*.jar | tr '\n' ':')"
+        exec "$JAVA_HOME/bin/java" -Xmx"$HEAP" --enable-preview -cp "$CP" \
+            org.apache.iceberg.tornadovm.bench.AddCompositeTable "$@"
+        ;;
     gpu)
         CP="$(classpath)"
         # The argfile puts TornadoVM on the module path; -da for TornadoVM packages, see build.gradle.
