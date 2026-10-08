@@ -54,6 +54,11 @@ case "$mode" in
         exec "$JAVA_HOME/bin/java" -Xmx"$HEAP" --enable-preview -cp "$CP" \
             org.apache.iceberg.tornadovm.bench.AddCompositeTable "$@"
         ;;
+    addequality)
+        CP="$(classpath):$(ls "$TORNADOVM_HOME"/share/java/tornado/tornado-{api,cudf}-*.jar | tr '\n' ':')"
+        exec "$JAVA_HOME/bin/java" -Xmx"$HEAP" --enable-preview -cp "$CP" \
+            org.apache.iceberg.tornadovm.bench.AddEqualityDeletes "$@"
+        ;;
     gpu)
         CP="$(classpath)"
         # The argfile puts TornadoVM on the module path; -da for TornadoVM packages, see build.gradle.
@@ -83,11 +88,12 @@ case "$mode" in
             "$HERE/spark_bench.py" "$@"
         ;;
     rapids)
-        # Spark with the RAPIDS Accelerator on the same GPU; NOT_ON_GPU explains every operator it
+        # Spark with the RAPIDS Accelerator on the same GPU, with the newest Iceberg runtime RAPIDS
+        # supports (ICEBERG_RAPIDS_JAR; 26.08 takes 1.6, 1.9, 1.10); NOT_ON_GPU explains every operator it
         # leaves on the CPU.
         : "${SPARK_HOME:?set SPARK_HOME}"; : "${ICEBERG_SPARK_JAR:?set ICEBERG_SPARK_JAR}"; : "${RAPIDS_JAR:?set RAPIDS_JAR}"
         ENGINE=rapids exec "$SPARK_HOME/bin/spark-submit" --master "local[${THREADS:-$(nproc)}]" \
-            --driver-memory "$HEAP" --jars "$ICEBERG_SPARK_JAR,$RAPIDS_JAR" \
+            --driver-memory "$HEAP" --jars "${ICEBERG_RAPIDS_JAR:-$ICEBERG_SPARK_JAR},$RAPIDS_JAR" \
             --conf spark.plugins=com.nvidia.spark.SQLPlugin \
             --conf spark.rapids.sql.enabled=true \
             --conf spark.rapids.sql.explain="${RAPIDS_EXPLAIN:-NOT_ON_GPU}" \

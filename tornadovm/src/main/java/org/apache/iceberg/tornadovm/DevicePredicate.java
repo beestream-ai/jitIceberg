@@ -294,11 +294,13 @@ final class DevicePredicate {
       long[] longs = new long[kind == CudfType.FLOAT64 ? 0 : values.size()];
       double[] doubles = new double[kind == CudfType.FLOAT64 ? values.size() : 0];
       for (int i = 0; i < values.size(); i++) {
-        Number value = (Number) values.get(i);
-        if (kind == CudfType.FLOAT64) {
-          doubles[i] = value.doubleValue();
+        Object value = values.get(i);
+        if (value instanceof CharSequence string) {
+          longs[i] = ScanLayout.packString(string);
+        } else if (kind == CudfType.FLOAT64) {
+          doubles[i] = ((Number) value).doubleValue();
         } else {
-          longs[i] = value.longValue();
+          longs[i] = ((Number) value).longValue();
         }
       }
       List<Term> terms = Lists.newArrayList();

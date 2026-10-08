@@ -501,6 +501,140 @@ final class DeviceKernels {
     return validSlot >= 0 && valid.get(validSlot * stride + i) == 0 ? 1 : 0;
   }
 
+  /**
+   * Packs each string of {@code strings} cuDF-layout columns into its INT64 slot: up to 8 bytes,
+   * big-endian, zero-padded, sign bit flipped -- so signed order is byte order, as Iceberg orders
+   * strings. A longer value sets {@code errors[0]}, and the host refuses the batch. Column s has
+   * its {@code stride + 1} offsets at {@code s * (stride + 1)} and its bytes at {@code s * 8 *
+   * stride}; a null packs to whatever, its validity byte says it is null.
+   */
+  static void packStrings(
+      IntArray meta,
+      IntArray offsets,
+      ByteArray chars,
+      int strings,
+      int firstSlot,
+      int stride,
+      LongArray longs,
+      IntArray errors) {
+    for (@Parallel int i = 0; i < stride; i++) {
+      if (i < meta.get(META_ROWS)) {
+        for (int s = 0; s < strings; s++) {
+          int from = offsets.get(s * (stride + 1) + i);
+          int length = offsets.get(s * (stride + 1) + i + 1) - from;
+          long packed = 0L;
+          if (length > 8) {
+            errors.set(0, 1);
+          } else {
+            long base = 8L * s * stride + from;
+            for (int b = 0; b < 8; b++) {
+              long next = b < length ? (chars.get((int) (base + b)) & 0xFFL) : 0L;
+              packed = (packed << 8) | next;
+            }
+          }
+          longs.set((long) (firstSlot + s) * stride + i, packed ^ Long.MIN_VALUE);
+        }
+      }
+    }
+  }
+
+  /** The first key column of a row a batch drops: its group is discarded on the host. */
+  static final long DEAD_KEY = Long.MIN_VALUE;
+
+  /** A null group-key value. */
+  static final long NULL_KEY = Long.MIN_VALUE + 1;
+
+  /**
+   * Group-key columns as INT64, for a group-by over several keys: each key column's value widened
+   * (a packed string as it is), {@link #NULL_KEY} for a null; a dropped row gets {@link #DEAD_KEY}
+   * in the first. With no key columns every live row gets key 0. {@code spec} holds, a key, its
+   * kind (0 INT32, 1 INT64), slot and validity slot (or -1).
+   */
+  static void groupKeyColumns(
+      IntArray spec,
+      int keys,
+      ByteArray live,
+      IntArray ints,
+      LongArray longs,
+      ByteArray valid,
+      int stride,
+      LongArray out) {
+    for (@Parallel int i = 0; i < stride; i++) {
+      if (live.get(i) == 0) {
+        out.set(i, DEAD_KEY);
+        for (int k = 1; k < keys; k++) {
+          out.set((long) k * stride + i, 0L);
+        }
+      } else if (keys == 0) {
+        out.set(i, 0L);
+      } else {
+        for (int k = 0; k < keys; k++) {
+          int slot = spec.get(3 * k + 1);
+          int validSlot = spec.get(3 * k + 2);
+          long value;
+          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+            value = NULL_KEY;
+          } else if (spec.get(3 * k) == 0) {
+            value = ints.get(slot * stride + i);
+          } else {
+            value = longs.get((long) slot * stride + i);
+          }
+          out.set((long) k * stride + i, value);
+        }
+      }
+    }
+  }
+
+  /** Ints of {@code spec} a value: its factor count, then kind, slot and validity slot a factor. */
+  static final int VALUE_SPEC_INTS = 1 + 3 * DeviceValue.MAX_FACTORS;
+
+  /**
+   * Each {@link DeviceValue} of every live row, a column at {@code stride}, then a column of 1 a
+   * live row to count with: a product of {@code (offset + scale * column)} factors, 0 when a
+   * factor's column is null. A dropped row gets 0 everywhere. {@code constants} holds offset and
+   * scale a factor, {@code 2 * MAX_FACTORS} a value.
+   */
+  static void valueColumns(
+      IntArray spec,
+      DoubleArray constants,
+      int values,
+      ByteArray live,
+      IntArray ints,
+      LongArray longs,
+      DoubleArray doubles,
+      ByteArray valid,
+      int stride,
+      DoubleArray out) {
+    for (@Parallel int i = 0; i < stride; i++) {
+      int alive = live.get(i);
+      for (int v = 0; v < values; v++) {
+        int base = v * VALUE_SPEC_INTS;
+        double product = 1.0;
+        int isNull = 0;
+        for (int f = 0; f < spec.get(base); f++) {
+          int kind = spec.get(base + 1 + 3 * f);
+          int slot = spec.get(base + 2 + 3 * f);
+          int validSlot = spec.get(base + 3 + 3 * f);
+          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+            isNull = 1;
+          }
+          double x;
+          if (kind == 0) {
+            x = ints.get(slot * stride + i);
+          } else if (kind == 1) {
+            x = longs.get((long) slot * stride + i);
+          } else {
+            x = doubles.get((long) slot * stride + i);
+          }
+          int c = 2 * (v * DeviceValue.MAX_FACTORS + f);
+          product = product * (constants.get(c) + constants.get(c + 1) * x);
+        }
+        out.set((long) v * stride + i, alive == 1 && isNull == 0 ? product : 0.0);
+      }
+      out.set((long) values * stride + i, alive == 1 ? 1.0 : 0.0);
+    }
+  }
+
   /** Most columns a Z-order key interleaves; Spark's rewrites rarely use more. */
   static final int MAX_ZORDER_COLUMNS = 4;
 

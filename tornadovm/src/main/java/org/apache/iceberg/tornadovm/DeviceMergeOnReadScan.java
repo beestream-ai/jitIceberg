@@ -92,6 +92,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   private static final int HOST_THREADS = 8;
 
+  /** The longest string the device packs into an INT64. */
+  static final int STRING_BYTES = 8;
+
   private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.debug");
 
   /**
@@ -218,6 +221,61 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         (region, executed) -> ((AggregateRegion) region).collect(executed, result));
     metrics.total((System.nanoTime() - start) / 1e6);
     return result;
+  }
+
+  /**
+   * Sums of {@link DeviceValue}s and the row count per group of up to four columns -- integer,
+   * long, date, timestamp or string (of up to 8 bytes) -- over the live rows that pass the scan's
+   * filter: the shape of TPC-H's Q1 and, with no group columns, Q6.
+   *
+   * <p>One kernel builds the group keys as INT64 columns (a string as its packed value), another
+   * evaluates every value of every row, and cuDF groups by all keys at once
+   * (Cudf.groupAggregateLongs); only the groups come back to the host.
+   */
+  public GroupedAggregate aggregate(List<String> groupColumns, List<DeviceValue> values) {
+    if (groupColumns.size() > 4 || values.isEmpty()) {
+      throw new IllegalArgumentException("Up to 4 group columns and at least one value");
+    }
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    List<String> projection = Lists.newArrayList(groupColumns);
+    for (String column : groupColumns) {
+      org.apache.iceberg.types.Type.TypeID type = column(column).type().typeId();
+      switch (type) {
+        case INTEGER, LONG, DATE, TIMESTAMP, STRING -> {}
+        default -> throw new UnsupportedOperationException("Cannot group by " + column(column));
+      }
+    }
+    for (DeviceValue value : values) {
+      for (DeviceValue.Factor factor : value.factors()) {
+        org.apache.iceberg.types.Type.TypeID type = column(factor.column()).type().typeId();
+        if (type != org.apache.iceberg.types.Type.TypeID.INTEGER
+            && type != org.apache.iceberg.types.Type.TypeID.LONG
+            && type != org.apache.iceberg.types.Type.TypeID.DOUBLE) {
+          throw new UnsupportedOperationException("Not a numeric column: " + factor.column());
+        }
+        if (!projection.contains(factor.column())) {
+          projection.add(factor.column());
+        }
+      }
+    }
+    Planned planned = new Planned(null, projection);
+    String key = "grouped:" + groupColumns + ":" + values;
+    List<Region> streams =
+        reuse(key, planned, () -> new GroupedRegion(planned, groupColumns, values));
+    metrics.plan((System.nanoTime() - start) / 1e6);
+    GroupedAggregate result = new GroupedAggregate(values.size());
+    run(streams, planned, (region, executed) -> ((GroupedRegion) region).collect(executed, result));
+    metrics.total((System.nanoTime() - start) / 1e6);
+    return result;
+  }
+
+  private Types.NestedField column(String name) {
+    Types.NestedField field = table.schema().findField(name);
+    if (field == null) {
+      throw new IllegalArgumentException("No column " + name);
+    }
+    return field;
   }
 
   @Override
@@ -418,6 +476,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                     }
                     long deviceStart = System.nanoTime();
                     TornadoExecutionResult executed = executionPlan.execute();
+                    region.checkStrings(executed);
                     long copyStart = System.nanoTime();
                     long rows = perBatch.applyAsLong(region, executed);
                     if (DEBUG) {
@@ -438,6 +497,19 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         worker.get();
       }
     } catch (java.util.concurrent.ExecutionException e) {
+      for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
+        if (cause instanceof UnsupportedOperationException unsupported) {
+          throw unsupported;
+        }
+        if (String.valueOf(cause.getMessage()).contains("a column was sized for")) {
+          // The string read found more bytes than 8 a row: some value is longer than that.
+          throw new UnsupportedOperationException(
+              "A string column holds values longer than "
+                  + STRING_BYTES
+                  + " bytes, which the device does not support",
+              e.getCause());
+        }
+      }
       throw new IllegalStateException("Device scan failed", e.getCause());
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -475,6 +547,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         throw new UncheckedIOException(e);
       }
       this.equalityKeyId = HostDeletes.equalityKeyId(tasks);
+      if (equalityKeyId != null
+          && table.schema().findField(equalityKeyId).type().typeId()
+              == org.apache.iceberg.types.Type.TypeID.STRING) {
+        throw new UnsupportedOperationException(
+            "Equality deletes on a string column are not supported on the device");
+      }
       List<Integer> allKeyIds = HostDeletes.equalityKeyIds(tasks);
       this.keyIds = allKeyIds.size() > 1 ? allKeyIds : List.of();
       this.filtered = filter.op() != Expression.Operation.TRUE;
@@ -635,6 +713,23 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final DoubleArray doubles;
     final ByteArray valid;
     final ByteArray live;
+    final int[] stringColumns;
+    final IntArray stringOffsets;
+    final ByteArray stringChars;
+    final IntArray stringErrors = new IntArray(1);
+
+    /** Refuses a batch that held a string longer than {@link #STRING_BYTES}. */
+    void checkStrings(TornadoExecutionResult executed) {
+      if (stringColumns.length > 0) {
+        executed.transferToHost(stringErrors);
+        if (stringErrors.get(0) != 0) {
+          throw new UnsupportedOperationException(
+              "A string column holds a value longer than "
+                  + STRING_BYTES
+                  + " bytes, which the device does not support");
+        }
+      }
+    }
 
     private TornadoExecutionPlan plan;
     private String setOnDevice;
@@ -663,7 +758,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.equalityCapacity = planned.equalityCapacity;
       this.positionCapacity = planned.positionCapacity;
       this.maxFiles = planned.maxFiles;
-      this.columns = new int[layout.fields().size()];
+      if (layout.numericCount() == 0) {
+        throw new UnsupportedOperationException("A device scan reads at least one numeric column");
+      }
+      this.columns = new int[layout.numericCount()];
+      this.stringColumns = new int[layout.stringCount()];
+      long strings = layout.stringCount();
+      this.stringOffsets = new IntArray(strings == 0 ? 1 : (int) (strings * (capacity + 1L)));
+      this.stringChars = new ByteArray(strings == 0 ? 1L : strings * STRING_BYTES * capacity);
       this.probeSizes[0] = capacity;
 
       boolean equality = equalityKeyId != null;
@@ -705,8 +807,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.longs = new LongArray(Math.max(1L, (long) layout.slots(CudfType.INT64) * capacity));
       this.doubles =
           new DoubleArray(Math.max(1L, (long) layout.slots(CudfType.FLOAT64) * capacity));
+      // The string read writes validity for its columns whether or not they are optional.
       this.valid =
-          new ByteArray(layout.anyOptional() ? (long) layout.fields().size() * capacity : 1L);
+          new ByteArray(
+              layout.anyOptional() || layout.stringCount() > 0
+                  ? (long) layout.fields().size() * capacity
+                  : 1L);
       this.live = new ByteArray(capacity);
     }
 
@@ -760,6 +866,37 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           doubles,
           valid,
           layout.anyOptional());
+      if (layout.stringCount() > 0) {
+        // STRING columns of the same files: cuDF decodes them into offsets and bytes, and a kernel
+        // packs each value -- up to 8 bytes -- into its INT64 slot, where filters, group keys and
+        // the rest treat it as a number that orders as the string does.
+        graph
+            .transferToDevice(DataTransferMode.EVERY_EXECUTION, stringErrors)
+            .libraryTask(
+                "readStrings",
+                Cudf::readParquetStringColumns,
+                path,
+                stringColumns,
+                rowsHolder,
+                capacity,
+                stringOffsets,
+                stringChars,
+                (long) STRING_BYTES * capacity,
+                valid,
+                layout.numericCount())
+            .task(
+                "packStrings",
+                DeviceKernels::packStrings,
+                meta,
+                stringOffsets,
+                stringChars,
+                layout.stringCount(),
+                layout.firstStringSlot(),
+                capacity,
+                longs,
+                stringErrors)
+            .transferToHost(DataTransferMode.UNDER_DEMAND, stringErrors);
+      }
       // Position-delete files the device reads itself: their pos columns, concatenated.
       graph.libraryTask(
           "readPositions",
@@ -909,6 +1046,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       hold(path, prep.path());
       rowsHolder[0] = prep.rows();
       System.arraycopy(prep.columns(), 0, columns, 0, columns.length);
+      System.arraycopy(prep.columns(), columns.length, stringColumns, 0, stringColumns.length);
+      stringErrors.set(0, 0);
       meta.set(DeviceKernels.META_ROWS, (int) prep.rows());
 
       byte[] bits = prep.positionBits();
@@ -1315,6 +1454,149 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         executed.transferToHost(
             new DataRange(array).withOffset((long) s * capacity).withSize(rows));
       }
+    }
+  }
+
+  /** Sums of expressions per group of several columns: the TPC-H Q1 and Q6 shape. */
+  private final class GroupedRegion extends Region {
+    private final int keys;
+    private final int groupKeyColumns;
+    private final int values;
+    private final boolean[] stringKey;
+    private final boolean[] nullableKey;
+    private final IntArray groupSpec;
+    private final IntArray valueSpec;
+    private final DoubleArray valueConstants;
+    private final LongArray keyColumnsData;
+    private final DoubleArray valueData;
+    private final LongArray outKeys;
+    private final DoubleArray outSums;
+    private final IntArray outGroups = new IntArray(1);
+    private final int[] size;
+
+    GroupedRegion(Planned planned, List<String> groupColumns, List<DeviceValue> sums) {
+      super(planned);
+      this.keys = groupColumns.size();
+      this.groupKeyColumns = Math.max(1, keys);
+      this.values = sums.size();
+      this.stringKey = new boolean[keys];
+      this.nullableKey = new boolean[keys];
+      this.groupSpec = new IntArray(Math.max(1, 3 * keys));
+      for (int k = 0; k < keys; k++) {
+        Types.NestedField field = column(groupColumns.get(k));
+        stringKey[k] = layout.isString(field.fieldId());
+        nullableKey[k] = field.isOptional();
+        groupSpec.set(3 * k, layout.type(field.fieldId()) == CudfType.INT32 ? 0 : 1);
+        groupSpec.set(3 * k + 1, layout.slot(field.fieldId()));
+        groupSpec.set(3 * k + 2, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
+      }
+      this.valueSpec = new IntArray(values * DeviceKernels.VALUE_SPEC_INTS);
+      this.valueConstants = new DoubleArray(2L * values * DeviceValue.MAX_FACTORS);
+      for (int v = 0; v < values; v++) {
+        List<DeviceValue.Factor> factors = sums.get(v).factors();
+        int base = v * DeviceKernels.VALUE_SPEC_INTS;
+        valueSpec.set(base, factors.size());
+        for (int f = 0; f < factors.size(); f++) {
+          DeviceValue.Factor factor = factors.get(f);
+          Types.NestedField field = column(factor.column());
+          CudfType type = layout.type(field.fieldId());
+          valueSpec.set(
+              base + 1 + 3 * f, type == CudfType.INT32 ? 0 : type == CudfType.INT64 ? 1 : 2);
+          valueSpec.set(base + 2 + 3 * f, layout.slot(field.fieldId()));
+          valueSpec.set(
+              base + 3 + 3 * f, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
+          int c = 2 * (v * DeviceValue.MAX_FACTORS + f);
+          valueConstants.set(c, factor.offset());
+          valueConstants.set(c + 1, factor.scale());
+        }
+      }
+      this.keyColumnsData = new LongArray((long) groupKeyColumns * capacity);
+      this.valueData = new DoubleArray((long) (values + 1) * capacity);
+      this.outKeys = new LongArray((long) groupKeyColumns * capacity);
+      this.outSums = new DoubleArray((long) (values + 1) * capacity);
+      this.size = new int[] {capacity, groupKeyColumns, values + 1};
+    }
+
+    @Override
+    void consumer(TaskGraph graph) {
+      graph
+          .transferToDevice(DataTransferMode.FIRST_EXECUTION, groupSpec, valueSpec, valueConstants)
+          .task(
+              "groupKeys",
+              DeviceKernels::groupKeyColumns,
+              groupSpec,
+              keys,
+              live,
+              ints,
+              longs,
+              valid,
+              capacity,
+              keyColumnsData)
+          .task(
+              "values",
+              DeviceKernels::valueColumns,
+              valueSpec,
+              valueConstants,
+              values,
+              live,
+              ints,
+              longs,
+              doubles,
+              valid,
+              capacity,
+              valueData)
+          .libraryTask(
+              "groupBy",
+              Cudf::groupAggregateLongs,
+              size,
+              CudfAggregation.SUM.code(),
+              keyColumnsData,
+              valueData,
+              capacity,
+              outKeys,
+              outSums,
+              outGroups)
+          .transferToHost(DataTransferMode.UNDER_DEMAND, outKeys, outSums, outGroups);
+    }
+
+    /** Copies back one batch's groups and merges them; returns the batch's live rows. */
+    long collect(TornadoExecutionResult executed, GroupedAggregate result) {
+      executed.transferToHost(outGroups);
+      int groups = outGroups.get(0);
+      if (groups == 0) {
+        return 0L;
+      }
+      for (int k = 0; k < groupKeyColumns; k++) {
+        executed.transferToHost(
+            new DataRange(outKeys).withOffset((long) k * capacity).withSize(groups));
+      }
+      for (int v = 0; v <= values; v++) {
+        executed.transferToHost(
+            new DataRange(outSums).withOffset((long) v * capacity).withSize(groups));
+      }
+      long liveRows = 0;
+      double[] sums = new double[values];
+      for (int g = 0; g < groups; g++) {
+        if (outKeys.get(g) == DeviceKernels.DEAD_KEY) {
+          continue;
+        }
+        List<Object> key = Lists.newArrayListWithCapacity(keys);
+        for (int k = 0; k < keys; k++) {
+          long value = outKeys.get((long) k * capacity + g);
+          if (nullableKey[k] && value == DeviceKernels.NULL_KEY) {
+            key.add(null);
+          } else {
+            key.add(stringKey[k] ? ScanLayout.unpackString(value) : (Object) value);
+          }
+        }
+        for (int v = 0; v < values; v++) {
+          sums[v] = outSums.get((long) v * capacity + g);
+        }
+        double rows = outSums.get((long) values * capacity + g);
+        result.add(key, sums, rows);
+        liveRows += (long) rows;
+      }
+      return liveRows;
     }
   }
 

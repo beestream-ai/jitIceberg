@@ -40,6 +40,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.tornadovm.bench.MorTables;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.BeforeAll;
@@ -235,6 +236,112 @@ public class TestDeviceMergeOnRead {
     MorTables.deleteEqualRows(table, ImmutableList.of("id", "k"), keys);
     writeFiles(table, 0, 500); // after the deletes: (3, 3) survives here
     assertMatchesIceberg(table);
+  }
+
+  /**
+   * String columns (up to 8 bytes) as group keys and in filters, with nulls, UTF-8 and deletes;
+   * sums of products of columns -- TPC-H Q1's shape -- checked against IcebergGenerics. A column
+   * holding a longer string is refused, not cut.
+   */
+  @Test
+  public void testStringGroupKeysAndValues() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "flag", Types.StringType.get()),
+            Types.NestedField.optional(3, "mode", Types.StringType.get()),
+            Types.NestedField.required(4, "price", Types.DoubleType.get()),
+            Types.NestedField.required(5, "disc", Types.DoubleType.get()),
+            Types.NestedField.required(6, "tax", Types.DoubleType.get()),
+            Types.NestedField.required(7, "comment", Types.StringType.get()));
+    Table table = MorTables.create(temp.resolve("strings").toString(), schema, 2);
+    String[] modes = {"AIR", "REG AIR", "TRUCK", "Ωméga", "SHIP"};
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              5000,
+              i -> {
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("id", index * 1_000_000L + i);
+                record.setField("flag", String.valueOf("RAN".charAt((int) (i % 3))));
+                record.setField("mode", i % 13 == 0 ? null : modes[(int) ((i + index) % 5)]);
+                record.setField("price", 100.0 + i);
+                record.setField("disc", (i % 10) / 100.0);
+                record.setField("tax", (i % 8) / 100.0);
+                record.setField("comment", "a comment longer than eight bytes " + i);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(5000, 7), new long[0], everyNth(5000, 11)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(3L, 1_000_005L));
+    table.refresh();
+
+    org.apache.iceberg.expressions.Expression filter =
+        org.apache.iceberg.expressions.Expressions.and(
+            org.apache.iceberg.expressions.Expressions.notEqual("flag", "N"),
+            org.apache.iceberg.expressions.Expressions.lessThan("price", 4000.0));
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
+      for (Record record : records) {
+        double price = (Double) record.getField("price");
+        double disc = (Double) record.getField("disc");
+        double tax = (Double) record.getField("tax");
+        List<Object> key = Lists.newArrayList(record.getField("flag"), record.getField("mode"));
+        double[] totals = expected.computeIfAbsent(key, ignored -> new double[3]);
+        totals[0] += price * (1 - disc);
+        totals[1] += price * (1 - disc) * (1 + tax);
+        totals[2] += 1;
+      }
+    }
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table, filter)) {
+      for (int repeat = 0; repeat < 2; repeat++) {
+        Map<List<Object>, double[]> actual =
+            device
+                .aggregate(
+                    ImmutableList.of("flag", "mode"),
+                    ImmutableList.of(
+                        DeviceValue.of("price").timesOneMinus("disc"),
+                        DeviceValue.of("price").timesOneMinus("disc").timesOnePlus("tax")))
+                .groups();
+        assertThat(actual.keySet()).isEqualTo(expected.keySet());
+        for (Map.Entry<List<Object>, double[]> entry : expected.entrySet()) {
+          double[] got = actual.get(entry.getKey());
+          for (int v = 0; v < 3; v++) {
+            assertThat(got[v])
+                .as("%s value %d", entry.getKey(), v)
+                .isCloseTo(entry.getValue()[v], org.assertj.core.data.Offset.offset(1e-6));
+          }
+        }
+      }
+    }
+
+    // A filter on a string column the device packs; the long comment column is refused.
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(
+            table, org.apache.iceberg.expressions.Expressions.in("mode", "AIR", "Ωméga"))) {
+      long rows =
+          device.aggregate(ImmutableList.of(), ImmutableList.of(DeviceValue.of("price"))).rows();
+      long expectedRows = 0;
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table)
+              .where(org.apache.iceberg.expressions.Expressions.in("mode", "AIR", "Ωméga"))
+              .build()) {
+        for (Record ignored : records) {
+          expectedRows++;
+        }
+      }
+      assertThat(rows).isEqualTo(expectedRows);
+      org.assertj.core.api.Assertions.assertThatThrownBy(
+              () ->
+                  device.aggregate(
+                      ImmutableList.of("comment"), ImmutableList.of(DeviceValue.of("price"))))
+          .hasStackTraceContaining("8 bytes");
+    }
   }
 
   /**

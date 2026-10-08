@@ -42,6 +42,8 @@ final class ScanLayout {
   private final Map<Integer, Integer> slotById = Maps.newHashMap();
   private final Map<Integer, Integer> readIndexById = Maps.newHashMap();
   private final int[] slotsPerType = new int[3];
+  private final List<Types.NestedField> strings = Lists.newArrayList();
+  private int numericCount;
   private boolean anyOptional = false;
 
   ScanLayout(Schema schema, Integer equalityKeyId, String groupColumn, List<String> columns) {
@@ -54,6 +56,17 @@ final class ScanLayout {
     for (String column : columns) {
       add(field(schema, column));
     }
+    // STRING columns come after every numeric one: the numeric read fills the first slots of
+    // each buffer and the first validity rows, the string read and its packing kernel the rest.
+    // Each string takes an INT64 slot, packed (see packStrings).
+    numericCount = fields.size();
+    for (Types.NestedField field : strings) {
+      readIndexById.put(field.fieldId(), fields.size());
+      slotById.put(field.fieldId(), slotsPerType[CudfType.INT64.code()]++);
+      fields.add(field);
+      types.add(CudfType.INT64);
+      anyOptional |= field.isOptional();
+    }
   }
 
   private static Types.NestedField field(Schema schema, String name) {
@@ -65,7 +78,11 @@ final class ScanLayout {
   }
 
   private void add(Types.NestedField field) {
-    if (slotById.containsKey(field.fieldId())) {
+    if (slotById.containsKey(field.fieldId()) || strings.contains(field)) {
+      return;
+    }
+    if (field.type().typeId() == Type.TypeID.STRING) {
+      strings.add(field);
       return;
     }
     CudfType type = cudfType(field);
@@ -82,6 +99,10 @@ final class ScanLayout {
     return switch (id) {
       case INTEGER, DATE -> CudfType.INT32;
       case LONG, TIMESTAMP, TIME -> CudfType.INT64;
+        // Strings of up to 8 bytes, packed into an INT64 on the device; longer ones are refused
+        // when
+        // a batch meets one.
+      case STRING -> CudfType.INT64;
       case DOUBLE -> CudfType.FLOAT64;
       default ->
           throw new UnsupportedOperationException(
@@ -97,8 +118,59 @@ final class ScanLayout {
     return fields;
   }
 
+  /** The types of the numeric columns, which the numeric read takes: the first fields. */
   CudfType[] types() {
-    return types.toArray(new CudfType[0]);
+    return types.subList(0, numericCount).toArray(new CudfType[0]);
+  }
+
+  /** How many fields are numeric; the string fields follow them. */
+  int numericCount() {
+    return numericCount;
+  }
+
+  int stringCount() {
+    return fields.size() - numericCount;
+  }
+
+  /** The INT64 slot of the first string column; the others follow it. */
+  int firstStringSlot() {
+    return slotsPerType[CudfType.INT64.code()] - stringCount();
+  }
+
+  boolean isString(int fieldId) {
+    return readIndex(fieldId) >= numericCount;
+  }
+
+  /**
+   * A string of up to 8 UTF-8 bytes as the device holds it: big-endian, zero-padded, sign bit
+   * flipped, so that signed INT64 order is the strings' byte order. Refuses a longer one, which
+   * would compare wrongly once cut.
+   */
+  static long packString(CharSequence value) {
+    byte[] bytes = value.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    if (bytes.length > 8) {
+      throw new UnsupportedOperationException(
+          "Strings of more than 8 bytes are not supported on the device: " + value);
+    }
+    long packed = 0;
+    for (int b = 0; b < 8; b++) {
+      packed = (packed << 8) | (b < bytes.length ? bytes[b] & 0xFFL : 0L);
+    }
+    return packed ^ Long.MIN_VALUE;
+  }
+
+  /** The string {@link #packString} packed. */
+  static String unpackString(long packed) {
+    long raw = packed ^ Long.MIN_VALUE;
+    byte[] bytes = new byte[8];
+    int length = 0;
+    for (int b = 0; b < 8; b++) {
+      bytes[b] = (byte) (raw >>> (56 - 8 * b));
+      if (bytes[b] != 0) {
+        length = b + 1;
+      }
+    }
+    return new String(bytes, 0, length, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   int slots(CudfType type) {
