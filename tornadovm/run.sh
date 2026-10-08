@@ -77,6 +77,25 @@ case "$mode" in
             --conf spark.ui.enabled=false \
             "$HERE/spark_bench.py" "$@"
         ;;
+    rapids)
+        # Spark with the RAPIDS Accelerator on the same GPU; NOT_ON_GPU explains every operator it
+        # leaves on the CPU.
+        : "${SPARK_HOME:?set SPARK_HOME}"; : "${ICEBERG_SPARK_JAR:?set ICEBERG_SPARK_JAR}"; : "${RAPIDS_JAR:?set RAPIDS_JAR}"
+        ENGINE=rapids exec "$SPARK_HOME/bin/spark-submit" --master "local[${THREADS:-$(nproc)}]" \
+            --driver-memory "$HEAP" --jars "$ICEBERG_SPARK_JAR,$RAPIDS_JAR" \
+            --conf spark.plugins=com.nvidia.spark.SQLPlugin \
+            --conf spark.rapids.sql.enabled=true \
+            --conf spark.rapids.sql.explain="${RAPIDS_EXPLAIN:-NOT_ON_GPU}" \
+            --conf spark.rapids.sql.concurrentGpuTasks="${RAPIDS_TASKS:-2}" \
+            --conf spark.rapids.memory.pinnedPool.size=4g \
+            --conf spark.rapids.sql.format.iceberg.enabled=true \
+            --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+            --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
+            --conf spark.sql.catalog.local.type=hadoop \
+            --conf spark.sql.catalog.local.warehouse="$(dirname "$1")" \
+            --conf spark.ui.enabled=false \
+            "$HERE/spark_bench.py" "$@"
+        ;;
     *)
         echo "unknown mode $mode" >&2; exit 2 ;;
 esac

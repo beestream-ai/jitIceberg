@@ -283,6 +283,29 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * new files, so rows keep them. Data files that already store lineage columns are refused.
    */
   public RewriteResult rewriteDataFiles() {
+    return rewrite(List.of());
+  }
+
+  /**
+   * {@link #rewriteDataFiles()}, writing each new file's rows in Iceberg's Z-order of the given
+   * columns -- the order {@code rewrite_data_files(strategy => 'sort', sort_order =>
+   * 'zorder(...)')} writes -- so that files cluster on all of them at once.
+   *
+   * <p>A kernel computes every row's Z-order value as Iceberg's {@code ZOrderByteUtils} does, cuDF
+   * sorts the rows of a batch by it, and the live rows are gathered in that order and written. Each
+   * output file is sorted; files are not sorted against each other (a batch is the unit, as a file
+   * group is Spark's). Up to {@value DeviceKernels#MAX_ZORDER_COLUMNS} integer, long, date,
+   * timestamp or double columns.
+   */
+  public RewriteResult rewriteDataFilesZOrder(String... zorderColumns) {
+    if (zorderColumns.length == 0 || zorderColumns.length > DeviceKernels.MAX_ZORDER_COLUMNS) {
+      throw new IllegalArgumentException(
+          "Z-order takes 1 to " + DeviceKernels.MAX_ZORDER_COLUMNS + " columns");
+    }
+    return rewrite(List.of(zorderColumns));
+  }
+
+  private RewriteResult rewrite(List<String> zorderColumns) {
     if (filter.op() != Expression.Operation.TRUE) {
       throw new UnsupportedOperationException("A rewrite of part of a table is not supported");
     }
@@ -301,9 +324,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     Planned planned = new Planned(null, columns);
     List<Region> streams =
         reuse(
-            "rewrite" + (formatVersion >= 3 ? "-lineage" : ""),
+            "rewrite" + (formatVersion >= 3 ? "-lineage" : "") + "-z" + zorderColumns,
             planned,
-            () -> new RewriteRegion(planned, formatVersion >= 3));
+            () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns));
     metrics.plan((System.nanoTime() - start) / 1e6);
 
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
@@ -1047,9 +1070,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       return liveCount;
     }
 
-    IntArray compacted() {
+    /** The rows the gathers take, in the order they write them: the live rows, by default. */
+    IntArray positions() {
       return compacted;
     }
+
+    /** What a shape adds between the compaction and the gathers; nothing by default. */
+    void beforeGather(TaskGraph graph) {}
 
     int longSlots() {
       return longSlots;
@@ -1096,11 +1123,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     void consumer(TaskGraph graph) {
       graph.libraryTask(
           "compact", Cudf::selectedIndices, capacity, capacity, live, compacted, liveCount);
+      beforeGather(graph);
       if (intSlots > 0) {
         graph.task(
             "gatherInts",
             DeviceKernels::gatherInts,
-            compacted,
+            positions(),
             liveCount,
             ints,
             intSlots,
@@ -1111,7 +1139,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherLongs",
             DeviceKernels::gatherLongs,
-            compacted,
+            positions(),
             liveCount,
             longs,
             longSlots,
@@ -1122,7 +1150,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherDoubles",
             DeviceKernels::gatherDoubles,
-            compacted,
+            positions(),
             liveCount,
             doubles,
             doubleSlots,
@@ -1133,7 +1161,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherValid",
             DeviceKernels::gatherBytes,
-            compacted,
+            positions(),
             liveCount,
             valid,
             validSlots,
@@ -1180,15 +1208,37 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final IntArray fileCount = new IntArray(1);
     private final LongArray firstRowIds;
     private final LongArray sequences;
+    private final int zColumns;
+    private final IntArray zSpec;
+    private final int[] zSize;
+    private final LongArray zKeys;
+    private final IntArray zOrder;
     private String location;
 
     /**
      * {@code lineage}: a v3 table's rewrite, which also writes each row's {@code _row_id} and
      * {@code _last_updated_sequence_number}, as two INT64 columns after the table's.
      */
-    RewriteRegion(Planned planned, boolean lineage) {
+    RewriteRegion(Planned planned, boolean lineage, List<String> zorderColumns) {
       super(planned, lineage ? 2 : 0);
       this.lineage = lineage;
+      this.zColumns = zorderColumns.size();
+      this.zSpec = new IntArray(Math.max(1, 3 * zColumns));
+      this.zSize = new int[] {0, zColumns + 1};
+      this.zKeys = new LongArray(zColumns == 0 ? 1L : (long) (zColumns + 1) * capacity);
+      this.zOrder = new IntArray(zColumns == 0 ? 1 : capacity);
+      for (int c = 0; c < zColumns; c++) {
+        Types.NestedField field = table.schema().findField(zorderColumns.get(c));
+        if (field == null) {
+          throw new IllegalArgumentException("No column " + zorderColumns.get(c));
+        }
+        CudfType type = layout.type(field.fieldId());
+        zSpec.set(3 * c, type == CudfType.INT32 ? 0 : type == CudfType.INT64 ? 1 : 2);
+        zSpec.set(3 * c + 1, layout.slot(field.fieldId()));
+        zSpec.set(
+            3 * c + 2,
+            layout.anyOptional() && field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
+      }
       this.fileStarts = new IntArray(maxFiles);
       this.firstRowIds = new LongArray(maxFiles);
       this.sequences = new LongArray(maxFiles);
@@ -1226,6 +1276,32 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     @Override
+    IntArray positions() {
+      return zColumns == 0 ? super.positions() : zOrder;
+    }
+
+    @Override
+    void beforeGather(TaskGraph graph) {
+      if (zColumns > 0) {
+        graph
+            .transferToDevice(DataTransferMode.FIRST_EXECUTION, zSpec)
+            .task(
+                "zorder",
+                DeviceKernels::zorderKeys,
+                zSpec,
+                zColumns,
+                live,
+                ints,
+                longs,
+                doubles,
+                valid,
+                capacity,
+                zKeys)
+            .libraryTask("zsort", Cudf::sortedOrderLongs, zSize, zKeys, capacity, zOrder);
+      }
+    }
+
+    @Override
     void consumer(TaskGraph graph) {
       super.consumer(graph);
       if (lineage) {
@@ -1235,7 +1311,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "lineage",
                 DeviceKernels::lineage,
-                compacted(),
+                positions(),
                 liveCount(),
                 fileStarts,
                 fileCount,
@@ -1289,6 +1365,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     /** A new file a batch, where Iceberg's location provider puts data files. */
     @Override
     void stageOutput(HostDeletes.FilePrep prep) {
+      zSize[0] = (int) prep.rows();
       if (lineage) {
         if (prep.storedLineage()) {
           throw new UnsupportedOperationException(

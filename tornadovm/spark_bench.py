@@ -31,6 +31,8 @@ from pyspark.sql import SparkSession
 
 warehouse, query, runs, tables = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
 # The catalog's warehouse is the warehouse's parent, so its tables are <warehouse name>.<table>.
+# "spark", or "rapids" when run.sh adds the RAPIDS Accelerator plugin.
+engine = os.environ.get("ENGINE", "spark")
 namespace = os.path.basename(warehouse.rstrip("/"))
 spark = SparkSession.builder.appName("mor-bench").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
@@ -64,7 +66,7 @@ def rewrite_run(name, run):
         local = path[len("file:"):] if path.startswith("file:") else path
         if os.path.exists(local):
             os.remove(local)
-    print(f"{name},spark,rewrite,{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"{len(added)} files\"", flush=True)
+    print(f"{name},{engine},rewrite,{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"{len(added)} files\"", flush=True)
 
 
 for name in tables:
@@ -109,5 +111,5 @@ for name in tables:
         if query == "q3":
             row = spark.sql("SELECT count(*), sum(id + k) + sum(v1) FROM t").collect()[0]
             rows, checksum = row[0], row[1]
-        print(f"{name},spark,{query},{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"\"", flush=True)
+        print(f"{name},{engine},{query},{run},{'yes' if run == 0 else 'no'},{millis:.1f},{rows},{checksum:.6e},\"\"", flush=True)
 spark.stop()

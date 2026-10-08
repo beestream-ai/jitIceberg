@@ -359,6 +359,94 @@ public class TestDeviceMergeOnRead {
     assertMatchesIceberg(table);
   }
 
+  /**
+   * A Z-order rewrite keeps every row and writes each new file in non-decreasing Iceberg Z-order of
+   * (k, v1), as {@code ZOrderByteUtils} computes it on the CPU; v1 has nulls, which order as zero
+   * bytes.
+   */
+  @Test
+  public void testRewriteDataFilesZOrder() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.required(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("zorder").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              3000,
+              i -> {
+                Record record = row(schema, index, i);
+                record.setField("k", (int) ((i * 7919 + index) % 101) - 50);
+                record.setField("v1", i % 11 == 0 ? null : Math.sin(i + index) * 1e3);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(3000, 7), new long[0], everyNth(3000, 3)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(10L, 1_000_020L));
+
+    table.refresh();
+    List<String> before = rows(table);
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      device.rewriteDataFilesZOrder("k", "v1");
+    }
+    table.refresh();
+    assertThat(rows(table)).containsExactlyElementsOf(before);
+
+    long checked = 0;
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        byte[] previous = null;
+        try (CloseableIterable<Record> records =
+            org.apache.iceberg.parquet.Parquet.read(table.io().newInputFile(task.file().location()))
+                .project(schema)
+                .createReaderFunc(
+                    fileSchema ->
+                        org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(
+                            schema, fileSchema))
+                .build()) {
+          for (Record record : records) {
+            byte[] z = zorder((Integer) record.getField("k"), (Double) record.getField("v1"));
+            if (previous != null) {
+              assertThat(java.util.Arrays.compareUnsigned(previous, z))
+                  .as("row %d of %s", checked, task.file().location())
+                  .isLessThanOrEqualTo(0);
+            }
+            previous = z;
+            checked++;
+          }
+        }
+      }
+    }
+    assertThat(checked).isEqualTo(before.size());
+  }
+
+  private static byte[] zorder(int k, Double v1) {
+    byte[] key =
+        org.apache.iceberg.util.ZOrderByteUtils.intToOrderedBytes(
+                k, java.nio.ByteBuffer.allocate(8))
+            .array()
+            .clone();
+    byte[] value =
+        v1 == null
+            ? new byte[org.apache.iceberg.util.ZOrderByteUtils.PRIMITIVE_BUFFER_SIZE]
+            : org.apache.iceberg.util.ZOrderByteUtils.doubleToOrderedBytes(
+                    v1, java.nio.ByteBuffer.allocate(8))
+                .array()
+                .clone();
+    return org.apache.iceberg.util.ZOrderByteUtils.interleaveBits(
+        new byte[][] {key, value}, 16, java.nio.ByteBuffer.allocate(16));
+  }
+
   /** {@code id -> _row_id|_last_updated_sequence_number} of every live row. */
   private static Map<Long, String> lineage(Table table) throws IOException {
     Schema projection =

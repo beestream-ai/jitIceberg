@@ -384,6 +384,98 @@ final class DeviceKernels {
     }
   }
 
+  /** Most columns a Z-order key interleaves; Spark's rewrites rarely use more. */
+  static final int MAX_ZORDER_COLUMNS = 4;
+
+  /**
+   * Iceberg's Z-order value of every row, as {@code columns + 1} INT64 sort words a row at {@code
+   * stride}: word 0 is 0 for a live row and 1 otherwise, so the rows a batch drops sort after the
+   * rows it keeps; words 1.. are the interleaved bits, flipped in their sign bit so that a signed
+   * comparison orders them as Iceberg's unsigned bytes do.
+   *
+   * <p>Each column is first made order-preserving as {@code ZOrderByteUtils} does: an integer has
+   * its sign bit flipped, a double {@code bits ^ ((bits >> 63) | MIN_VALUE)} (NaN canonical, as
+   * {@code doubleToLongBits}), and a null is all zeros, as Spark's Z-order function writes it. The
+   * bits then interleave most significant first, one from each column in turn -- {@code
+   * interleaveBits} with every column 8 bytes wide.
+   *
+   * <p>{@code spec} holds, a column, its kind (0 INT32 or DATE, 1 INT64 or TIMESTAMP, 2 FLOAT64),
+   * its slot in that kind's buffer and its validity slot, or -1 when it cannot be null.
+   */
+  static void zorderKeys(
+      IntArray spec,
+      int columns,
+      ByteArray live,
+      IntArray ints,
+      LongArray longs,
+      DoubleArray doubles,
+      ByteArray valid,
+      int stride,
+      LongArray keys) {
+    for (@Parallel int i = 0; i < stride; i++) {
+      if (live.get(i) == 0) {
+        keys.set(i, 1L);
+        for (int w = 1; w <= columns; w++) {
+          keys.set((long) w * stride + i, Long.MAX_VALUE);
+        }
+      } else {
+        keys.set(i, 0L);
+        long u0 = orderedBits(spec, 0, columns, i, ints, longs, doubles, valid, stride);
+        long u1 = orderedBits(spec, 1, columns, i, ints, longs, doubles, valid, stride);
+        long u2 = orderedBits(spec, 2, columns, i, ints, longs, doubles, valid, stride);
+        long u3 = orderedBits(spec, 3, columns, i, ints, longs, doubles, valid, stride);
+        long word = 0L;
+        int filled = 0;
+        int out = 1;
+        for (int b = 63; b >= 0; b--) {
+          for (int c = 0; c < columns; c++) {
+            long u = c == 0 ? u0 : c == 1 ? u1 : c == 2 ? u2 : u3;
+            word = word | (((u >>> b) & 1L) << (63 - filled));
+            filled++;
+            if (filled == 64) {
+              keys.set((long) out * stride + i, word ^ Long.MIN_VALUE);
+              out++;
+              word = 0L;
+              filled = 0;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // value != value is NaN in a form the kernel compiler takes; Double.isNaN may not be.
+  @SuppressWarnings("IdentityBinaryExpression")
+  private static long orderedBits(
+      IntArray spec,
+      int c,
+      int columns,
+      int i,
+      IntArray ints,
+      LongArray longs,
+      DoubleArray doubles,
+      ByteArray valid,
+      int stride) {
+    long bits = 0L;
+    if (c < columns) {
+      int kind = spec.get(3 * c);
+      int slot = spec.get(3 * c + 1);
+      int validSlot = spec.get(3 * c + 2);
+      if (validSlot < 0 || valid.get(validSlot * stride + i) == 1) {
+        if (kind == 0) {
+          bits = ((long) ints.get(slot * stride + i)) ^ Long.MIN_VALUE;
+        } else if (kind == 1) {
+          bits = longs.get(slot * stride + i) ^ Long.MIN_VALUE;
+        } else {
+          double value = doubles.get(slot * stride + i);
+          long raw = value != value ? 0x7ff8000000000000L : Double.doubleToRawLongBits(value);
+          bits = raw ^ ((raw >> 63) | Long.MIN_VALUE);
+        }
+      }
+    }
+    return bits;
+  }
+
   /** {@link #gatherInts} for INT64 slots. */
   static void gatherLongs(
       IntArray positions,
