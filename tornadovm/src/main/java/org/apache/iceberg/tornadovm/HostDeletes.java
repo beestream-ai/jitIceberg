@@ -25,7 +25,6 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
@@ -41,7 +40,6 @@ import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
@@ -320,7 +318,10 @@ final class HostDeletes {
   private final Integer equalityKeyId;
   private final boolean deviceDeletes;
   private final BaseDeleteLoader deleteLoader;
-  private final Map<String, EqualitySet> equalitySets = Maps.newConcurrentMap();
+  // Host-loaded equality sets, kept across scans: their identity is their delete files' paths,
+  // which never change content.
+  private static final com.github.benmanes.caffeine.cache.Cache<String, EqualitySet> EQUALITY_SETS =
+      com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(16).build();
 
   // Parquet footers and column positions, kept across scans: Iceberg never rewrites a file in
   // place,
@@ -683,7 +684,7 @@ final class HostDeletes {
             .map(DeleteFile::location)
             .sorted(Comparator.naturalOrder())
             .collect(Collectors.joining(","));
-    return equalitySets.computeIfAbsent(id, ignored -> loadEqualitySet(id, deletes));
+    return EQUALITY_SETS.get(id + "#" + equalityKeyId, ignored -> loadEqualitySet(id, deletes));
   }
 
   /**

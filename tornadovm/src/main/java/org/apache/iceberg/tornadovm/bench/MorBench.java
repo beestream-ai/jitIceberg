@@ -34,6 +34,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.tornadovm.AggregateResult;
 import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
+import org.apache.iceberg.tornadovm.DeviceValue;
+import org.apache.iceberg.tornadovm.GroupedAggregate;
 import org.apache.iceberg.tornadovm.MergeOnReadScan;
 
 /**
@@ -119,6 +121,39 @@ public final class MorBench {
   /** The live row count and a checksum of the answer. */
   private static double[] run(MergeOnReadScan scan, String query) {
     return switch (query) {
+      case "tpch1" -> {
+        // TPC-H Q1: sums of quantity, price, discounted price and charge per (returnflag,
+        // linestatus); the averages are these over the counts. Checksum: the four sums.
+        GroupedAggregate result =
+            ((DeviceMergeOnReadScan) scan)
+                .aggregate(
+                    ImmutableList.of("l_returnflag", "l_linestatus"),
+                    ImmutableList.of(
+                        DeviceValue.of("l_quantity"),
+                        DeviceValue.of("l_extendedprice"),
+                        DeviceValue.of("l_extendedprice").timesOneMinus("l_discount"),
+                        DeviceValue.of("l_extendedprice")
+                            .timesOneMinus("l_discount")
+                            .timesOnePlus("l_tax"),
+                        DeviceValue.of("l_discount")));
+        double checksum = 0;
+        for (double[] totals : result.groups().values()) {
+          checksum += totals[0] + totals[1] + totals[2] + totals[3];
+        }
+        yield new double[] {result.rows(), checksum};
+      }
+      case "tpch6" -> {
+        GroupedAggregate result =
+            ((DeviceMergeOnReadScan) scan)
+                .aggregate(
+                    ImmutableList.of(),
+                    ImmutableList.of(DeviceValue.of("l_extendedprice").times("l_discount")));
+        double revenue = 0;
+        for (double[] totals : result.groups().values()) {
+          revenue += totals[0];
+        }
+        yield new double[] {result.rows(), revenue};
+      }
       case "q1" -> {
         AggregateResult result = scan.aggregate(null, "v1");
         yield new double[] {result.rows(), sum(result)};
@@ -204,6 +239,20 @@ public final class MorBench {
 
   /** Q5's filter: ids are ascending file by file, so the id bound prunes three files in four. */
   static Expression filterOf(String query) {
+    if ("tpch1".equals(query)) {
+      return Expressions.lessThanOrEqual("l_shipdate", "1998-09-02");
+    }
+    if ("tpch6".equals(query)) {
+      return Expressions.and(
+          Expressions.and(
+              Expressions.greaterThanOrEqual("l_shipdate", "1994-01-01"),
+              Expressions.lessThan("l_shipdate", "1995-01-01")),
+          Expressions.and(
+              Expressions.and(
+                  Expressions.greaterThanOrEqual("l_discount", 0.05),
+                  Expressions.lessThanOrEqual("l_discount", 0.07)),
+              Expressions.lessThan("l_quantity", 24.0)));
+    }
     if ("q5".equals(query)) {
       return Expressions.and(
           Expressions.lessThan("id", 25_000_000L), Expressions.greaterThan("v2", 0.5));
@@ -223,6 +272,9 @@ public final class MorBench {
 
   /** Iceberg's own row-at-a-time merge-on-read reader, one thread: the reference answer. */
   private static double[] generics(Table table, String query) throws IOException {
+    if (query.startsWith("tpch")) {
+      return genericsTpch(table, query);
+    }
     List<String> columns =
         "q3".equals(query)
             ? ImmutableList.of("id", "k", "v1")
@@ -264,5 +316,32 @@ public final class MorBench {
       }
     }
     return new double[] {rows, checksum + groups.size()};
+  }
+
+  /** TPC-H Q1 and Q6 row by row with Iceberg's own reader: the oracle. */
+  private static double[] genericsTpch(Table table, String query) throws IOException {
+    long rows = 0;
+    double checksum = 0;
+    try (CloseableIterable<Record> records =
+        IcebergGenerics.read(table)
+            .select("l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_shipdate")
+            .where(filterOf(query))
+            .build()) {
+      for (Record record : records) {
+        rows++;
+        double price = (Double) record.getField("l_extendedprice");
+        double discount = (Double) record.getField("l_discount");
+        if ("tpch6".equals(query)) {
+          checksum += price * discount;
+        } else {
+          checksum +=
+              (Double) record.getField("l_quantity")
+                  + price
+                  + price * (1 - discount)
+                  + price * (1 - discount) * (1 + (Double) record.getField("l_tax"));
+        }
+      }
+    }
+    return new double[] {rows, checksum};
   }
 }

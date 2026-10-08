@@ -84,7 +84,24 @@ for name in tables:
     reader.load(f"{warehouse}/{name}").createOrReplaceTempView("t")
     for run in range(runs):
         start = time.perf_counter()
-        if query == "q1":
+        if query == "tpch1":
+            result = spark.sql(
+                "SELECT l_returnflag, l_linestatus, sum(l_quantity) q, sum(l_extendedprice) b, "
+                "sum(l_extendedprice * (1 - l_discount)) d, "
+                "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) c, avg(l_quantity), "
+                "avg(l_extendedprice), avg(l_discount), count(*) n FROM t "
+                "WHERE l_shipdate <= date '1998-09-02' GROUP BY 1, 2 ORDER BY 1, 2"
+            ).collect()
+            rows = sum(r["n"] for r in result)
+            checksum = sum(r["q"] + r["b"] + r["d"] + r["c"] for r in result)
+        elif query == "tpch6":
+            row = spark.sql(
+                "SELECT count(*), sum(l_extendedprice * l_discount) FROM t "
+                "WHERE l_shipdate >= date '1994-01-01' AND l_shipdate < date '1995-01-01' "
+                "AND l_discount >= 0.05 AND l_discount <= 0.07 AND l_quantity < 24"
+            ).collect()[0]
+            rows, checksum = row[0], row[1] or 0.0
+        elif query == "q1":
             row = spark.sql("SELECT count(*), sum(v1) FROM t").collect()[0]
             rows, checksum = row[0], row[1] or 0.0
         elif query == "q2":
