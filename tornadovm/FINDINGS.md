@@ -222,10 +222,10 @@ TornadoVM kernels that apply Iceberg's deletes, filters and transforms take micr
 | PR | what |
 |---|---|
 | beehive-lab/TornadoVM#1200 (merged) | `readParquetColumns` (typed, nullable, several files a read), `containedIn`; library-task text arguments passed by reference rather than serialized to the device |
-| #1205 | `writeParquetColumns`: device buffers to Parquet, with field ids, null masks, statistics; row count from a device counter |
-| #1203 | Device-only intermediates (written and read only on the device) were never freed when a plan closed: a process running large plans one after another ran out of device memory |
-| #1204 | The zero-fill of a recycled write-only buffer ran on the legacy stream, unordered with TornadoVM's non-blocking streams, and could wipe what a plan had just written. Under concurrency this gave wrong rows on first executions, until fixed |
-| #1202 | Compiler plugins registered for methods that do not exist stopped the CUDA backend from starting under a blanket `-ea` (Gradle, Maven, IDEs) |
+| #1205 (merged) | `writeParquetColumns`: device buffers to Parquet, with field ids, null masks, statistics; row count from a device counter |
+| #1203 (merged) | Device-only intermediates (written and read only on the device) were never freed when a plan closed: a process running large plans one after another ran out of device memory |
+| #1204 (merged) | The zero-fill of a recycled write-only buffer ran on the legacy stream, unordered with TornadoVM's non-blocking streams, and could wipe what a plan had just written. Under concurrency this gave wrong rows on first executions, until fixed |
+| #1202 (open) | Compiler plugins registered for methods that do not exist stopped the CUDA backend from starting under a blanket `-ea` (Gradle, Maven, IDEs) |
 
 Two related issues are already covered by other PRs:
 - **#1185 and #1187:** library calls followed the stream of the thread that created the context.
