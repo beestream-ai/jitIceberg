@@ -44,6 +44,7 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.BucketUtil;
 import uk.ac.manchester.tornado.cudf.enums.CudfType;
 
@@ -151,7 +152,15 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       throw new UncheckedIOException(e);
     }
     Integer equalityKeyId = HostDeletes.equalityKeyId(tasks);
+    List<Integer> allKeyIds = HostDeletes.equalityKeyIds(tasks);
+    List<Integer> keyIds = allKeyIds.size() > 1 ? allKeyIds : List.of();
     List<String> read = Lists.newArrayList(projection);
+    for (int keyId : keyIds) {
+      String name = table.schema().findField(keyId).name();
+      if (!read.contains(name)) {
+        read.add(name);
+      }
+    }
     for (int fieldId : DevicePredicate.fieldIds(filter, table.schema())) {
       String name = table.schema().findField(fieldId).name();
       if (!read.contains(name)) {
@@ -173,7 +182,14 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       columnIndex.put(readSchema.columns().get(i).name(), i);
     }
     ScanLayout layout = new ScanLayout(table.schema(), equalityKeyId, null, read);
-    HostDeletes host = new HostDeletes(table, layout, equalityKeyId, false);
+    HostDeletes host = new HostDeletes(table, layout, equalityKeyId, false).withKeyIds(keyIds);
+    int[] keyColumns = new int[keyIds.size()];
+    boolean[] keyInts = new boolean[keyIds.size()];
+    for (int c = 0; c < keyColumns.length; c++) {
+      Types.NestedField field = table.schema().findField(keyIds.get(c));
+      keyColumns[c] = columnIndex.get(field.name());
+      keyInts[c] = layout.type(field.fieldId()) == CudfType.INT32;
+    }
     metrics.plan((System.nanoTime() - start) / 1e6);
 
     boolean keyIsInt = keyName != null && layout.type(equalityKeyId) == CudfType.INT32;
@@ -197,6 +213,9 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
                           : sets.computeIfAbsent(
                               equality.id(), ignored -> new PrimitiveHash.LongSet(equality.keys()));
                   boolean setHasNull = equality != null && equality.hasNull();
+                  HostDeletes.KeySet keySet = prep.keySet();
+                  long[] keyValues = new long[keyColumns.length];
+                  byte[] keyNulls = new byte[keyColumns.length];
                   S sink = factory.create(task.file(), columnIndex);
                   RowFilter rowFilter =
                       filtered
@@ -228,6 +247,19 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
                               continue;
                             }
                           } else if (set.contains(keyIsInt ? key.getInt(r) : key.getLong(r))) {
+                            continue;
+                          }
+                        }
+                        if (keySet != null) {
+                          for (int c = 0; c < keyColumns.length; c++) {
+                            ColumnVector column = batch.column(keyColumns[c]);
+                            keyNulls[c] = (byte) (column.isNullAt(r) ? 1 : 0);
+                            keyValues[c] =
+                                keyNulls[c] == 1
+                                    ? 0
+                                    : keyInts[c] ? column.getInt(r) : column.getLong(r);
+                          }
+                          if (keySet.contains(keyValues, keyNulls)) {
                             continue;
                           }
                         }

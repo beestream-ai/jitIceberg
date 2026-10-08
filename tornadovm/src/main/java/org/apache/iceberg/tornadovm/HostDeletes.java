@@ -42,6 +42,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.parquet.hadoop.ParquetFileReader;
@@ -79,6 +80,7 @@ final class HostDeletes {
     private int[] columns;
     private byte[] positionBits;
     private EqualitySet equality;
+    private KeySet keySet;
     private long hostNanos;
     private int files = 1;
 
@@ -182,13 +184,109 @@ final class HostDeletes {
       return setColumn;
     }
 
+    /** Multi-column equality keys loaded on the host, or null. */
+    KeySet keySet() {
+      return keySet;
+    }
+
     /** The identity of the equality deletes that apply, read either way; empty when none. */
     String equalityId() {
-      return setPaths != null ? setPaths : equality != null ? equality.id() : "";
+      return setPaths != null
+          ? setPaths
+          : equality != null ? equality.id() : keySet != null ? keySet.id() : "";
     }
   }
 
   /** The keys of a set of equality-delete files over one column, loaded on the host. */
+  static final class KeySet {
+    private final String id;
+    private final int columns;
+    private final int size;
+    private final long[] hashes;
+    private final long[] keys; // column c at c * size
+    private final byte[] nulls; // column c at c * size
+    private int[] order; // by hash, for the host probe; built on first use
+
+    KeySet(String id, int columns, int size, long[] hashes, long[] keys, byte[] nulls) {
+      this.id = id;
+      this.columns = columns;
+      this.size = size;
+      this.hashes = hashes;
+      this.keys = keys;
+      this.nulls = nulls;
+    }
+
+    String id() {
+      return id;
+    }
+
+    int columns() {
+      return columns;
+    }
+
+    int size() {
+      return size;
+    }
+
+    long[] hashes() {
+      return hashes;
+    }
+
+    long[] keys() {
+      return keys;
+    }
+
+    byte[] nulls() {
+      return nulls;
+    }
+
+    /**
+     * Whether a key is in the set, as the device decides it: hash, then every entry with that hash
+     * compared column by column, a null equal to a null.
+     */
+    boolean contains(long[] key, byte[] isNull) {
+      int[] byHash = order();
+      long hash = DeviceKernels.KEY_HASH_SEED;
+      for (int c = 0; c < columns; c++) {
+        hash = DeviceKernels.keyHash(hash, key[c], isNull[c]);
+      }
+      int lo = 0;
+      int hi = size;
+      while (lo < hi) {
+        int mid = (lo + hi) >>> 1;
+        if (hashes[byHash[mid]] < hash) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      for (int j = lo; j < size && hashes[byHash[j]] == hash; j++) {
+        int entry = byHash[j];
+        boolean same = true;
+        for (int c = 0; c < columns && same; c++) {
+          byte entryNull = nulls[c * size + entry];
+          same = entryNull == isNull[c] && (isNull[c] == 1 || keys[c * size + entry] == key[c]);
+        }
+        if (same) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    private synchronized int[] order() {
+      if (order == null) {
+        order =
+            java.util.stream.IntStream.range(0, size)
+                .boxed()
+                .sorted(Comparator.comparingLong(i -> hashes[i]))
+                .mapToInt(Integer::intValue)
+                .toArray();
+      }
+      return order;
+    }
+  }
+
   static final class EqualitySet {
     private final String id;
     private final long[] keys;
@@ -225,6 +323,10 @@ final class HostDeletes {
   // so a path names the same bytes for as long as it exists. Small (a schema a file), and bounded.
   private static final com.github.benmanes.caffeine.cache.Cache<String, MessageType> FOOTERS =
       com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(200_000).build();
+  // Multi-column equality sets, loaded on the host once a set of delete files.
+  private static final com.github.benmanes.caffeine.cache.Cache<String, KeySet> KEY_SETS =
+      com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(16).build();
+  private List<Integer> keyIds = List.of();
   private static final com.github.benmanes.caffeine.cache.Cache<String, Integer> COLUMNS =
       com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(200_000).build();
 
@@ -245,21 +347,47 @@ final class HostDeletes {
    * Multi-column equality deletes are declined rather than half-applied.
    */
   static Integer equalityKeyId(List<FileScanTask> tasks) {
-    Integer key = null;
+    List<Integer> ids = equalityKeyIds(tasks);
+    return ids.size() == 1 ? ids.get(0) : null;
+  }
+
+  /**
+   * The columns every equality delete of the scan compares, or an empty list. Deletes over
+   * different column sets in one scan are refused.
+   */
+  static List<Integer> equalityKeyIds(List<FileScanTask> tasks) {
+    List<Integer> key = List.of();
     for (FileScanTask task : tasks) {
       for (DeleteFile delete : task.deletes()) {
         if (delete.content() != FileContent.EQUALITY_DELETES) {
           continue;
         }
         List<Integer> ids = delete.equalityFieldIds();
-        if (ids.size() != 1 || (key != null && !key.equals(ids.get(0)))) {
+        if (!key.isEmpty() && !key.equals(ids)) {
           throw new UnsupportedOperationException(
-              "Equality deletes on several columns are not supported on the device: " + ids);
+              "Equality deletes over different columns in one scan: " + key + " and " + ids);
         }
-        key = ids.get(0);
+        key = List.copyOf(ids);
       }
     }
     return key;
+  }
+
+  /** Equality deletes over several columns: loaded on the host as a {@link KeySet}. */
+  HostDeletes withKeyIds(List<Integer> ids) {
+    for (int id : ids) {
+      Types.NestedField field = table.schema().findField(id);
+      Type.TypeID type = field.type().typeId();
+      if (type != Type.TypeID.INTEGER
+          && type != Type.TypeID.LONG
+          && type != Type.TypeID.DATE
+          && type != Type.TypeID.TIMESTAMP) {
+        throw new UnsupportedOperationException(
+            "Equality deletes over several columns need integer, date or timestamp keys: " + field);
+      }
+    }
+    this.keyIds = ids;
+    return this;
   }
 
   /** The equality-delete files that apply to a task, as an identity: tasks with equal ids batch. */
@@ -388,7 +516,10 @@ final class HostDeletes {
         hostDeleted += count[0];
       }
 
-      if (!equalityDeletes.isEmpty() && (prep.setPaths == null && prep.equality == null)) {
+      if (!equalityDeletes.isEmpty()
+          && prep.setPaths == null
+          && prep.equality == null
+          && prep.keySet == null) {
         applyEquality(prep, equalityDeletes);
       }
       offset += rows;
@@ -409,6 +540,15 @@ final class HostDeletes {
   }
 
   private void applyEquality(FilePrep prep, List<DeleteFile> deletes) {
+    if (keyIds.size() > 1) {
+      String id =
+          deletes.stream()
+              .map(DeleteFile::location)
+              .sorted(Comparator.naturalOrder())
+              .collect(Collectors.joining(","));
+      prep.keySet = KEY_SETS.get(id, ignored -> loadKeySet(id, deletes));
+      return;
+    }
     Types.NestedField key = table.schema().findField(equalityKeyId);
     boolean allParquet = deletes.stream().allMatch(d -> d.format() == FileFormat.PARQUET);
     if (deviceDeletes && key.isRequired() && allParquet) {
@@ -467,6 +607,70 @@ final class HostDeletes {
     } catch (IOException e) {
       throw new UncheckedIOException("Cannot read the footer of " + path, e);
     }
+  }
+
+  /**
+   * Reads the key columns of each equality-delete file, values widened to long, and hashes them.
+   */
+  private KeySet loadKeySet(String id, List<DeleteFile> deletes) {
+    int columns = keyIds.size();
+    List<Types.NestedField> fields = Lists.newArrayList();
+    for (int keyId : keyIds) {
+      fields.add(table.schema().findField(keyId));
+    }
+    Schema keySchema = new Schema(fields);
+    long total = deletes.stream().mapToLong(DeleteFile::recordCount).sum();
+    if (total * columns > Integer.MAX_VALUE) {
+      throw new UnsupportedOperationException("Equality-delete set too large: " + total);
+    }
+    int capacity = (int) total;
+    long[] values = new long[columns * capacity];
+    byte[] nulls = new byte[columns * capacity];
+    long[] hashes = new long[capacity];
+    int size = 0;
+    for (DeleteFile delete : deletes) {
+      if (delete.format() != FileFormat.PARQUET) {
+        throw new UnsupportedOperationException("Not a Parquet delete file: " + delete.location());
+      }
+      try (CloseableIterable<Record> records =
+          Parquet.read(table.io().newInputFile(delete.location()))
+              .project(keySchema)
+              .createReaderFunc(
+                  fileSchema -> GenericParquetReaders.buildReader(keySchema, fileSchema))
+              .build()) {
+        for (Record record : records) {
+          long hash = DeviceKernels.KEY_HASH_SEED;
+          for (int c = 0; c < columns; c++) {
+            Object value = record.get(c);
+            long widened = 0;
+            byte isNull = 1;
+            if (value != null) {
+              isNull = 0;
+              widened =
+                  switch (value) {
+                    case java.time.LocalDate date -> date.toEpochDay();
+                    case java.time.LocalDateTime time ->
+                        org.apache.iceberg.util.DateTimeUtil.microsFromTimestamp(time);
+                    case java.time.OffsetDateTime time ->
+                        org.apache.iceberg.util.DateTimeUtil.microsFromTimestamptz(time);
+                    default -> ((Number) value).longValue();
+                  };
+            }
+            values[c * capacity + size] = widened;
+            nulls[c * capacity + size] = isNull;
+            hash = DeviceKernels.keyHash(hash, widened, isNull);
+          }
+          hashes[size++] = hash;
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+    if (size != capacity) {
+      // Columns are laid out at the declared count; a short read would misplace them.
+      throw new IllegalStateException("Equality-delete files hold " + size + " rows, not " + total);
+    }
+    return new KeySet(id, columns, size, hashes, values, nulls);
   }
 
   private EqualitySet equalitySet(List<DeleteFile> deletes) {

@@ -384,6 +384,123 @@ final class DeviceKernels {
     }
   }
 
+  /**
+   * One step of the hash of an equality-delete key of several columns, the same on the host and the
+   * device: the running hash mixed with a column's value, or with a constant when it is null
+   * (splitmix64's finalizer). Matches are always confirmed column by column, so a collision costs a
+   * comparison, never a wrong row.
+   */
+  static long keyHash(long hash, long value, int isNull) {
+    long x = hash ^ (isNull == 1 ? 0x7F4A7C159E3779B9L : value);
+    x += 0x9E3779B97F4A7C15L;
+    x = (x ^ (x >>> 30)) * 0xBF58476D1CE4E5B9L;
+    x = (x ^ (x >>> 27)) * 0x94D049BB133111EBL;
+    return x ^ (x >>> 31);
+  }
+
+  static final long KEY_HASH_SEED = 0x2545F4914F6CDD1DL;
+
+  /**
+   * Puts the rows of a multi-column equality-delete set in hash order, from the order cuDF
+   * computed: hashes, key values and null flags, a column at {@code stride}. Runs only when {@code
+   * changed[0]} is 1, so a plan re-sorts only for a new set.
+   */
+  static void gatherKeySet(
+      IntArray changed,
+      IntArray size,
+      IntArray order,
+      LongArray hashes,
+      LongArray keys,
+      ByteArray nulls,
+      int columns,
+      int stride,
+      LongArray sortedHashes,
+      LongArray sortedKeys,
+      ByteArray sortedNulls) {
+    for (@Parallel int j = 0; j < stride; j++) {
+      if (changed.get(0) == 1 && j < size.get(0)) {
+        int from = order.get(j);
+        sortedHashes.set(j, hashes.get(from));
+        for (int c = 0; c < columns; c++) {
+          sortedKeys.set((long) c * stride + j, keys.get((long) c * stride + from));
+          sortedNulls.set(c * stride + j, nulls.get(c * stride + from));
+        }
+      }
+    }
+  }
+
+  /**
+   * Marks each row whose key -- several integer columns -- is in the equality-delete set, as
+   * Iceberg compares them: a null matches a null. The row's hash is binary-searched among the set's
+   * sorted hashes, and every entry with that hash is compared column by column.
+   *
+   * <p>{@code spec} holds, a key column, its kind (0 INT32 or DATE, 1 INT64 or TIMESTAMP), its slot
+   * and its validity slot, or -1 when it cannot be null.
+   */
+  static void probeKeySet(
+      IntArray spec,
+      int columns,
+      LongArray sortedHashes,
+      LongArray sortedKeys,
+      ByteArray sortedNulls,
+      IntArray size,
+      int setStride,
+      IntArray ints,
+      LongArray longs,
+      ByteArray valid,
+      int stride,
+      ByteArray found) {
+    for (@Parallel int i = 0; i < stride; i++) {
+      long hash = KEY_HASH_SEED;
+      for (int c = 0; c < columns; c++) {
+        hash =
+            keyHash(
+                hash,
+                keyValue(spec, c, i, ints, longs, stride),
+                keyNull(spec, c, i, valid, stride));
+      }
+      int lo = 0;
+      int hi = size.get(0);
+      while (lo < hi) {
+        int mid = (lo + hi) >>> 1;
+        if (sortedHashes.get(mid) < hash) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      byte hit = 0;
+      for (int j = lo; j < size.get(0) && hit == 0 && sortedHashes.get(j) == hash; j++) {
+        int same = 1;
+        for (int c = 0; c < columns; c++) {
+          int isNull = keyNull(spec, c, i, valid, stride);
+          if (sortedNulls.get(c * setStride + j) != isNull) {
+            same = 0;
+          } else if (isNull == 0
+              && sortedKeys.get((long) c * setStride + j)
+                  != keyValue(spec, c, i, ints, longs, stride)) {
+            same = 0;
+          }
+        }
+        if (same == 1) {
+          hit = 1;
+        }
+      }
+      found.set(i, hit);
+    }
+  }
+
+  private static long keyValue(
+      IntArray spec, int c, int i, IntArray ints, LongArray longs, int stride) {
+    int slot = spec.get(3 * c + 1);
+    return spec.get(3 * c) == 0 ? (long) ints.get(slot * stride + i) : longs.get(slot * stride + i);
+  }
+
+  private static int keyNull(IntArray spec, int c, int i, ByteArray valid, int stride) {
+    int validSlot = spec.get(3 * c + 2);
+    return validSlot >= 0 && valid.get(validSlot * stride + i) == 0 ? 1 : 0;
+  }
+
   /** Most columns a Z-order key interleaves; Spark's rewrites rarely use more. */
   static final int MAX_ZORDER_COLUMNS = 4;
 

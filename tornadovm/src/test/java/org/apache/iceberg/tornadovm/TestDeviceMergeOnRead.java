@@ -189,6 +189,55 @@ public class TestDeviceMergeOnRead {
   }
 
   /**
+   * Equality deletes over two columns, (id, k), as CDC writes them: a pair deletes a row only when
+   * both match, and a null id matches a null id. Thousands of random pairs exercise the hash
+   * search; a file appended after the deletes keeps its rows.
+   */
+  @Test
+  public void testEqualityDeletesOnTwoColumns() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.required(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("eq2").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              4000,
+              i -> {
+                Record record = row(schema, index, i);
+                if (i % 5 == 0) {
+                  record.setField("id", null);
+                }
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(4000, 9), new long[0], new long[0]));
+    Random random = new Random(3);
+    List<Object[]> keys = Lists.newArrayList();
+    keys.add(new Object[] {3L, 3}); // matches
+    keys.add(new Object[] {11L, 0}); // id 11 has k 4: no match
+    keys.add(new Object[] {null, 0}); // every row with a null id and k 0
+    for (int j = 0; j < 5000; j++) {
+      long id = random.nextInt(3) * 1_000_000L + random.nextInt(4000);
+      int k = random.nextBoolean() ? (int) ((id % 1_000_000L) % 7) : random.nextInt(7);
+      keys.add(new Object[] {id, k});
+    }
+    MorTables.deleteEqualRows(table, ImmutableList.of("id", "k"), keys);
+    writeFiles(table, 0, 500); // after the deletes: (3, 3) survives here
+    assertMatchesIceberg(table);
+  }
+
+  /**
    * Filters: Iceberg prunes files with the filter's statistics, the device applies the residual to
    * the rows that survive the deletes. Ranges, IN, inequality and constants of every column type.
    */

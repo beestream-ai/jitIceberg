@@ -456,6 +456,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final ScanLayout layout;
     private final HostDeletes host;
     private final Integer equalityKeyId;
+    private final List<Integer> keyIds;
     private final CudfType equalityKeyType;
     private final boolean keyNullable;
     private final int capacity;
@@ -474,8 +475,16 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         throw new UncheckedIOException(e);
       }
       this.equalityKeyId = HostDeletes.equalityKeyId(tasks);
+      List<Integer> allKeyIds = HostDeletes.equalityKeyIds(tasks);
+      this.keyIds = allKeyIds.size() > 1 ? allKeyIds : List.of();
       this.filtered = filter.op() != Expression.Operation.TRUE;
       List<String> read = Lists.newArrayList(projection);
+      for (int keyId : keyIds) {
+        String name = table.schema().findField(keyId).name();
+        if (!read.contains(name)) {
+          read.add(name);
+        }
+      }
       for (int fieldId : DevicePredicate.fieldIds(filter, table.schema())) {
         String name = table.schema().findField(fieldId).name();
         if (!read.contains(name)) {
@@ -483,7 +492,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
       }
       this.layout = new ScanLayout(table.schema(), equalityKeyId, groupColumn, read);
-      this.host = new HostDeletes(table, layout, equalityKeyId, true);
+      this.host = new HostDeletes(table, layout, equalityKeyId, true).withKeyIds(keyIds);
       this.equalityKeyType = equalityKeyId == null ? null : layout.type(equalityKeyId);
       this.keyNullable =
           equalityKeyId != null && table.schema().findField(equalityKeyId).isOptional();
@@ -556,7 +565,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         Types.NestedField field = layout.fields().get(c);
         signature.append(field.fieldId()).append(field.isOptional() ? "?" : "").append(',');
       }
-      return signature.append(equalityKeyId).append(keyNullable).append(filtered).toString();
+      return signature
+          .append(equalityKeyId)
+          .append(keyIds)
+          .append(keyNullable)
+          .append(filtered)
+          .toString();
     }
   }
 
@@ -604,6 +618,18 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final LongArray sortedLongs;
     final int[] sortSize = new int[1];
     final IntArray setSize = new IntArray(1);
+    // Equality deletes over several columns: the set as loaded, then in hash order.
+    final int keyColumns;
+    final IntArray keySpec;
+    final LongArray rawHashes;
+    final LongArray rawKeys;
+    final ByteArray rawNulls;
+    final IntArray keyOrder;
+    final int[] keySortSize = {0, 1};
+    final IntArray keySetChanged = new IntArray(1);
+    final LongArray keyHashes;
+    final LongArray keyValues;
+    final ByteArray keyNulls;
     final IntArray ints;
     final LongArray longs;
     final DoubleArray doubles;
@@ -641,11 +667,32 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.probeSizes[0] = capacity;
 
       boolean equality = equalityKeyId != null;
+      this.keyColumns = planned.keyIds.size();
+      boolean composite = keyColumns > 1;
+      long keyCells = composite ? (long) keyColumns * equalityCapacity : 1L;
+      this.keySpec = new IntArray(Math.max(1, 3 * keyColumns));
+      for (int c = 0; c < keyColumns; c++) {
+        int keyId = planned.keyIds.get(c);
+        keySpec.set(3 * c, layout.type(keyId) == CudfType.INT32 ? 0 : 1);
+        keySpec.set(3 * c + 1, layout.slot(keyId));
+        keySpec.set(
+            3 * c + 2,
+            layout.fields().get(layout.readIndex(keyId)).isOptional()
+                ? layout.readIndex(keyId)
+                : -1);
+      }
+      this.rawHashes = new LongArray(composite ? equalityCapacity : 1);
+      this.rawKeys = new LongArray(keyCells);
+      this.rawNulls = new ByteArray(keyCells);
+      this.keyOrder = new IntArray(composite ? equalityCapacity : 1);
+      this.keyHashes = new LongArray(composite ? equalityCapacity : 1);
+      this.keyValues = new LongArray(keyCells);
+      this.keyNulls = new ByteArray(keyCells);
       this.positionBits = new ByteArray((capacity + 7) / 8);
       this.positions = new LongArray(positionCapacity);
       this.segmentStarts = new IntArray(maxFiles);
       this.segmentOffsets = new IntArray(maxFiles);
-      this.inSet = new ByteArray(equality ? capacity : 1);
+      this.inSet = new ByteArray(equality || composite ? capacity : 1);
       this.setInts =
           new IntArray(equality && equalityKeyType == CudfType.INT32 ? equalityCapacity : 1);
       this.setLongs =
@@ -770,6 +817,50 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
         keyValidOffset = layout.readIndex(equalityKeyId) * capacity;
       }
+      if (keyColumns > 1) {
+        // Several key columns: the set, loaded on the host, is put in hash order on the device when
+        // it changes; every batch then binary-searches it by hash and compares the columns.
+        graph
+            .transferToDevice(
+                DataTransferMode.FIRST_EXECUTION, rawHashes, rawKeys, rawNulls, keySpec)
+            .transferToDevice(DataTransferMode.EVERY_EXECUTION, keySetChanged, setSize)
+            .libraryTask(
+                "keySort",
+                Cudf::sortedOrderLongs,
+                keySortSize,
+                rawHashes,
+                equalityCapacity,
+                keyOrder)
+            .task(
+                "keyGather",
+                DeviceKernels::gatherKeySet,
+                keySetChanged,
+                setSize,
+                keyOrder,
+                rawHashes,
+                rawKeys,
+                rawNulls,
+                keyColumns,
+                equalityCapacity,
+                keyHashes,
+                keyValues,
+                keyNulls)
+            .task(
+                "keyProbe",
+                DeviceKernels::probeKeySet,
+                keySpec,
+                keyColumns,
+                keyHashes,
+                keyValues,
+                keyNulls,
+                setSize,
+                equalityCapacity,
+                ints,
+                longs,
+                valid,
+                capacity,
+                inSet);
+      }
       graph
           .task(
               "live",
@@ -844,8 +935,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       setPath.setLength(0);
       setRowsHolder[0] = 0;
       sortSize[0] = 0;
+      keySortSize[0] = 0;
+      keySetChanged.set(0, 0);
       if (!equalityId.isEmpty() && !equalityId.equals(setOnDevice)) {
-        if (prep.setPaths() != null) {
+        if (prep.keySet() != null) {
+          uploadKeySet(executionPlan, prep.keySet());
+          meta.set(DeviceKernels.META_EQUALITY_SET_HAS_NULL, 0);
+          meta.set(DeviceKernels.META_KEY_NULLABLE, 0);
+        } else if (prep.setPaths() != null) {
           hold(setPath, prep.setPaths());
           setRowsHolder[0] = prep.setRows();
           setColumn[0] = prep.setColumn();
@@ -872,6 +969,31 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 + PATH_CAPACITY);
       }
       holder.append(paths);
+    }
+
+    /** Puts a host-loaded multi-column set on the device, for this execution to sort. */
+    private void uploadKeySet(TornadoExecutionPlan executionPlan, HostDeletes.KeySet set) {
+      int m = set.size();
+      MemorySegment.copy(
+          MemorySegment.ofArray(set.hashes()), 0, rawHashes.getSegment(), 0, (long) m * Long.BYTES);
+      for (int c = 0; c < keyColumns; c++) {
+        MemorySegment.copy(
+            MemorySegment.ofArray(set.keys()),
+            (long) c * m * Long.BYTES,
+            rawKeys.getSegment(),
+            (long) c * equalityCapacity * Long.BYTES,
+            (long) m * Long.BYTES);
+        MemorySegment.copy(
+            MemorySegment.ofArray(set.nulls()),
+            (long) c * m,
+            rawNulls.getSegment(),
+            (long) c * equalityCapacity,
+            m);
+      }
+      executionPlan.transferToDevice(rawHashes, rawKeys, rawNulls);
+      keySortSize[0] = m;
+      keySetChanged.set(0, 1);
+      setSize.set(0, m);
     }
 
     /** Puts a host-loaded equality-delete set on the device. */

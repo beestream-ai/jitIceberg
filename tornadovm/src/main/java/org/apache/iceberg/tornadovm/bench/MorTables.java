@@ -209,6 +209,43 @@ public final class MorTables {
     }
   }
 
+  /** Equality deletes over several columns: each key gives the columns' values, null allowed. */
+  public static void deleteEqualRows(Table table, List<String> columns, List<Object[]> keys) {
+    List<Types.NestedField> fields = Lists.newArrayList();
+    int[] ids = new int[columns.size()];
+    for (int c = 0; c < columns.size(); c++) {
+      Types.NestedField field = table.schema().findField(columns.get(c));
+      fields.add(field);
+      ids[c] = field.fieldId();
+    }
+    Schema keySchema = new Schema(fields);
+    try {
+      EqualityDeleteWriter<Record> writer =
+          Parquet.writeDeletes(newFile(table, "eq-deletes"))
+              .forTable(table)
+              .withSpec(table.spec())
+              .rowSchema(keySchema)
+              .createWriterFunc(GenericParquetWriter::create)
+              .equalityFieldIds(ids)
+              .overwrite()
+              .buildEqualityWriter();
+      org.apache.iceberg.data.GenericRecord record =
+          org.apache.iceberg.data.GenericRecord.create(keySchema);
+      try (EqualityDeleteWriter<Record> closing = writer) {
+        for (Object[] key : keys) {
+          org.apache.iceberg.data.GenericRecord row = record.copy();
+          for (int c = 0; c < key.length; c++) {
+            row.set(c, key[c]);
+          }
+          closing.write(row);
+        }
+      }
+      table.newRowDelta().addDeletes(writer.toDeleteFile()).commit();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   public static int formatVersion(Table table) {
     return ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
   }
