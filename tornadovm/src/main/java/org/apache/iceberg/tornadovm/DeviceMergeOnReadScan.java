@@ -24,6 +24,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -41,6 +42,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
 import uk.ac.manchester.tornado.api.DataRange;
 import uk.ac.manchester.tornado.api.GridScheduler;
@@ -170,6 +172,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   public void close() {
     regions.values().forEach(list -> list.forEach(Region::close));
     regions.clear();
+    sharedPools.values().forEach(SharedPool::close);
+    sharedPools.clear();
   }
 
   @Override
@@ -292,27 +296,158 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   /**
    * {@link #materialize(List, Consumer)} over file scan tasks someone else planned -- a Spark
-   * task's -- rather than the table's: their data files read with their delete files applied. Calls
-   * are serialized, so concurrent Spark tasks take the device in turn; each runs on every stream.
+   * task's -- rather than the table's: their data files read with their delete files applied.
+   * Concurrent calls share the device: their batches go into one queue that every stream takes
+   * from, so the streams stay busy while each caller waits only for its own batches.
    */
-  public synchronized long materialize(
+  public long materialize(
       List<FileScanTask> tasks, List<String> columns, Consumer<LiveRows> consumer) {
     if (tasks.isEmpty()) {
       return 0;
     }
-    metrics = new ScanMetrics();
-    long start = System.nanoTime();
     Planned planned = new Planned(null, columns, tasks);
-    String key = "materialize:" + String.join(",", columns);
-    List<Region> streams = reuse(key, planned, () -> new MaterializeRegion(planned));
-    metrics.plan((System.nanoTime() - start) / 1e6);
-    long live =
-        run(
-            streams,
-            planned,
-            (region, executed) -> ((MaterializeRegion) region).collect(executed, consumer));
-    metrics.total((System.nanoTime() - start) / 1e6);
-    return live;
+    SharedPool pool = sharedPools.computeIfAbsent(planned.signature(), ignored -> new SharedPool());
+    return pool.run(
+        planned, (region, executed) -> ((MaterializeRegion) region).collect(executed, consumer));
+  }
+
+  private final Map<String, SharedPool> sharedPools =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  /** Regions that take batches from any caller's request, for one projection. */
+  private final class SharedPool {
+    private final java.util.concurrent.LinkedBlockingQueue<Work> queue =
+        new java.util.concurrent.LinkedBlockingQueue<>();
+    private final java.util.concurrent.locks.ReentrantReadWriteLock lock =
+        new java.util.concurrent.locks.ReentrantReadWriteLock();
+    private final ExecutorService hostPool =
+        Executors.newFixedThreadPool(
+            HOST_THREADS,
+            runnable -> {
+              Thread thread = new Thread(runnable, "tornadovm-host");
+              thread.setDaemon(true);
+              return thread;
+            });
+    private List<Region> regions;
+
+    /** A batch of a request; a null planned stops the region that takes it. */
+    private record Work(
+        Planned planned,
+        int index,
+        CompletableFuture<HostDeletes.FilePrep> prep,
+        java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch,
+        ScanMetrics metrics,
+        CompletableFuture<Long> done) {}
+
+    long run(
+        Planned planned,
+        java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch) {
+      ensureFits(planned);
+      lock.readLock().lock();
+      try {
+        ScanMetrics batchMetrics = new ScanMetrics();
+        List<CompletableFuture<Long>> done = Lists.newArrayList();
+        for (int i = 0; i < planned.batches.size(); i++) {
+          List<FileScanTask> batch = planned.batches.get(i);
+          CompletableFuture<HostDeletes.FilePrep> prep =
+              CompletableFuture.supplyAsync(() -> planned.host.prepare(batch), hostPool);
+          CompletableFuture<Long> finished = new CompletableFuture<>();
+          done.add(finished);
+          queue.add(new Work(planned, i, prep, perBatch, batchMetrics, finished));
+        }
+        long rows = 0;
+        for (CompletableFuture<Long> finished : done) {
+          rows += finished.join();
+        }
+        metrics = batchMetrics;
+        return rows;
+      } catch (java.util.concurrent.CompletionException e) {
+        throw e.getCause() instanceof RuntimeException runtime
+            ? runtime
+            : new IllegalStateException("Device scan failed", e.getCause());
+      } finally {
+        lock.readLock().unlock();
+      }
+    }
+
+    /** Builds the regions, or rebuilds them bigger once no request is in flight. */
+    private void ensureFits(Planned planned) {
+      lock.readLock().lock();
+      try {
+        if (regions != null && regions.get(0).fits(planned)) {
+          return;
+        }
+      } finally {
+        lock.readLock().unlock();
+      }
+      lock.writeLock().lock();
+      try {
+        if (regions != null && regions.get(0).fits(planned)) {
+          return;
+        }
+        if (regions != null) {
+          for (int r = 0; r < regions.size(); r++) {
+            queue.add(new Work(null, -1, null, null, null, null));
+          }
+          regions.forEach(Region::close);
+        }
+        List<Region> created = Lists.newArrayList();
+        for (int r = 0; r < STREAMS; r++) {
+          Region region = new MaterializeRegion(planned);
+          created.add(region);
+          region.thread.execute(() -> loop(region));
+        }
+        regions = created;
+      } finally {
+        lock.writeLock().unlock();
+      }
+    }
+
+    void close() {
+      lock.writeLock().lock();
+      try {
+        if (regions != null) {
+          for (int r = 0; r < regions.size(); r++) {
+            queue.add(new Work(null, -1, null, null, null, null));
+          }
+          regions.forEach(Region::close);
+          regions = null;
+        }
+        hostPool.shutdown();
+      } finally {
+        lock.writeLock().unlock();
+      }
+    }
+
+    private void loop(Region region) {
+      TornadoExecutionPlan executionPlan = region.plan();
+      while (true) {
+        Work work;
+        try {
+          work = queue.take();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        if (work.planned() == null) {
+          return;
+        }
+        try {
+          work.done()
+              .complete(
+                  executeBatch(
+                      region,
+                      executionPlan,
+                      work.planned(),
+                      work.index(),
+                      work.prep().join(),
+                      work.perBatch(),
+                      work.metrics()));
+        } catch (Throwable failure) {
+          work.done().completeExceptionally(failure);
+        }
+      }
+    }
   }
 
   @Override
@@ -475,6 +610,68 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * it finishes one; {@code perBatch} returns the live rows a batch had. Host preparation of every
    * batch is started up front on its own pool.
    */
+  /** Per field of the layout, whether every file of the batch counts no null in it. */
+  private static boolean[] nullFree(ScanLayout layout, List<FileScanTask> batch) {
+    List<Types.NestedField> fields = layout.fields();
+    boolean[] free = new boolean[fields.size()];
+    for (int c = 0; c < free.length; c++) {
+      Types.NestedField field = fields.get(c);
+      boolean none = true;
+      for (FileScanTask task : batch) {
+        Map<Integer, Long> counts = task.file().nullValueCounts();
+        Long count = counts == null ? null : counts.get(field.fieldId());
+        if (count == null || count != 0) {
+          none = false;
+          break;
+        }
+      }
+      free[c] = field.isRequired() || none;
+    }
+    return free;
+  }
+
+  /** One batch on one region: stage it, run the plan, hand the result over. */
+  private long executeBatch(
+      Region region,
+      TornadoExecutionPlan executionPlan,
+      Planned planned,
+      int i,
+      HostDeletes.FilePrep prep,
+      java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch,
+      ScanMetrics into) {
+    into.deleteLoad(prep.hostNanos() / 1e6);
+    region.nullFree = nullFree(region.layout, planned.batches.get(i));
+    region.stage(executionPlan, prep, planned.keyNullable);
+    if (region.filtered) {
+      planned
+          .batchFilters
+          .get(i)
+          .encode(
+              region.layout,
+              table.schema(),
+              region.capacity,
+              region.filterTerms,
+              region.filterLongs,
+              region.filterDoubles);
+    }
+    long deviceStart = System.nanoTime();
+    TornadoExecutionResult executed = executionPlan.execute();
+    region.checkStrings(executed);
+    long copyStart = System.nanoTime();
+    long rows = perBatch.applyAsLong(region, executed);
+    if (DEBUG) {
+      System.err.printf(
+          "[mor] batch %d region %d files %d rows %d live %d%n",
+          i, System.identityHashCode(region), prep.files(), prep.rows(), rows);
+    }
+    long end = System.nanoTime();
+    into.device((copyStart - deviceStart) / 1e6);
+    into.copyBack((end - copyStart) / 1e6);
+    into.batch(prep.rows(), prep.files());
+    into.live(rows);
+    return rows;
+  }
+
   private long run(
       List<Region> streams,
       Planned planned,
@@ -497,36 +694,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                   for (int i = next.getAndIncrement();
                       i < preps.size();
                       i = next.getAndIncrement()) {
-                    HostDeletes.FilePrep prep = preps.get(i).join();
-                    metrics.deleteLoad(prep.hostNanos() / 1e6);
-                    region.stage(executionPlan, prep, planned.keyNullable);
-                    if (region.filtered) {
-                      planned
-                          .batchFilters
-                          .get(i)
-                          .encode(
-                              region.layout,
-                              table.schema(),
-                              region.capacity,
-                              region.filterTerms,
-                              region.filterLongs,
-                              region.filterDoubles);
-                    }
-                    long deviceStart = System.nanoTime();
-                    TornadoExecutionResult executed = executionPlan.execute();
-                    region.checkStrings(executed);
-                    long copyStart = System.nanoTime();
-                    long rows = perBatch.applyAsLong(region, executed);
-                    if (DEBUG) {
-                      System.err.printf(
-                          "[mor] batch %d region %d files %d rows %d live %d%n",
-                          i, System.identityHashCode(region), prep.files(), prep.rows(), rows);
-                    }
-                    long end = System.nanoTime();
-                    metrics.device((copyStart - deviceStart) / 1e6);
-                    metrics.copyBack((end - copyStart) / 1e6);
-                    metrics.batch(prep.rows(), prep.files());
-                    metrics.live(rows);
+                    long rows =
+                        executeBatch(
+                            region,
+                            executionPlan,
+                            planned,
+                            i,
+                            preps.get(i).join(),
+                            perBatch,
+                            metrics);
                     liveRows.addAndGet(rows);
                   }
                 }));
@@ -586,6 +762,27 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     /**
+     * A given task's residual as a device filter, or null when the device cannot run it: an
+     * operation it lacks, or a string column, whose values may not pack into a key.
+     */
+    private DevicePredicate deviceResidual(Expression residual) {
+      if (residual.op() == Expression.Operation.TRUE) {
+        return null;
+      }
+      for (int fieldId : DevicePredicate.fieldIds(residual, table.schema())) {
+        if (table.schema().findField(fieldId).type().typeId()
+            == org.apache.iceberg.types.Type.TypeID.STRING) {
+          return null;
+        }
+      }
+      try {
+        return DevicePredicate.compile(residual, table.schema());
+      } catch (UnsupportedOperationException e) {
+        return null;
+      }
+    }
+
+    /**
      * {@code given}: file scan tasks someone else planned (a Spark task's, say) instead of the
      * table's. Their sizes are rounded up, so that the next group of tasks most likely fits the
      * same device buffers and plans.
@@ -612,7 +809,28 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       List<Integer> allKeyIds = HostDeletes.equalityKeyIds(tasks);
       this.keyIds = allKeyIds.size() > 1 ? allKeyIds : List.of();
-      this.filtered = filter.op() != Expression.Operation.TRUE;
+      // Given tasks carry the caller's filter as their residuals. The caller applies it again
+      // (Spark does), so the device only narrows what comes back, and a residual it cannot run
+      // simply filters nothing.
+      Map<Expression, DevicePredicate> residuals = Maps.newHashMap();
+      Set<Integer> filterIds = Sets.newHashSet(DevicePredicate.fieldIds(filter, table.schema()));
+      if (given != null) {
+        for (FileScanTask task : tasks) {
+          residuals.computeIfAbsent(
+              task.residual(),
+              residual -> {
+                DevicePredicate compiled = deviceResidual(residual);
+                if (compiled != null) {
+                  filterIds.addAll(DevicePredicate.fieldIds(residual, table.schema()));
+                }
+                return compiled == null ? DevicePredicate.alwaysTrue() : compiled;
+              });
+        }
+      }
+      this.filtered =
+          filter.op() != Expression.Operation.TRUE
+              || residuals.keySet().stream()
+                  .anyMatch(r -> r.op() != Expression.Operation.TRUE && deviceResidual(r) != null);
       List<String> read = Lists.newArrayList(projection);
       for (int keyId : keyIds) {
         String name = table.schema().findField(keyId).name();
@@ -620,7 +838,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           read.add(name);
         }
       }
-      for (int fieldId : DevicePredicate.fieldIds(filter, table.schema())) {
+      for (int fieldId : filterIds) {
         String name = table.schema().findField(fieldId).name();
         if (!read.contains(name)) {
           read.add(name);
@@ -636,7 +854,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       // idle:
       // a batch holds at most an even share of the table a stream, up to BATCH_ROWS.
       long totalRows = tasks.stream().mapToLong(t -> t.file().recordCount()).sum();
-      long batchRows = Math.max(1, Math.min(BATCH_ROWS, (totalRows + STREAMS - 1) / STREAMS));
+      // Given tasks share the streams with other callers' requests, so they are not cut smaller.
+      long batchRows =
+          given != null
+              ? BATCH_ROWS
+              : Math.max(1, Math.min(BATCH_ROWS, (totalRows + STREAMS - 1) / STREAMS));
       List<FileScanTask> current = Lists.newArrayList();
       long currentRows = 0;
       String currentSet = null;
@@ -657,10 +879,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         batches.add(current);
       }
       for (List<FileScanTask> batch : batches) {
+        Expression residual = batch.get(0).residual();
         batchFilters.add(
-            filtered
-                ? DevicePredicate.compile(batch.get(0).residual(), table.schema())
-                : DevicePredicate.alwaysTrue());
+            !filtered
+                ? DevicePredicate.alwaysTrue()
+                : given != null
+                    ? residuals.get(residual)
+                    : DevicePredicate.compile(residual, table.schema()));
       }
 
       long maxRows = 1;
@@ -782,6 +1007,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * application and live-row kernel, which every shape shares, plus what the shape adds.
    */
   private abstract static class Region implements AutoCloseable {
+    /**
+     * Per field of the layout, whether no file of the current batch holds a null there (by its
+     * metrics), so that its validity bytes need not come back.
+     */
+    boolean[] nullFree = new boolean[0];
+
     final String signature;
     final ScanLayout layout;
     final Integer equalityKeyId;
@@ -1656,10 +1887,19 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       executed.transferToHost(liveCount);
       int rows = liveCount.get(0);
       if (rows > 0) {
-        copySlots(executed, outInts, intSlots, rows);
-        copySlots(executed, outLongs, longSlots, rows);
-        copySlots(executed, outDoubles, doubleSlots, rows);
-        copySlots(executed, outValid, validSlots, rows);
+        copySlots(executed, outInts, 0, intSlots, rows);
+        // A string's INT64 slot holds its packed key, which the host never reads: it takes the
+        // string from its offsets and chars.
+        copySlots(executed, outLongs, 0, layout.firstStringSlot(), rows);
+        copySlots(
+            executed, outLongs, layout.firstStringSlot() + layout.stringCount(), longSlots, rows);
+        copySlots(executed, outDoubles, 0, doubleSlots, rows);
+        for (int c = 0; c < validSlots; c++) {
+          if (!nullFree[c]) {
+            executed.transferToHost(
+                new DataRange(outValid).withOffset((long) c * capacity).withSize(rows));
+          }
+        }
       }
       consumer.accept(
           new HostBatch(
@@ -1671,6 +1911,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
               outLongs,
               outDoubles,
               outValid,
+              nullFree.clone(),
               rows > 0 ? copyStrings(executed, rows) : null));
       return rows;
     }
@@ -1702,8 +1943,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     private void copySlots(
-        TornadoExecutionResult executed, TornadoNativeArray array, int slots, int rows) {
-      for (int s = 0; s < slots; s++) {
+        TornadoExecutionResult executed, TornadoNativeArray array, int from, int to, int rows) {
+      for (int s = from; s < to; s++) {
         executed.transferToHost(
             new DataRange(array).withOffset((long) s * capacity).withSize(rows));
       }

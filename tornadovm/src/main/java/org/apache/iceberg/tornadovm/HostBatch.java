@@ -40,6 +40,8 @@ public final class HostBatch implements LiveRows {
   private final LongArray longs;
   private final DoubleArray doubles;
   private final ByteArray valid;
+  // Columns with no null in the batch, whose validity bytes were not copied back.
+  private final boolean[] nullFree;
   private final int[] bases;
   private final CudfType[] types;
   private final StringColumns strings;
@@ -59,7 +61,9 @@ public final class HostBatch implements LiveRows {
       LongArray longs,
       DoubleArray doubles,
       ByteArray valid,
+      boolean[] nullFree,
       StringColumns strings) {
+    this.nullFree = nullFree;
     this.strings = strings;
     this.layout = layout;
     this.idByName = idByName;
@@ -103,7 +107,7 @@ public final class HostBatch implements LiveRows {
 
   @Override
   public boolean isNull(int column, int row) {
-    return layout.anyOptional() && valid.get(column * stride + row) == 0;
+    return layout.anyOptional() && !nullFree[column] && valid.get(column * stride + row) == 0;
   }
 
   @Override
@@ -134,6 +138,87 @@ public final class HostBatch implements LiveRows {
     int from = strings.offsets().get(s * (stride + 1) + source);
     int to = strings.offsets().get(s * (stride + 1) + source + 1);
     return new String(strings.chars()[s], from, to - from, java.nio.charset.StandardCharsets.UTF_8);
+  }
+
+  // Bulk copies: one native-to-heap copy a column instead of a call a value.
+
+  @Override
+  public void copyInts(int column, int[] into) {
+    java.lang.foreign.MemorySegment.copy(
+        ints.getSegment(),
+        java.lang.foreign.ValueLayout.JAVA_INT,
+        (long) base(column, CudfType.INT32) * Integer.BYTES,
+        into,
+        0,
+        rows);
+  }
+
+  @Override
+  public void copyLongs(int column, long[] into) {
+    java.lang.foreign.MemorySegment.copy(
+        longs.getSegment(),
+        java.lang.foreign.ValueLayout.JAVA_LONG,
+        (long) base(column, CudfType.INT64) * Long.BYTES,
+        into,
+        0,
+        rows);
+  }
+
+  @Override
+  public void copyDoubles(int column, double[] into) {
+    java.lang.foreign.MemorySegment.copy(
+        doubles.getSegment(),
+        java.lang.foreign.ValueLayout.JAVA_DOUBLE,
+        (long) base(column, CudfType.FLOAT64) * Double.BYTES,
+        into,
+        0,
+        rows);
+  }
+
+  @Override
+  public boolean copyNulls(int column, boolean[] into) {
+    if (!layout.anyOptional() || nullFree[column]) {
+      return false;
+    }
+    byte[] flags = new byte[rows];
+    java.lang.foreign.MemorySegment.copy(
+        valid.getSegment(),
+        java.lang.foreign.ValueLayout.JAVA_BYTE,
+        (long) column * stride,
+        flags,
+        0,
+        rows);
+    boolean any = false;
+    for (int r = 0; r < rows; r++) {
+      into[r] = flags[r] == 0;
+      any |= into[r];
+    }
+    return any;
+  }
+
+  @Override
+  public Utf8Column utf8Column(int column) {
+    int s = column - layout.numericCount();
+    if (strings == null || s < 0) {
+      throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
+    }
+    int[] starts = new int[rows];
+    int[] lengths = new int[rows];
+    int[] compacted = new int[rows];
+    java.lang.foreign.MemorySegment.copy(
+        strings.compacted().getSegment(),
+        java.lang.foreign.ValueLayout.JAVA_INT,
+        0,
+        compacted,
+        0,
+        rows);
+    long base = (long) s * (stride + 1);
+    for (int r = 0; r < rows; r++) {
+      int from = strings.offsets().get((int) (base + compacted[r]));
+      starts[r] = from;
+      lengths[r] = strings.offsets().get((int) (base + compacted[r] + 1)) - from;
+    }
+    return new Utf8Column(strings.chars()[s], starts, lengths);
   }
 
   @Override

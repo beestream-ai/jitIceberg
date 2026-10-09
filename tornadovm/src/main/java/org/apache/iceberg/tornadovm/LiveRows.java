@@ -66,4 +66,54 @@ public interface LiveRows {
   default String getString(String column, int row) {
     return getString(column(column), row);
   }
+
+  /** A string column's live values: UTF-8 bytes, and each row's start and length in them. */
+  record Utf8Column(byte[] bytes, int[] starts, int[] lengths) {}
+
+  /** Copies an INT32 or DATE column's values of all rows into {@code into}. */
+  default void copyInts(int column, int[] into) {
+    for (int r = 0; r < rows(); r++) {
+      into[r] = isNull(column, r) ? 0 : getInt(column, r);
+    }
+  }
+
+  /** Copies an INT64 or TIMESTAMP column's values of all rows into {@code into}. */
+  default void copyLongs(int column, long[] into) {
+    for (int r = 0; r < rows(); r++) {
+      into[r] = isNull(column, r) ? 0 : getLong(column, r);
+    }
+  }
+
+  /** Copies a floating-point column's values of all rows into {@code into}. */
+  default void copyDoubles(int column, double[] into) {
+    for (int r = 0; r < rows(); r++) {
+      into[r] = isNull(column, r) ? 0 : getDouble(column, r);
+    }
+  }
+
+  /** Marks the null rows of a column in {@code into}; returns whether there were any. */
+  default boolean copyNulls(int column, boolean[] into) {
+    boolean any = false;
+    for (int r = 0; r < rows(); r++) {
+      into[r] = isNull(column, r);
+      any |= into[r];
+    }
+    return any;
+  }
+
+  /** A string column's values, without a String a row. */
+  default Utf8Column utf8Column(int column) {
+    java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+    int[] starts = new int[rows()];
+    int[] lengths = new int[rows()];
+    for (int r = 0; r < rows(); r++) {
+      java.nio.ByteBuffer value = getUtf8(column, r);
+      starts[r] = bytes.size();
+      if (value != null) {
+        lengths[r] = value.remaining();
+        bytes.write(value.array(), value.arrayOffset() + value.position(), value.remaining());
+      }
+    }
+    return new Utf8Column(bytes.toByteArray(), starts, lengths);
+  }
 }
