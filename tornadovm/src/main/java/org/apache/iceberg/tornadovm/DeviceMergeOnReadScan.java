@@ -285,6 +285,36 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     return field;
   }
 
+  /** Whether the device scan can read this task: a whole data file, as it reads files. */
+  public static boolean readsWholeFile(FileScanTask task) {
+    return HostDeletes.wholeFile(task);
+  }
+
+  /**
+   * {@link #materialize(List, Consumer)} over file scan tasks someone else planned -- a Spark
+   * task's -- rather than the table's: their data files read with their delete files applied. Calls
+   * are serialized, so concurrent Spark tasks take the device in turn; each runs on every stream.
+   */
+  public synchronized long materialize(
+      List<FileScanTask> tasks, List<String> columns, Consumer<LiveRows> consumer) {
+    if (tasks.isEmpty()) {
+      return 0;
+    }
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    Planned planned = new Planned(null, columns, tasks);
+    String key = "materialize:" + String.join(",", columns);
+    List<Region> streams = reuse(key, planned, () -> new MaterializeRegion(planned));
+    metrics.plan((System.nanoTime() - start) / 1e6);
+    long live =
+        run(
+            streams,
+            planned,
+            (region, executed) -> ((MaterializeRegion) region).collect(executed, consumer));
+    metrics.total((System.nanoTime() - start) / 1e6);
+    return live;
+  }
+
   @Override
   public long materialize(List<String> columns, Consumer<LiveRows> consumer) {
     metrics = new ScanMetrics();
@@ -430,7 +460,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     if (kept != null) {
       kept.forEach(Region::close);
     }
-    int streams = Math.max(1, Math.min(STREAMS, planned.batches.size()));
+    // Planned tasks someone else will send more of get every stream from the start.
+    int streams = Math.max(1, planned.given ? STREAMS : Math.min(STREAMS, planned.batches.size()));
     List<Region> created = Lists.newArrayList();
     for (int i = 0; i < streams; i++) {
       created.add(create.get());
@@ -548,14 +579,29 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final long stringStride;
     // Columns whose values the device compares -- filters and keys: a string among them must pack.
     private final java.util.Set<Integer> keyedIds = new java.util.HashSet<>();
+    private final boolean given;
 
     Planned(String groupColumn, List<String> projection) {
+      this(groupColumn, projection, null);
+    }
+
+    /**
+     * {@code given}: file scan tasks someone else planned (a Spark task's, say) instead of the
+     * table's. Their sizes are rounded up, so that the next group of tasks most likely fits the
+     * same device buffers and plans.
+     */
+    Planned(String groupColumn, List<String> projection, List<FileScanTask> given) {
       this.snapshotId =
           table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
-      try (CloseableIterable<FileScanTask> planned = table.newScan().filter(filter).planFiles()) {
-        this.tasks = Lists.newArrayList(planned);
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
+      this.given = given != null;
+      if (given != null) {
+        this.tasks = Lists.newArrayList(given);
+      } else {
+        try (CloseableIterable<FileScanTask> planned = table.newScan().filter(filter).planFiles()) {
+          this.tasks = Lists.newArrayList(planned);
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
+        }
       }
       this.equalityKeyId = HostDeletes.equalityKeyId(tasks);
       if (equalityKeyId != null
@@ -651,16 +697,28 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       // the loop bound exactly, and a bound with no such divisor (a prime row count, say) gets
       // one-thread blocks -- 28x slower kernels for a batch of 7,987,813 rows. The padding rows are
       // never live.
-      this.capacity = (int) Math.min(Integer.MAX_VALUE / 8, (maxRows + 1023) / 1024 * 1024);
+      this.capacity =
+          (int)
+              Math.min(
+                  Integer.MAX_VALUE / 8,
+                  (Math.max(maxRows, given != null ? Math.min(BATCH_ROWS, roundUp(maxRows)) : 0)
+                          + 1023)
+                      / 1024
+                      * 1024);
       keyedIds.addAll(DevicePredicate.fieldIds(filter, table.schema()));
       if (equalityKeyId != null) {
         keyedIds.add(equalityKeyId);
       }
       keyedIds.addAll(keyIds);
-      this.stringStride = stringStride(batches, layout, capacity);
-      this.equalityCapacity = (int) maxSet;
-      this.positionCapacity = (int) maxPositions;
-      this.maxFiles = files;
+      long stride = stringStride(batches, layout, capacity);
+      this.stringStride =
+          given != null && stride > 1
+              ? Math.min(roundUp(stride), Integer.MAX_VALUE / Math.max(1, layout.stringCount()))
+              : stride;
+      boolean padded = given != null;
+      this.equalityCapacity = (int) (padded ? roundUp(maxSet) : maxSet);
+      this.positionCapacity = (int) (padded ? roundUp(maxPositions) : maxPositions);
+      this.maxFiles = padded ? Math.max(64, files) : files;
     }
 
     /**
@@ -696,6 +754,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             "String columns of " + stride + " bytes a batch are beyond one device buffer");
       }
       return stride;
+    }
+
+    /** The next power of two, at least 1024. */
+    private static long roundUp(long value) {
+      return Math.max(1024, Long.highestOneBit(Math.max(1, value - 1)) << 1);
     }
 
     /** What decides the shape of the graph, apart from sizes. */
@@ -898,7 +961,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           && capacity >= planned.capacity
           && equalityCapacity >= planned.equalityCapacity
           && positionCapacity >= planned.positionCapacity
-          && maxFiles >= planned.maxFiles;
+          && maxFiles >= planned.maxFiles
+          && stringStride >= planned.stringStride;
     }
 
     /** Threads a block for every kernel of the scan. */

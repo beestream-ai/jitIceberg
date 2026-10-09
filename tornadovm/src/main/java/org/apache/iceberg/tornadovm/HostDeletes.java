@@ -413,6 +413,16 @@ final class HostDeletes {
         .collect(Collectors.joining(","));
   }
 
+  /**
+   * Whether a task reads its whole data file: from at or before its first row group (Iceberg starts
+   * a whole Parquet file's split after the 4-byte magic) to the end of the file.
+   */
+  static boolean wholeFile(FileScanTask task) {
+    List<Long> offsets = task.file().splitOffsets();
+    long first = offsets == null || offsets.isEmpty() ? 4 : offsets.get(0);
+    return task.start() <= first && task.start() + task.length() >= task.file().fileSizeInBytes();
+  }
+
   /** Whether the device reads this position-delete file itself. */
   static boolean readOnDevice(DeleteFile delete, String dataLocation) {
     return delete.content() == FileContent.POSITION_DELETES
@@ -457,7 +467,7 @@ final class HostDeletes {
       if (task.file().format() != FileFormat.PARQUET) {
         throw new UnsupportedOperationException("Not a Parquet data file: " + location);
       }
-      if (task.start() != 0 || task.length() < task.file().fileSizeInBytes()) {
+      if (!wholeFile(task)) {
         throw new UnsupportedOperationException("Split data files are not supported: " + location);
       }
       MessageType footer = footerSchema(path);

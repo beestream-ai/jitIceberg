@@ -158,6 +158,13 @@ if (sparkVersions.contains("3.5")) {
   project(":iceberg-spark:spark-runtime-3.5_${scalaVersion}").name = "iceberg-spark-runtime-3.5_${scalaVersion}"
 }
 
+// Spark 3.5 reads on the GPU, through the merge-on-read scan above.
+if (System.getenv('TORNADOVM_HOME') != null && sparkVersions.contains("3.5")) {
+  include 'tornadovm-spark'
+  project(':tornadovm-spark').projectDir = file('tornadovm/spark')
+  project(':tornadovm-spark').name = 'iceberg-tornadovm-spark'
+}
+
 if (sparkVersions.contains("4.0")) {
   include ":iceberg-spark:spark-4.0_2.13"
   include ":iceberg-spark:spark-extensions-4.0_2.13"
