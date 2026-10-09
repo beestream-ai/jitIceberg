@@ -136,6 +136,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private static final int REWRITE_STREAMS =
       Integer.getInteger("iceberg.tornadovm.rewriteStreams", STREAMS);
 
+  /** The decoded bytes a compaction batch holds, at most, on each stream. */
+  private static final long REWRITE_BATCH_BYTES =
+      Long.getLong("iceberg.tornadovm.rewriteBatchBytes", 768L << 20);
+
   private final Table table;
   private final Expression filter;
   private final Map<String, List<Region>> regions = Maps.newHashMap();
@@ -354,6 +358,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private static boolean outOfDeviceMemory(Throwable failure) {
     for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
       if (cause instanceof uk.ac.manchester.tornado.api.exceptions.TornadoOutOfMemoryException) {
+        return true;
+      }
+      // cuDF's allocations fail inside the shim and arrive as a runtime error with RMM's message.
+      String message = cause.getMessage();
+      if (message != null
+          && (message.contains("out_of_memory") || message.contains("cudaErrorMemoryAllocation"))) {
         return true;
       }
     }
@@ -691,6 +701,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       long rows = Math.max(1, tasks.stream().mapToLong(t -> t.file().recordCount()).sum());
       long fileRows =
           Math.max(1, Math.min(BATCH_ROWS, targetFileBytes / Math.max(1, bytes / rows)));
+      // ... but no more than a batch's worth of decoded rows: a table that compresses to a few
+      // bytes a row (TPC-H lineitem: ~3) would otherwise make batches of millions of wide rows,
+      // strings included, on every stream at once.
+      fileRows = Math.max(1024, Math.min(fileRows, REWRITE_BATCH_BYTES / decodedRowBytes(tasks)));
       // A rewrite needs room: idle readers give their device memory back first, as the last
       // other table rewritten has. This one keeps its regions -- and its compiled kernels -- for
       // its next group.
@@ -710,9 +724,60 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             planned.equalityCapacity,
             planned.layout.fields().size());
       }
-      write(planned, List.of(), written, start);
+      try {
+        write(planned, List.of(), written, start, REWRITE_STREAMS);
+      } catch (RuntimeException e) {
+        if (!outOfDeviceMemory(e)) {
+          throw e;
+        }
+        // Out of device memory -- wide string rows next to cuDF's own buffers, say. Drop what
+        // the group wrote, free everything idle, and write it again in halves on one stream.
+        discard(written);
+        releaseRewriteRegions();
+        evictIdle(null, 0);
+        Planned smaller =
+            new Planned(null, rewriteColumns(), tasks, Math.max(1, fileRows / 2), false, true);
+        write(smaller, List.of(), written, System.nanoTime(), 1);
+      }
     }
     return Lists.newArrayList(written);
+  }
+
+  /** Decoded bytes a row of the table, numeric columns and strings (from the files' footers). */
+  private long decodedRowBytes(List<FileScanTask> tasks) {
+    long bytes = 0;
+    for (Types.NestedField field : table.schema().columns()) {
+      if (field.type().typeId() != org.apache.iceberg.types.Type.TypeID.STRING) {
+        bytes += Long.BYTES + 1;
+        continue;
+      }
+      long chars = 0;
+      long rows = 0;
+      for (FileScanTask task : tasks) {
+        long fileBytes =
+            HostDeletes.stringBytes(
+                LocalFiles.path(task.file().location(), table.io()), field.fieldId());
+        if (fileBytes < 0) {
+          chars = -1;
+          break;
+        }
+        chars += fileBytes;
+        rows += task.file().recordCount();
+      }
+      // Offsets and validity, plus the bytes; 16 a row where a writer recorded no sizes.
+      bytes += Integer.BYTES + 1 + (chars < 0 || rows == 0 ? 16 : chars / rows + 1);
+    }
+    return Math.max(1, bytes);
+  }
+
+  /** Deletes the files a failed attempt wrote, which nothing will reference. */
+  private void discard(List<DataFile> written) {
+    synchronized (written) {
+      for (DataFile file : written) {
+        table.io().deleteFile(file.location());
+      }
+      written.clear();
+    }
   }
 
   /** The scan whose rewrite regions are kept: one rewriter's at a time hold device memory. */
@@ -750,6 +815,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   /** Writes the planned tasks' live rows into new files, added to {@code written}; their rows. */
   private long write(
       Planned planned, List<String> zorderColumns, List<DataFile> written, long start) {
+    return write(planned, zorderColumns, written, start, STREAMS);
+  }
+
+  private long write(
+      Planned planned,
+      List<String> zorderColumns,
+      List<DataFile> written,
+      long start,
+      int maxStreams) {
     int formatVersion =
         ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
     List<Region> streams =
@@ -761,7 +835,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 + (planned.given ? "-given" : ""),
             planned,
             () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns),
-            planned.given ? REWRITE_STREAMS : STREAMS);
+            maxStreams);
     metrics.plan((System.nanoTime() - start) / 1e6);
     return run(
         streams,
