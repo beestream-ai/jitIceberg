@@ -30,32 +30,8 @@ import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 final class GpuScans {
   private static final Map<String, DeviceMergeOnReadScan> SCANS = new ConcurrentHashMap<>();
 
-  // Spark gives an executor no lifecycle hook for a cache like this; the device is freed at exit.
-  @SuppressWarnings("ShutdownHook")
-  private static void closeAtExit() {
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () -> closeWithin(() -> SCANS.values().forEach(DeviceMergeOnReadScan::close))));
-  }
-
-  /**
-   * Runs {@code close} at exit for at most 10 seconds: freeing the device must not keep a JVM from
-   * exiting -- a scan stuck on a broken device would hold it, and the host memory, forever.
-   */
-  static void closeWithin(Runnable close) {
-    Thread closing = new Thread(close, "tornadovm-close");
-    closing.setDaemon(true);
-    closing.start();
-    try {
-      closing.join(10_000);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    }
-  }
-
   static {
-    closeAtExit();
+    ExitCleanup.register(() -> SCANS.values().forEach(DeviceMergeOnReadScan::close));
   }
 
   private GpuScans() {}

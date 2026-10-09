@@ -53,23 +53,13 @@ public final class GpuAggregates {
         }
       };
 
-  // Spark gives the driver no lifecycle hook for a cache like this; the device is freed at exit.
-  @SuppressWarnings("ShutdownHook")
-  private static void closeAtExit() {
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () ->
-                    GpuScans.closeWithin(
-                        () -> {
-                          synchronized (SCANS) {
-                            SCANS.values().forEach(DeviceMergeOnReadScan::close);
-                          }
-                        })));
-  }
-
   static {
-    closeAtExit();
+    ExitCleanup.register(
+        () -> {
+          synchronized (SCANS) {
+            SCANS.values().forEach(DeviceMergeOnReadScan::close);
+          }
+        });
   }
 
   // What a snapshot's file metrics say of a column; a snapshot never changes.
