@@ -122,6 +122,13 @@ for engine in ("spark", "gpu"):
          .rewriteDataFiles(t).option("rewrite-all", "true")
          .option("remove-dangling-deletes", "true").execute())
         total += (time.perf_counter() - start) * 1000
+        if engine == "spark":
+            # Spark's compaction is undone for the GPU's run; its files go with its snapshot.
+            t.refresh()
+            rewritten = t.currentSnapshot().snapshotId()
+            t.manageSnapshots().rollbackTo(snapshot).commit()
+            t.refresh()
+            t.expireSnapshots().expireSnapshotId(rewritten).commit()
     times[engine] = total
 print(f"compaction,{times['spark']:.0f},{times['gpu']:.0f},,", flush=True)
 single_user("compacted")

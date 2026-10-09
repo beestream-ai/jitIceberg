@@ -74,6 +74,14 @@ for t in tables:
             millis = (time.perf_counter() - begin) * 1000
             ok = fingerprint(name) == expected
             left = delete_files(name)
+            # Roll back now and expire the rewrite's snapshot with the files it wrote: runs would
+            # otherwise fill the disk with rewrites nothing references.
+            table.refresh()
+            rewritten = table.currentSnapshot().snapshotId()
+            if rewritten != start_snapshot:
+                table.manageSnapshots().rollbackTo(start_snapshot).commit()
+                table.refresh()
+                table.expireSnapshots().expireSnapshotId(rewritten).commit()
             print(f"{t},{engine},{run},{millis:.0f},{result.rewrittenDataFilesCount()},"
                   f"{result.addedDataFilesCount()},{ok},{left}", flush=True)
     table.refresh()
