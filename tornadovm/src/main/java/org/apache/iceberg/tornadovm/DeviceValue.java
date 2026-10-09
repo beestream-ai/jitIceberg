@@ -27,11 +27,11 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
  * TPC-H's pricing queries, {@code l_extendedprice * (1 - l_discount) * (1 + l_tax)} for one. A row
  * where any factor's column is null contributes 0, as SQL's SUM skips a null product.
  */
-public final class DeviceValue {
+public final class DeviceValue implements java.io.Serializable {
   /** Most factors in one value. */
   public static final int MAX_FACTORS = 4;
 
-  record Factor(String column, double offset, double scale) {}
+  record Factor(String column, double offset, double scale) implements java.io.Serializable {}
 
   private final List<Factor> factors;
 

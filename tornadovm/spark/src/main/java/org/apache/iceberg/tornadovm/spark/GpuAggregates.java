@@ -20,6 +20,7 @@ package org.apache.iceberg.tornadovm.spark;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,10 +29,13 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
 import org.apache.iceberg.types.Types;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.sql.SparkSession;
 
 /**
  * Grouped sums on the device for Spark's aggregate planning (GpuAggregateStrategy): one device scan
@@ -85,6 +89,53 @@ public final class GpuAggregates {
         + column
         + "|"
         + fact;
+  }
+
+  /**
+   * The groups of an aggregate -- by the given columns, or by {@code bucket(buckets, bucketColumn)}
+   * when that is not null -- computed where the GPU is: in this JVM in local mode, else in a
+   * one-task Spark job on an executor, the table travelling as a {@link SerializableTableWithSize}.
+   */
+  public static Map<List<Object>, double[]> groups(
+      SparkSession spark,
+      Table table,
+      Expression filter,
+      List<String> groupColumns,
+      String bucketColumn,
+      int buckets,
+      List<String> sumColumns,
+      List<DeviceValue> values) {
+    if (spark.sparkContext().isLocal()) {
+      return groupsHere(table, filter, groupColumns, bucketColumn, buckets, sumColumns, values);
+    }
+    Table shipped = SerializableTableWithSize.copyOf(table);
+    List<String> groupBy = new ArrayList<>(groupColumns);
+    List<String> sums = new ArrayList<>(sumColumns);
+    List<DeviceValue> sumValues = new ArrayList<>(values);
+    return JavaSparkContext.fromSparkContext(spark.sparkContext())
+        .parallelize(List.of(0), 1)
+        .map(
+            ignored -> groupsHere(shipped, filter, groupBy, bucketColumn, buckets, sums, sumValues))
+        .collect()
+        .get(0);
+  }
+
+  private static Map<List<Object>, double[]> groupsHere(
+      Table table,
+      Expression filter,
+      List<String> groupColumns,
+      String bucketColumn,
+      int buckets,
+      List<String> sumColumns,
+      List<DeviceValue> values) {
+    Map<List<Object>, double[]> groups =
+        bucketColumn != null
+            ? aggregateByBucket(table, filter, bucketColumn, buckets, sumColumns)
+            : aggregate(table, filter, groupColumns, values).groups();
+    // Serializable keys and map, for the trip back from an executor.
+    LinkedHashMap<List<Object>, double[]> copy = new LinkedHashMap<>();
+    groups.forEach((key, totals) -> copy.put(new ArrayList<>(key), totals));
+    return copy;
   }
 
   /**

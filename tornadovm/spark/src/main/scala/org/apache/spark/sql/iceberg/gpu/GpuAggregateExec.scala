@@ -51,12 +51,15 @@ case class GpuAggregateSpec(
   /** The result rows: each output expression with its aggregates and group columns filled in. */
   def run(): Seq[InternalRow] = {
     // In bucket mode the values are the sum columns, in order, so the totals line up the same.
-    val result = bucket match {
-      case Some((column, buckets)) =>
-        GpuAggregates.aggregateByBucket(table, filter, column, buckets, sumColumns.asJava)
-      case None =>
-        GpuAggregates.aggregate(table, filter, groupColumns.asJava, values.asJava).groups()
-    }
+    val result = GpuAggregates.groups(
+      org.apache.spark.sql.SparkSession.active,
+      table,
+      filter,
+      groupColumns.asJava,
+      bucket.map(_._1).orNull,
+      bucket.map(_._2).getOrElse(0),
+      sumColumns.asJava,
+      values.asJava)
     val groups = result.asScala.toVector.map { case (key, totals) =>
       (key.asScala.toVector, totals)
     }
@@ -137,7 +140,8 @@ case class GpuAggregateSpec(
 }
 
 /**
- * A grouped aggregate over an Iceberg table, computed by one device scan in the driver; when the
+ * A grouped aggregate over an Iceberg table, computed by one device scan -- in the driver in local
+ * mode, else in a one-task job on an executor -- with the result rows built in the driver; when the
  * device cannot run it after all (a group string over 8 bytes, say), the aggregate is planned
  * and run on the CPU instead. The spec and plan are the driver's, where it runs.
  */

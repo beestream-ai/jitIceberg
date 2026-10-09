@@ -23,6 +23,7 @@
 # device memory, GPU_JAVA_OPTS adds driver JVM options.
 #
 #   spark-submit-gpu --driver-memory 24g [--conf ...] app.py|--class ... app.jar
+#   SPARK_MASTER=spark://host:7077 spark-submit-gpu ...    (cluster: one executor per GPU)
 #
 # Needs SPARK_HOME (Spark 3.5, Scala 2.12), JAVA_HOME (JDK 21), and libcudf and TornadoVM's native
 # libraries on LD_LIBRARY_PATH (see the README).
@@ -30,10 +31,25 @@ set -euo pipefail
 : "${SPARK_HOME:?set SPARK_HOME to a Spark 3.5 distribution}"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CP=$(ls "$HERE"/jars/*.jar | paste -sd: -)
+GPU_JVM="--enable-preview @$HERE/tornado-argfile -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${GPU_JAVA_OPTS:-}"
+MASTER="${SPARK_MASTER:-local[*]}"
+EXECUTORS=()
+if [[ "$MASTER" != local\[* && "$MASTER" != local ]]; then
+  # Cluster: every executor runs GPU work, so it gets the driver's class path, JVM options and
+  # native libraries. The bundle and the native libraries must be at these paths on every node,
+  # and each executor needs a GPU of its own (one executor per GPU).
+  EXECUTORS=(
+    --conf spark.executor.extraClassPath="$CP"
+    --conf spark.executor.extraJavaOptions="$GPU_JVM"
+    --conf spark.executorEnv.LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+    --conf spark.executor.memory="${GPU_EXECUTOR_MEMORY:-24g}"
+  )
+fi
 exec "$SPARK_HOME/bin/spark-submit" \
-  --master "local[*]" \
+  --master "$MASTER" \
   --driver-class-path "$CP" \
-  --conf spark.driver.extraJavaOptions="--enable-preview @$HERE/tornado-argfile -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${GPU_JAVA_OPTS:-}" \
+  --conf spark.driver.extraJavaOptions="$GPU_JVM" \
+  "${EXECUTORS[@]}" \
   --conf spark.iceberg.gpu.enabled=true \
   --conf spark.sql.iceberg.partition-reader-factory-provider=tornadovm \
   --conf spark.sql.iceberg.rewrite-runner-provider=tornadovm \

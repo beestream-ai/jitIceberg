@@ -23,6 +23,8 @@
 # read back the same rows -- count, a checksum over every numeric column -- with no delete file.
 #
 #   BENCH_SCRIPT=compact_bench.py run.sh spark-gpu <warehouse>/<namespace> <runs> <table>...
+#   BENCH_SCRIPT=compact_bench.py run.sh rapids    <warehouse>/<namespace> <runs> <table>...
+#     (Spark's runner with the RAPIDS Accelerator off and on, as engines spark and rapids)
 import os
 import sys
 import time
@@ -37,8 +39,16 @@ jvm = spark.sparkContext._jvm
 env_conf = jvm.org.apache.spark.SparkEnv.get().conf()
 
 
+RAPIDS = os.environ.get("ENGINE") == "rapids"
+GPU_ENGINE = "rapids" if RAPIDS else "gpu"
+
+
 def gpu(on):
-    env_conf.set("spark.iceberg.gpu.enabled", "true" if on else "false")
+    if RAPIDS:
+        # Spark's own runner either way; the RAPIDS Accelerator runs its read and write on the GPU.
+        spark.conf.set("spark.rapids.sql.enabled", "true" if on else "false")
+    else:
+        env_conf.set("spark.iceberg.gpu.enabled", "true" if on else "false")
 
 
 def fingerprint(name):
@@ -63,11 +73,11 @@ for t in tables:
     start_snapshot = table.currentSnapshot().snapshotId()
     expected = fingerprint(name)
     for run in range(runs + 1):  # run 0 warms both up
-        for engine in ("spark", "gpu"):
+        for engine in ("spark", GPU_ENGINE):
             table.refresh()
             table.manageSnapshots().rollbackTo(start_snapshot).commit()
             table.refresh()
-            gpu(engine == "gpu")
+            gpu(engine == GPU_ENGINE)
             begin = time.perf_counter()
             result = (jvm.org.apache.iceberg.spark.actions.SparkActions.get(spark._jsparkSession)
                       .rewriteDataFiles(table).option("rewrite-all", "true").execute())

@@ -121,9 +121,20 @@ case "$mode" in
         SPARK_GPU_CP="${SPARK_GPU_CP:-$(ls "$BUNDLE"/jars/*.jar 2>/dev/null | paste -sd: -)}"
         SPARK_GPU_ARGFILE="${SPARK_GPU_ARGFILE:-$BUNDLE/tornado-argfile}"
         : "${SPARK_GPU_CP:?run :iceberg-tornadovm-spark:sparkGpuBundle or set SPARK_GPU_CP}"
-        ENGINE=spark-gpu exec "$SPARK_HOME/bin/spark-submit" --master "local[${THREADS:-$(nproc)}]" \
+        GPU_JVM="--enable-preview @$SPARK_GPU_ARGFILE -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}"
+        MASTER="${SPARK_MASTER:-local[${THREADS:-$(nproc)}]}"
+        EXECUTORS=()
+        if [[ "$MASTER" != local\[* && "$MASTER" != local ]]; then
+            # Cluster (e.g. SPARK_MASTER=local-cluster[1,16,32768] to test on one machine): the
+            # executors run the GPU work, with the driver's class path, JVM options and libraries.
+            EXECUTORS=(--conf spark.executor.extraClassPath="$SPARK_GPU_CP"
+                       --conf spark.executor.extraJavaOptions="$GPU_JVM"
+                       --conf spark.executorEnv.LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+                       --conf spark.executor.memory="${GPU_EXECUTOR_MEMORY:-24g}")
+        fi
+        ENGINE=spark-gpu exec "$SPARK_HOME/bin/spark-submit" --master "$MASTER" "${EXECUTORS[@]}" \
             --driver-memory "${GPU_HEAP:-24g}" --driver-class-path "$SPARK_GPU_CP" \
-            --conf spark.driver.extraJavaOptions="--enable-preview @$SPARK_GPU_ARGFILE -Dtornado.device.memory=20GB -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}" \
+            --conf spark.driver.extraJavaOptions="$GPU_JVM" \
             --conf spark.iceberg.gpu.enabled=true \
             --conf spark.sql.iceberg.partition-reader-factory-provider=tornadovm \
             --conf spark.sql.iceberg.rewrite-runner-provider=tornadovm \

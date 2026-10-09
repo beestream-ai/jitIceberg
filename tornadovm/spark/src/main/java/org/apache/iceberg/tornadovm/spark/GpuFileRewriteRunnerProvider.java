@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.tornadovm.spark;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.DataFile;
@@ -29,9 +31,11 @@ import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.actions.FileRewriteRunnerProvider;
+import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.SparkEnv;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.SparkSession;
 
 /**
@@ -69,7 +73,6 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
     if (env == null
         || !env.conf().getBoolean(GpuPartitionReaderFactoryProvider.ENABLED, false)
         || !env.conf().getBoolean(REWRITE_ENABLED, true)
-        || !spark.sparkContext().isLocal()
         || !DeviceMergeOnReadScan.isAvailable()) {
       return null;
     }
@@ -79,7 +82,7 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
       return null;
     }
     LOG.info("Rewriting {} on the GPU", table.name());
-    return new GpuRunner(table);
+    return new GpuRunner(spark, table);
   }
 
   /** Why the device cannot rewrite the table as Spark's bin-pack would, or null. */
@@ -110,9 +113,11 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
 
   private static final class GpuRunner
       implements FileRewriteRunner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> {
+    private final SparkSession spark;
     private final Table table;
 
-    GpuRunner(Table table) {
+    GpuRunner(SparkSession spark, Table table) {
+      this.spark = spark;
       this.table = table;
     }
 
@@ -129,15 +134,38 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
     @Override
     public void init(Map<String, String> options) {}
 
+    /**
+     * Rewrites the group where the GPU is: in this JVM in local mode, else in a one-task Spark job
+     * on an executor, which writes the files and sends back their {@link DataFile}s.
+     */
     @Override
     public Set<DataFile> rewrite(RewriteFileGroup group) {
+      List<DataFile> written;
+      if (spark.sparkContext().isLocal()) {
+        written = rewriteHere(table, group.fileScanTasks(), group.maxOutputFileSize());
+      } else {
+        Table shipped = SerializableTableWithSize.copyOf(table);
+        List<FileScanTask> tasks = new ArrayList<>(group.fileScanTasks());
+        long maxOutputFileSize = group.maxOutputFileSize();
+        written =
+            JavaSparkContext.fromSparkContext(spark.sparkContext())
+                .parallelize(List.of(0), 1)
+                .map(ignored -> rewriteHere(shipped, tasks, maxOutputFileSize))
+                .collect()
+                .get(0);
+      }
+      GROUPS.incrementAndGet();
+      return Sets.newHashSet(written);
+    }
+
+    private static List<DataFile> rewriteHere(
+        Table table, List<FileScanTask> tasks, long maxOutputFileSize) {
       // The aggregates' kept scans hold device memory a rewrite needs; they rebuild when next used.
       GpuAggregates.releaseAll();
-      Set<DataFile> written =
-          Sets.newHashSet(
-              GpuScans.rewriteScan(table)
-                  .rewriteGroup(group.fileScanTasks(), group.maxOutputFileSize()));
-      GROUPS.incrementAndGet();
+      List<DataFile> written = new ArrayList<>();
+      for (DataFile file : GpuScans.rewriteScan(table).rewriteGroup(tasks, maxOutputFileSize)) {
+        written.add(file.copy());
+      }
       return written;
     }
   }
