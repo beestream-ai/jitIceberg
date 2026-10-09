@@ -96,20 +96,33 @@ merge-on-read reader. It covers:
 
 On the benchmark tables every engine returns the same row count and checksum.
 
+## Set up
+
+1. **libcudf** from NVIDIA's wheels (about 1.3 GB, once; no conda or Python environment needed):
+   ```bash
+   source tornadovm/cudf-env.sh            # sets CUDF_HOME, RMM_HOME and LD_LIBRARY_PATH
+   ```
+2. **TornadoVM with the cuDF shim.** Released SDKs don't ship `libtornado-cudf.so`, so build one
+   with the CUDA backend. Until they're released, it needs TornadoVM #1215, #1219, #1220 and #1221
+   on top of `develop`:
+   ```bash
+   git clone https://github.com/beehive-lab/TornadoVM && cd TornadoVM   # with the PRs above merged in
+   make BACKEND=cuda                       # with CUDF_HOME from step 1
+   source setvars.sh                       # TORNADOVM_HOME, and JAVA_HOME = JDK 21
+   ```
+3. **Check everything** (JDK, SDK and shim PRs, libcudf, GPU and memory, Spark, the bundle, disk),
+   and optionally whether given tables can run on the GPU:
+   ```bash
+   tornadovm/preflight.sh /data/wh/db/sales
+   ```
+   It prints OK, WARN or FAIL for each check and exits 1 on a failure.
+
+The module is part of the build only when `TORNADOVM_HOME` is set. For Spark, see
+[spark/README.md](spark/README.md).
+
 ## Running
 
-Requirements:
-
-- a TornadoVM SDK whose cuDF shim has `readParquetColumns`
-  ([beehive-lab/TornadoVM#1200](https://github.com/beehive-lab/TornadoVM/pull/1200)), built with
-  `make BACKEND=cuda` and `CUDF_HOME` pointing at libcudf (the `libcudf-cu12` wheels are enough);
-- JDK 21;
-- every RAPIDS library directory on `LD_LIBRARY_PATH` (see TornadoVM's `tornado-cudf/README.md`).
-
-The module is part of the build only when `TORNADOVM_HOME` is set.
-
 ```bash
-source $TORNADOVM/setvars.sh                      # TORNADOVM_HOME, JAVA_HOME (21)
 ./gradlew :iceberg-tornadovm:test
 
 tornadovm/run.sh gen   /data/wh 64 1562500        # 100M rows, one table a delete scenario

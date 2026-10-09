@@ -58,13 +58,18 @@ spark.iceberg.gpu.read.enabled=false
 
 ## Requirements
 
-- An NVIDIA GPU, CUDA 12, Linux x86_64.
+- An NVIDIA GPU (compute capability 7.0 or newer), CUDA 12 driver, Linux x86_64.
 - JDK 21. The device scan uses Java's foreign-memory API, which needs `--enable-preview` on 21.
 - Spark 3.5 (Scala 2.12), **local mode**: the GPU work runs in the driver JVM.
-- A TornadoVM SDK built with the CUDA backend and the cuDF shim (`libtornado-cudf.so`), with
-  `TORNADOVM_HOME` set. That means TornadoVM 7.2 or later, plus #1215 (decimals), #1219 (cuDF's
-  memory pool gives memory back), #1220 (evolved schemas) and #1221 (strings in compaction).
-- libcudf 26.08 (the `libcudf-cu12` wheels) and its dependencies on `LD_LIBRARY_PATH`.
+- libcudf 26.08 and a TornadoVM SDK built with the cuDF shim, including TornadoVM #1215
+  (decimals), #1219 (cuDF's memory pool gives memory back), #1220 (evolved schemas) and #1221
+  (strings in compaction). The steps are in [../README.md](../README.md#set-up).
+
+Check all of it, and whether your tables qualify, with:
+
+```bash
+tornadovm/preflight.sh /data/wh/db/sales        # table directories are optional
+```
 
 ## Build and run
 
