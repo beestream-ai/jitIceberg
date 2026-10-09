@@ -110,9 +110,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   /**
    * Rows a device batch may hold. Files are grouped up to this many rows into one read, because a
-   * read of one small file is mostly latency; a file larger than this is a batch on its own.
+   * read of one small file is mostly latency; a file larger than this is a batch on its own. The
+   * bigger the read, the cheaper cuDF's ZSTD decompression of it: for 100M rows in 1.56M-row files,
+   * 1, 2 and 5 files a read cost 435, 233 and 137 ms of decompression a scan, so the default fits
+   * five such files.
    */
-  private static final long BATCH_ROWS = Long.getLong("iceberg.tornadovm.batch-rows", 4_000_000L);
+  private static final long BATCH_ROWS = Long.getLong("iceberg.tornadovm.batch-rows", 8_000_000L);
 
   /**
    * Batches in flight at once, each in its own region -- its own buffers, plan and CUDA stream --
@@ -575,6 +578,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.keyNullable =
           equalityKeyId != null && table.schema().findField(equalityKeyId).isOptional();
 
+      // Big batches decompress cheaply, but a small table cut into a few of them leaves streams
+      // idle:
+      // a batch holds at most an even share of the table a stream, up to BATCH_ROWS.
+      long totalRows = tasks.stream().mapToLong(t -> t.file().recordCount()).sum();
+      long batchRows = Math.max(1, Math.min(BATCH_ROWS, (totalRows + STREAMS - 1) / STREAMS));
       List<FileScanTask> current = Lists.newArrayList();
       long currentRows = 0;
       String currentSet = null;
@@ -582,7 +590,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         long rows = task.file().recordCount();
         // Files batch together only if they share their equality deletes and their residual.
         String set = HostDeletes.equalityId(task) + "|" + task.residual();
-        if (!current.isEmpty() && (currentRows + rows > BATCH_ROWS || !set.equals(currentSet))) {
+        if (!current.isEmpty() && (currentRows + rows > batchRows || !set.equals(currentSet))) {
           batches.add(current);
           current = Lists.newArrayList();
           currentRows = 0;
@@ -630,7 +638,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           || maxPositions > Integer.MAX_VALUE) {
         throw new UnsupportedOperationException("Batch too large for one device read: " + maxRows);
       }
-      this.capacity = (int) maxRows;
+      // Rounded up to whole thread blocks: TornadoVM's CUDA scheduler picks a block size that
+      // divides
+      // the loop bound exactly, and a bound with no such divisor (a prime row count, say) gets
+      // one-thread blocks -- 28x slower kernels for a batch of 7,987,813 rows. The padding rows are
+      // never live.
+      this.capacity = (int) Math.min(Integer.MAX_VALUE / 8, (maxRows + 1023) / 1024 * 1024);
       this.equalityCapacity = (int) maxSet;
       this.positionCapacity = (int) maxPositions;
       this.maxFiles = files;
