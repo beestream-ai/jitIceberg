@@ -62,6 +62,8 @@ public class TestSparkGpuReads {
             // Path-based reads go through Iceberg's default catalog: a Hadoop catalog, no Hive.
             .config("spark.sql.catalog.default_iceberg", "org.apache.iceberg.spark.SparkCatalog")
             .config("spark.sql.catalog.default_iceberg.type", "hadoop")
+            .config("spark.sql.iceberg.partition-reader-factory-provider", "tornadovm")
+            .config("spark.sql.iceberg.rewrite-runner-provider", "tornadovm")
             .config(
                 "spark.sql.catalog.default_iceberg.warehouse",
                 System.getProperty("java.io.tmpdir") + "/iceberg-gpu-spark-test")
@@ -76,9 +78,9 @@ public class TestSparkGpuReads {
   }
 
   private static void gpu(boolean on) {
-    SparkEnv.get().conf().set(GpuColumnarReaderProvider.ENABLED, Boolean.toString(on));
+    SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.ENABLED, Boolean.toString(on));
     // These tables are small: read them on the device anyway.
-    SparkEnv.get().conf().set(GpuColumnarReaderProvider.MIN_ROWS, "0");
+    SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.MIN_ROWS, "0");
   }
 
   private static List<String> sorted(List<Row> rows) {

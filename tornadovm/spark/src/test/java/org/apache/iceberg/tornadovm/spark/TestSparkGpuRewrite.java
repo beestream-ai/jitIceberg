@@ -67,6 +67,8 @@ public class TestSparkGpuRewrite {
             .config("spark.sql.shuffle.partitions", "4")
             .config("spark.sql.catalog.default_iceberg", "org.apache.iceberg.spark.SparkCatalog")
             .config("spark.sql.catalog.default_iceberg.type", "hadoop")
+            .config("spark.sql.iceberg.partition-reader-factory-provider", "tornadovm")
+            .config("spark.sql.iceberg.rewrite-runner-provider", "tornadovm")
             .config(
                 "spark.sql.catalog.default_iceberg.warehouse",
                 System.getProperty("java.io.tmpdir") + "/iceberg-gpu-spark-test")
@@ -81,7 +83,7 @@ public class TestSparkGpuRewrite {
   }
 
   private static void gpu(boolean on) {
-    SparkEnv.get().conf().set(GpuColumnarReaderProvider.ENABLED, Boolean.toString(on));
+    SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.ENABLED, Boolean.toString(on));
   }
 
   private static List<String> rows(String location) {

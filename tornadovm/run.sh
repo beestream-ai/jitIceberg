@@ -125,6 +125,8 @@ case "$mode" in
             --driver-memory "${GPU_HEAP:-24g}" --driver-class-path "$SPARK_GPU_CP" \
             --conf spark.driver.extraJavaOptions="--enable-preview @$SPARK_GPU_ARGFILE -Dtornado.device.memory=20GB -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}" \
             --conf spark.iceberg.gpu.enabled=true \
+            --conf spark.sql.iceberg.partition-reader-factory-provider=tornadovm \
+            --conf spark.sql.iceberg.rewrite-runner-provider=tornadovm \
             --conf spark.iceberg.gpu.aggregate.enabled="${SPARK_GPU_AGGREGATE:-true}" \
             --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.spark.sql.iceberg.gpu.GpuAggregateExtensions \
             --conf spark.sql.catalog.default_iceberg=org.apache.iceberg.spark.SparkCatalog \

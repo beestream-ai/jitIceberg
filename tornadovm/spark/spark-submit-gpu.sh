@@ -35,5 +35,7 @@ exec "$SPARK_HOME/bin/spark-submit" \
   --driver-class-path "$CP" \
   --conf spark.driver.extraJavaOptions="--enable-preview @$HERE/tornado-argfile -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${GPU_JAVA_OPTS:-}" \
   --conf spark.iceberg.gpu.enabled=true \
+  --conf spark.sql.iceberg.partition-reader-factory-provider=tornadovm \
+  --conf spark.sql.iceberg.rewrite-runner-provider=tornadovm \
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.spark.sql.iceberg.gpu.GpuAggregateExtensions \
   "$@"

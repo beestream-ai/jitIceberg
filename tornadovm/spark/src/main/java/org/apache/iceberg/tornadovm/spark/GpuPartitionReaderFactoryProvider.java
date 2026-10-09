@@ -24,24 +24,30 @@ import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.ScanTaskGroup;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.spark.source.ColumnarReaderProvider;
+import org.apache.iceberg.spark.source.IcebergInputPartition;
+import org.apache.iceberg.spark.source.PartitionReaderFactoryProvider;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.SparkEnv;
+import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
+import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 /**
- * Spark reads of Iceberg tables on the GPU: when {@code spark.iceberg.gpu.enabled} is true, a Spark
- * task's data files are read by the TornadoVM + cuDF merge-on-read scan -- decoded, their position
- * deletes, deletion vectors and equality deletes applied on the device -- and handed to Spark as
- * columnar batches of the live rows. Anything the device cannot read the way Iceberg's reader would
- * is declined and left to that reader: other file formats, split files, metadata columns, and
- * column types the device does not have.
+ * Spark reads of Iceberg tables on the GPU, through Iceberg's {@link
+ * PartitionReaderFactoryProvider} (selected with {@code
+ * spark.sql.iceberg.partition-reader-factory-provider=tornadovm}): when {@code
+ * spark.iceberg.gpu.enabled} is true, a Spark task's data files are read by the TornadoVM + cuDF
+ * merge-on-read scan -- decoded, their position deletes, deletion vectors and equality deletes
+ * applied on the device -- and handed to Spark as columnar batches of the live rows. Anything the
+ * device cannot read the way Iceberg's reader would is declined and left to that reader: other file
+ * formats, split files, metadata columns, and column types the device does not have.
  */
-public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
+public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactoryProvider {
   private static final org.slf4j.Logger LOG =
-      org.slf4j.LoggerFactory.getLogger(GpuColumnarReaderProvider.class);
+      org.slf4j.LoggerFactory.getLogger(GpuPartitionReaderFactoryProvider.class);
 
   /** The Spark configuration key that turns GPU reads on. */
   public static final String ENABLED = "spark.iceberg.gpu.enabled";
@@ -58,10 +64,62 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
    */
   public static final String READ_ENABLED = "spark.iceberg.gpu.read.enabled";
 
+  /** The name that selects this provider. */
+  public static final String NAME = "tornadovm";
+
   private static final long DEFAULT_MIN_ROWS = 1_000_000L;
 
   @Override
-  public PartitionReader<ColumnarBatch> create(
+  public String name() {
+    return NAME;
+  }
+
+  @Override
+  public PartitionReaderFactory create(Table table, PartitionReaderFactory delegate) {
+    return new Factory(delegate);
+  }
+
+  /**
+   * Reads the columnar partitions the device can, and passes everything else to Iceberg's factory.
+   * It holds only the delegate, so it serializes as Iceberg's own factory does.
+   */
+  private static final class Factory implements PartitionReaderFactory {
+    private final PartitionReaderFactory delegate;
+
+    private Factory(PartitionReaderFactory delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public PartitionReader<InternalRow> createReader(InputPartition partition) {
+      return delegate.createReader(partition);
+    }
+
+    @Override
+    public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
+      if (partition instanceof IcebergInputPartition iceberg
+          && iceberg.allTasksOfType(FileScanTask.class)) {
+        PartitionReader<ColumnarBatch> reader =
+            reader(
+                iceberg.table(),
+                iceberg.<FileScanTask>taskGroup(),
+                iceberg.expectedSchema(),
+                iceberg.isCaseSensitive());
+        if (reader != null) {
+          return reader;
+        }
+      }
+      return delegate.createColumnarReader(partition);
+    }
+
+    @Override
+    public boolean supportColumnarReads(InputPartition partition) {
+      return delegate.supportColumnarReads(partition);
+    }
+  }
+
+  /** A device reader for the task group, or null to leave it to Iceberg's reader. */
+  static PartitionReader<ColumnarBatch> reader(
       Table table,
       ScanTaskGroup<FileScanTask> taskGroup,
       Schema expectedSchema,

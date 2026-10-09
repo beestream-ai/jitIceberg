@@ -54,12 +54,20 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
   /** The Spark configuration key that keeps rewrites on the CPU while reads use the GPU. */
   public static final String REWRITE_ENABLED = "spark.iceberg.gpu.rewrite.enabled";
 
+  /** The name that selects this provider. */
+  public static final String NAME = "tornadovm";
+
+  @Override
+  public String name() {
+    return NAME;
+  }
+
   @Override
   public FileRewriteRunner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> create(
       SparkSession spark, Table table) {
     SparkEnv env = SparkEnv.get();
     if (env == null
-        || !env.conf().getBoolean(GpuColumnarReaderProvider.ENABLED, false)
+        || !env.conf().getBoolean(GpuPartitionReaderFactoryProvider.ENABLED, false)
         || !env.conf().getBoolean(REWRITE_ENABLED, true)
         || !spark.sparkContext().isLocal()
         || !DeviceMergeOnReadScan.isAvailable()) {
