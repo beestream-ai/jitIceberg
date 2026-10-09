@@ -106,6 +106,7 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 | `tornado.device.memory` | `20GB` (`GPU_DEVICE_MEMORY`) | TornadoVM's share of device memory. Leave a few GB for cuDF's own allocations |
 | `iceberg.tornadovm.streams` | `4` | concurrent device streams |
 | `iceberg.tornadovm.rewriteStreams` | the streams | concurrent streams of a compaction's file group. Each holds a batch's read, gathered and encoded columns at once |
+| `iceberg.tornadovm.rewriteBatchBytes` | 768 MB | most decoded bytes in one compaction batch; wide tables (e.g. with strings) get fewer rows per batch. A batch that runs out of device memory is retried at half the rows on one stream |
 | `iceberg.tornadovm.cacheDir` | `java.io.tmpdir`/`iceberg-tornadovm-cache` | local copies of object-store files |
 | `iceberg.tornadovm.cacheBytes` | 64 GB | the cache's size; least recently used files go first |
 | `iceberg.tornadovm.fetchThreads` | `16` | parallel fetches from the object store |
