@@ -145,16 +145,28 @@ public class TestSparkGpuReads {
     String grouped =
         "SELECT intCol, count(*), sum(doubleCol), min(stringCol), max(timestampCol), sum(floatCol)"
             + " FROM t WHERE longCol % 3 <> 1 GROUP BY intCol";
+    // Pushed to the scan: each task's residual filters on the device (the string term cannot,
+    // and Spark applies all of it again).
+    String filtered =
+        "SELECT * FROM t WHERE dateCol >= DATE '2026-10-05' AND dateCol < DATE '2026-10-20'"
+            + " AND doubleCol BETWEEN 100 AND 1500000 AND intCol < 50 AND floatCol > 10"
+            + " AND timestampCol IS NOT NULL";
+    String stringFiltered =
+        "SELECT longCol FROM t WHERE stringCol > 'row-1' AND intCol IN (1, 2, 3)";
     spark.read().format("iceberg").load(location).createOrReplaceTempView("t");
 
     gpu(false);
     List<String> cpuRows = sorted(spark.sql(all).collectAsList());
     List<String> cpuGroups = sorted(spark.sql(grouped).collectAsList());
+    List<String> cpuFiltered = sorted(spark.sql(filtered).collectAsList());
+    List<String> cpuStringFiltered = sorted(spark.sql(stringFiltered).collectAsList());
 
     gpu(true);
     long before = GpuPartitionReader.TASKS.get();
     List<String> gpuRows = sorted(spark.sql(all).collectAsList());
     List<String> gpuGroups = sorted(spark.sql(grouped).collectAsList());
+    List<String> gpuFiltered = sorted(spark.sql(filtered).collectAsList());
+    List<String> gpuStringFiltered = sorted(spark.sql(stringFiltered).collectAsList());
     long gpuTasks = GpuPartitionReader.TASKS.get() - before;
     gpu(false);
 
@@ -162,5 +174,9 @@ public class TestSparkGpuReads {
     assertThat(cpuRows).isNotEmpty();
     assertThat(gpuRows).containsExactlyElementsOf(cpuRows);
     assertThat(gpuGroups).containsExactlyElementsOf(cpuGroups);
+    assertThat(cpuFiltered).isNotEmpty().hasSizeLessThan(cpuRows.size());
+    assertThat(gpuFiltered).containsExactlyElementsOf(cpuFiltered);
+    assertThat(cpuStringFiltered).isNotEmpty();
+    assertThat(gpuStringFiltered).containsExactlyElementsOf(cpuStringFiltered);
   }
 }

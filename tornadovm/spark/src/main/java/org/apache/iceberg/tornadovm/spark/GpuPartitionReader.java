@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.tornadovm.spark;
 
-import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.List;
 import org.apache.iceberg.FileScanTask;
@@ -31,7 +30,6 @@ import org.apache.iceberg.tornadovm.LiveRows;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.connector.read.PartitionReader;
-import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
@@ -45,6 +43,8 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
   /** Spark tasks read on the device in this JVM, for tests and logs. */
   static final java.util.concurrent.atomic.AtomicLong TASKS =
       new java.util.concurrent.atomic.AtomicLong();
+
+  private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.spark.debug");
 
   private final DeviceMergeOnReadScan scan;
   private final List<FileScanTask> tasks;
@@ -64,13 +64,36 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
   @Override
   public boolean next() {
     if (batches == null) {
-      List<ColumnarBatch> read = Lists.newArrayList();
+      // The scan hands batches over from each of its stream threads at once.
+      List<ColumnarBatch> read = java.util.Collections.synchronizedList(Lists.newArrayList());
+      long start = System.nanoTime();
       List<String> columns = Lists.newArrayList();
       for (Types.NestedField field : schema.columns()) {
         columns.add(field.name());
       }
-      scan.materialize(tasks, columns, batch -> read.add(toSpark(batch)));
+      java.util.concurrent.atomic.AtomicLong convert = new java.util.concurrent.atomic.AtomicLong();
+      long rows =
+          scan.materialize(
+              tasks,
+              columns,
+              batch -> {
+                long converting = System.nanoTime();
+                read.add(toSpark(batch));
+                convert.addAndGet(System.nanoTime() - converting);
+              });
       TASKS.incrementAndGet();
+      if (DEBUG) {
+        System.err.printf(
+            "[gpu-spark] t=%d..%d %d files, %d live rows, %d batches in %.1f ms (to Spark %.1f) | %s%n",
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(start) % 100_000,
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) % 100_000,
+            tasks.size(),
+            rows,
+            read.size(),
+            (System.nanoTime() - start) / 1e6,
+            convert.get() / 1e6,
+            scan.metrics());
+      }
       batches = read.iterator();
     }
     if (current != null) {
@@ -99,36 +122,43 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
     }
   }
 
-  /** One device batch as Spark column vectors: the device's buffers are reused for the next. */
+  /**
+   * One device batch as Spark columns: a bulk copy a column into heap arrays, which the device
+   * batch's buffers -- reused for the next batch -- are not.
+   */
   private ColumnarBatch toSpark(LiveRows batch) {
     int rows = batch.rows();
     List<Types.NestedField> fields = schema.columns();
     ColumnVector[] vectors = new ColumnVector[fields.size()];
     for (int c = 0; c < fields.size(); c++) {
       Types.NestedField field = fields.get(c);
-      OnHeapColumnVector vector =
-          new OnHeapColumnVector(Math.max(1, rows), sparkSchema.fields()[c].dataType());
+      org.apache.spark.sql.types.DataType type = sparkSchema.fields()[c].dataType();
       int column = batch.column(field.name());
-      Type.TypeID type = field.type().typeId();
-      for (int r = 0; r < rows; r++) {
-        if (batch.isNull(column, r)) {
-          vector.putNull(r);
-          continue;
-        }
-        switch (type) {
-          case INTEGER, DATE -> vector.putInt(r, batch.getInt(column, r));
-          case LONG, TIMESTAMP -> vector.putLong(r, batch.getLong(column, r));
-          case FLOAT -> vector.putFloat(r, (float) batch.getDouble(column, r));
-          case DOUBLE -> vector.putDouble(r, batch.getDouble(column, r));
-          case STRING -> {
-            ByteBuffer utf8 = batch.getUtf8(column, r);
-            vector.putByteArray(
-                r, utf8.array(), utf8.arrayOffset() + utf8.position(), utf8.remaining());
-          }
-          default -> throw new UnsupportedOperationException("Column " + field);
-        }
+      boolean[] nulls = new boolean[rows];
+      if (!batch.copyNulls(column, nulls)) {
+        nulls = null;
       }
-      vectors[c] = vector;
+      Type.TypeID id = field.type().typeId();
+      vectors[c] =
+          switch (id) {
+            case INTEGER, DATE -> {
+              int[] values = new int[rows];
+              batch.copyInts(column, values);
+              yield HostColumnVector.ofInts(type, values, nulls);
+            }
+            case LONG, TIMESTAMP -> {
+              long[] values = new long[rows];
+              batch.copyLongs(column, values);
+              yield HostColumnVector.ofLongs(type, values, nulls);
+            }
+            case FLOAT, DOUBLE -> {
+              double[] values = new double[rows];
+              batch.copyDoubles(column, values);
+              yield HostColumnVector.ofDoubles(type, values, nulls);
+            }
+            case STRING -> HostColumnVector.ofStrings(type, batch.utf8Column(column), nulls);
+            default -> throw new UnsupportedOperationException("Column " + field);
+          };
     }
     return new ColumnarBatch(vectors, rows);
   }

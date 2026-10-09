@@ -89,3 +89,12 @@ test {
   maxHeapSize = '16g'
   maxParallelForks = 1
 }
+
+// The class path a Spark job needs to read on the GPU: this module, Iceberg's modules and their
+// dependencies, unshaded (Spark itself comes from the distribution). See run.sh spark-gpu.
+tasks.register('printSparkClasspath') {
+  dependsOn 'jar'
+  doLast {
+    println((files(tasks.jar.archiveFile) + configurations.runtimeClasspath).asPath)
+  }
+}
