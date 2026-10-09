@@ -43,9 +43,13 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import uk.ac.manchester.tornado.api.DataRange;
+import uk.ac.manchester.tornado.api.GridScheduler;
+import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.TornadoExecutionResult;
+import uk.ac.manchester.tornado.api.WorkerGrid;
+import uk.ac.manchester.tornado.api.WorkerGrid1D;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.exceptions.TornadoExecutionPlanException;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
@@ -540,6 +544,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int maxFiles;
     private final boolean filtered;
     private final List<DevicePredicate> batchFilters = Lists.newArrayList();
+    // Bytes a string column of a batch may decode to, from the footers' size statistics.
+    private final long stringStride;
+    // Columns whose values the device compares -- filters and keys: a string among them must pack.
+    private final java.util.Set<Integer> keyedIds = new java.util.HashSet<>();
 
     Planned(String groupColumn, List<String> projection) {
       this.snapshotId =
@@ -644,9 +652,50 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       // one-thread blocks -- 28x slower kernels for a batch of 7,987,813 rows. The padding rows are
       // never live.
       this.capacity = (int) Math.min(Integer.MAX_VALUE / 8, (maxRows + 1023) / 1024 * 1024);
+      keyedIds.addAll(DevicePredicate.fieldIds(filter, table.schema()));
+      if (equalityKeyId != null) {
+        keyedIds.add(equalityKeyId);
+      }
+      keyedIds.addAll(keyIds);
+      this.stringStride = stringStride(batches, layout, capacity);
       this.equalityCapacity = (int) maxSet;
       this.positionCapacity = (int) maxPositions;
       this.maxFiles = files;
+    }
+
+    /**
+     * The bytes any string column of any batch decodes to, from the data files' footers
+     * (parquet-java records them); a writer that left them out gets 16 bytes a row, and a batch
+     * that needs more is refused rather than truncated.
+     */
+    private static long stringStride(
+        List<List<FileScanTask>> batches, ScanLayout layout, int rows) {
+      if (layout.stringCount() == 0) {
+        return 1;
+      }
+      long most = 0;
+      for (List<FileScanTask> batch : batches) {
+        for (int s = 0; s < layout.stringCount(); s++) {
+          int fieldId = layout.fields().get(layout.numericCount() + s).fieldId();
+          long bytes = 0;
+          for (FileScanTask task : batch) {
+            long file =
+                HostDeletes.stringBytes(HostDeletes.localPath(task.file().location()), fieldId);
+            if (file < 0) {
+              bytes = 16L * rows;
+              break;
+            }
+            bytes += file;
+          }
+          most = Math.max(most, bytes);
+        }
+      }
+      long stride = (most + 1023) / 1024 * 1024 + 1024;
+      if (stride * layout.stringCount() > Integer.MAX_VALUE) {
+        throw new UnsupportedOperationException(
+            "String columns of " + stride + " bytes a batch are beyond one device buffer");
+      }
+      return stride;
     }
 
     /** What decides the shape of the graph, apart from sizes. */
@@ -729,22 +778,34 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final int[] stringColumns;
     final IntArray stringOffsets;
     final ByteArray stringChars;
-    final IntArray stringErrors = new IntArray(1);
+    final IntArray stringErrors;
+    final long stringStride;
+    final java.util.Set<Integer> keyedIds;
 
-    /** Refuses a batch that held a string longer than {@link #STRING_BYTES}. */
+    /**
+     * Refuses a batch whose filter or key column held a string longer than {@link #STRING_BYTES}:
+     * those are compared packed, and a longer value would compare wrongly. Strings only returned to
+     * the host can be of any length.
+     */
     void checkStrings(TornadoExecutionResult executed) {
       if (stringColumns.length > 0) {
         executed.transferToHost(stringErrors);
-        if (stringErrors.get(0) != 0) {
-          throw new UnsupportedOperationException(
-              "A string column holds a value longer than "
-                  + STRING_BYTES
-                  + " bytes, which the device does not support");
+        for (int s = 0; s < stringColumns.length; s++) {
+          Types.NestedField field = layout.fields().get(layout.numericCount() + s);
+          if (stringErrors.get(s) != 0 && keyedIds.contains(field.fieldId())) {
+            throw new UnsupportedOperationException(
+                "String column "
+                    + field.name()
+                    + " holds a value longer than "
+                    + STRING_BYTES
+                    + " bytes; filters and keys on such columns are not supported on the device");
+          }
         }
       }
     }
 
     private TornadoExecutionPlan plan;
+    final KernelContext context = new KernelContext();
     private String setOnDevice;
 
     /**
@@ -778,7 +839,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.stringColumns = new int[layout.stringCount()];
       long strings = layout.stringCount();
       this.stringOffsets = new IntArray(strings == 0 ? 1 : (int) (strings * (capacity + 1L)));
-      this.stringChars = new ByteArray(strings == 0 ? 1L : strings * STRING_BYTES * capacity);
+      this.stringStride = planned.stringStride;
+      this.stringChars = new ByteArray(strings == 0 ? 1L : strings * stringStride);
+      this.stringErrors = new IntArray((int) Math.max(1, strings));
+      this.keyedIds = new java.util.HashSet<>(planned.keyedIds);
       this.probeSizes[0] = capacity;
 
       boolean equality = equalityKeyId != null;
@@ -837,6 +901,49 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           && maxFiles >= planned.maxFiles;
     }
 
+    /** Threads a block for every kernel of the scan. */
+    static final int BLOCK = 256;
+
+    /**
+     * The launch shape of every kernel, set here rather than left to TornadoVM's scheduler: each
+     * kernel takes a KernelContext and guards its index, and runs on whole blocks of {@link #BLOCK}
+     * threads over its own bound -- the batch, the position-delete entries, or the equality-delete
+     * set. Names a shape does not use are never looked up.
+     */
+    private GridScheduler grids() {
+      GridScheduler scheduler = new GridScheduler();
+      String[] perRow = {
+        "packStrings",
+        "probe",
+        "keyProbe",
+        "live",
+        "filter",
+        "buckets",
+        "groups",
+        "nulls",
+        "gatherInts",
+        "gatherLongs",
+        "gatherDoubles",
+        "gatherValid",
+        "groupKeys",
+        "values",
+        "zorder",
+        "lineage"
+      };
+      for (String task : perRow) {
+        scheduler.addWorkerGrid("mor." + task, grid(capacity));
+      }
+      scheduler.addWorkerGrid("mor.deletePositions", grid(positionCapacity));
+      scheduler.addWorkerGrid("mor.keyGather", grid(equalityCapacity));
+      return scheduler;
+    }
+
+    private static WorkerGrid grid(long bound) {
+      WorkerGrid grid = new WorkerGrid1D((int) ((Math.max(1, bound) + BLOCK - 1) / BLOCK * BLOCK));
+      grid.setLocalWork(BLOCK, 1, 1);
+      return grid;
+    }
+
     /** What this shape adds after the live-row kernel. */
     abstract void consumer(TaskGraph graph);
 
@@ -844,7 +951,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       if (plan == null) {
         TaskGraph graph = shared();
         consumer(graph);
-        plan = new TornadoExecutionPlan(graph.snapshot());
+        plan = new TornadoExecutionPlan(graph.snapshot()).withGridScheduler(grids());
       }
       return plan;
     }
@@ -894,18 +1001,20 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 capacity,
                 stringOffsets,
                 stringChars,
-                (long) STRING_BYTES * capacity,
+                stringStride,
                 valid,
                 layout.numericCount())
             .task(
                 "packStrings",
                 DeviceKernels::packStrings,
+                context,
                 meta,
                 stringOffsets,
                 stringChars,
                 layout.stringCount(),
                 layout.firstStringSlot(),
                 capacity,
+                (int) stringStride,
                 longs,
                 stringErrors)
             .transferToHost(DataTransferMode.UNDER_DEMAND, stringErrors);
@@ -954,11 +1063,25 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           if (intKey) {
             graph
                 .libraryTask("sortSet", Cudf::sortKeys, sortSize, setInts, sortedInts)
-                .task("probe", DeviceKernels::probeSortedInts, sortedInts, setSize, ints, inSet);
+                .task(
+                    "probe",
+                    DeviceKernels::probeSortedInts,
+                    context,
+                    sortedInts,
+                    setSize,
+                    ints,
+                    inSet);
           } else {
             graph
                 .libraryTask("sortSet", Cudf::sortKeys, sortSize, setLongs, sortedLongs)
-                .task("probe", DeviceKernels::probeSortedLongs, sortedLongs, setSize, longs, inSet);
+                .task(
+                    "probe",
+                    DeviceKernels::probeSortedLongs,
+                    context,
+                    sortedLongs,
+                    setSize,
+                    longs,
+                    inSet);
           }
         } else if (intKey) {
           graph.libraryTask("probe", Cudf::containedIn, probeSizes, ints, setInts, inSet);
@@ -984,6 +1107,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "keyGather",
                 DeviceKernels::gatherKeySet,
+                context,
                 keySetChanged,
                 setSize,
                 keyOrder,
@@ -998,6 +1122,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "keyProbe",
                 DeviceKernels::probeKeySet,
+                context,
                 keySpec,
                 keyColumns,
                 keyHashes,
@@ -1015,6 +1140,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           .task(
               "live",
               DeviceKernels::liveRows,
+              context,
               meta,
               positionBits,
               inSet,
@@ -1024,6 +1150,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           .task(
               "deletePositions",
               DeviceKernels::deletePositions,
+              context,
               positions,
               meta,
               segmentStarts,
@@ -1036,6 +1163,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "filter",
                 DeviceKernels::filterRows,
+                context,
                 filterTerms,
                 filterLongs,
                 filterDoubles,
@@ -1060,7 +1188,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       rowsHolder[0] = prep.rows();
       System.arraycopy(prep.columns(), 0, columns, 0, columns.length);
       System.arraycopy(prep.columns(), columns.length, stringColumns, 0, stringColumns.length);
-      stringErrors.set(0, 0);
+      for (int s = 0; s < stringColumns.length; s++) {
+        stringErrors.set(s, 0);
+      }
       meta.set(DeviceKernels.META_ROWS, (int) prep.rows());
 
       byte[] bits = prep.positionBits();
@@ -1236,13 +1366,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "buckets",
             DeviceKernels::bucketGroupKeys,
+            context,
             live,
             longs,
             groupOffset,
             buckets,
             groupKeys);
       } else {
-        graph.task("groups", DeviceKernels::groupKeys, live, ints, groupOffset, groupKeys);
+        graph.task("groups", DeviceKernels::groupKeys, context, live, ints, groupOffset, groupKeys);
       }
       if (layout.anyOptional()) {
         graph
@@ -1250,6 +1381,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "nulls",
                 DeviceKernels::zeroNulls,
+                context,
                 doubles,
                 valid,
                 validColumn,
@@ -1402,6 +1534,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherInts",
             DeviceKernels::gatherInts,
+            context,
             positions(),
             liveCount,
             ints,
@@ -1413,6 +1546,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherLongs",
             DeviceKernels::gatherLongs,
+            context,
             positions(),
             liveCount,
             longs,
@@ -1424,6 +1558,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherDoubles",
             DeviceKernels::gatherDoubles,
+            context,
             positions(),
             liveCount,
             doubles,
@@ -1435,6 +1570,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         graph.task(
             "gatherValid",
             DeviceKernels::gatherBytes,
+            context,
             positions(),
             liveCount,
             valid,
@@ -1444,6 +1580,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       graph.transferToHost(
           DataTransferMode.UNDER_DEMAND, liveCount, outInts, outLongs, outDoubles, outValid);
+      if (stringColumns.length > 0) {
+        // Strings are not gathered on the device: the live rows' indices, offsets and bytes come
+        // back, and the host reads each live value where the read left it.
+        graph.transferToHost(DataTransferMode.UNDER_DEMAND, compacted, stringOffsets, stringChars);
+      }
     }
 
     /** Copies back one batch's live rows and hands them to the consumer. */
@@ -1457,8 +1598,43 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         copySlots(executed, outValid, validSlots, rows);
       }
       consumer.accept(
-          new HostBatch(layout, idByName, rows, capacity, outInts, outLongs, outDoubles, outValid));
+          new HostBatch(
+              layout,
+              idByName,
+              rows,
+              capacity,
+              outInts,
+              outLongs,
+              outDoubles,
+              outValid,
+              rows > 0 ? copyStrings(executed, rows) : null));
       return rows;
+    }
+
+    /** A batch's string columns, for the rows the read produced, and the live rows' indices. */
+    private HostBatch.StringColumns copyStrings(TornadoExecutionResult executed, int rows) {
+      if (stringColumns.length == 0) {
+        return null;
+      }
+      int read = meta.get(DeviceKernels.META_ROWS);
+      executed.transferToHost(new DataRange(compacted).withSize(rows));
+      byte[][] chars = new byte[stringColumns.length][];
+      for (int s = 0; s < stringColumns.length; s++) {
+        long offsetsBase = (long) s * (capacity + 1);
+        executed.transferToHost(
+            new DataRange(stringOffsets).withOffset(offsetsBase).withSize(read + 1L));
+        int bytes = stringOffsets.get((int) (offsetsBase + read));
+        if (bytes > 0) {
+          executed.transferToHost(
+              new DataRange(stringChars).withOffset(s * stringStride).withSize(bytes));
+        }
+        chars[s] =
+            stringChars
+                .getSegment()
+                .asSlice(s * stringStride, bytes)
+                .toArray(ValueLayout.JAVA_BYTE);
+      }
+      return new HostBatch.StringColumns(compacted, stringOffsets, chars, layout.numericCount());
     }
 
     private void copySlots(
@@ -1498,6 +1674,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       for (int k = 0; k < keys; k++) {
         Types.NestedField field = column(groupColumns.get(k));
         stringKey[k] = layout.isString(field.fieldId());
+        keyedIds.add(field.fieldId()); // grouped on the device: a string key has to pack
         nullableKey[k] = field.isOptional();
         groupSpec.set(3 * k, layout.type(field.fieldId()) == CudfType.INT32 ? 0 : 1);
         groupSpec.set(3 * k + 1, layout.slot(field.fieldId()));
@@ -1537,6 +1714,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           .task(
               "groupKeys",
               DeviceKernels::groupKeyColumns,
+              context,
               groupSpec,
               keys,
               live,
@@ -1548,6 +1726,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           .task(
               "values",
               DeviceKernels::valueColumns,
+              context,
               valueSpec,
               valueConstants,
               values,
@@ -1705,6 +1884,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "zorder",
                 DeviceKernels::zorderKeys,
+                context,
                 zSpec,
                 zColumns,
                 live,
@@ -1728,6 +1908,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .task(
                 "lineage",
                 DeviceKernels::lineage,
+                context,
                 positions(),
                 liveCount(),
                 fileStarts,

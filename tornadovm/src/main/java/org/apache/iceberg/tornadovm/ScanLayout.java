@@ -39,6 +39,8 @@ final class ScanLayout {
 
   private final List<Types.NestedField> fields = Lists.newArrayList();
   private final List<CudfType> types = Lists.newArrayList();
+  // What the read asks the shim for: FLOAT32 for a float column, which is stored as FP64.
+  private final List<CudfType> readTypes = Lists.newArrayList();
   private final Map<Integer, Integer> slotById = Maps.newHashMap();
   private final Map<Integer, Integer> readIndexById = Maps.newHashMap();
   private final int[] slotsPerType = new int[3];
@@ -90,6 +92,7 @@ final class ScanLayout {
     slotById.put(field.fieldId(), slotsPerType[type.code()]++);
     fields.add(field);
     types.add(type);
+    readTypes.add(field.type().typeId() == Type.TypeID.FLOAT ? CudfType.FLOAT32 : type);
     anyOptional |= field.isOptional();
   }
 
@@ -103,7 +106,9 @@ final class ScanLayout {
         // when
         // a batch meets one.
       case STRING -> CudfType.INT64;
-      case DOUBLE -> CudfType.FLOAT64;
+        // A float is read widened, exactly, to FP64 (CudfType.FLOAT32), so the device keeps one
+        // floating-point buffer and every kernel sees a double.
+      case DOUBLE, FLOAT -> CudfType.FLOAT64;
       default ->
           throw new UnsupportedOperationException(
               "Column "
@@ -120,7 +125,7 @@ final class ScanLayout {
 
   /** The types of the numeric columns, which the numeric read takes: the first fields. */
   CudfType[] types() {
-    return types.subList(0, numericCount).toArray(new CudfType[0]);
+    return readTypes.subList(0, numericCount).toArray(new CudfType[0]);
   }
 
   /** How many fields are numeric; the string fields follow them. */

@@ -25,6 +25,7 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
@@ -40,6 +41,7 @@ import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
@@ -326,7 +328,14 @@ final class HostDeletes {
   // Parquet footers and column positions, kept across scans: Iceberg never rewrites a file in
   // place,
   // so a path names the same bytes for as long as it exists. Small (a schema a file), and bounded.
-  private static final com.github.benmanes.caffeine.cache.Cache<String, MessageType> FOOTERS =
+  /**
+   * What a scan needs from a Parquet footer: the schema, and for each top-level string column (by
+   * field id) the bytes its values decode to, summed over the row groups -- parquet-java's size
+   * statistics, -1 when the writer left them out.
+   */
+  record Footer(MessageType schema, Map<Integer, Long> stringBytes) {}
+
+  private static final com.github.benmanes.caffeine.cache.Cache<String, Footer> FOOTERS =
       com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(200_000).build();
   // Multi-column equality sets, loaded on the host once a set of delete files.
   private static final com.github.benmanes.caffeine.cache.Cache<String, KeySet> KEY_SETS =
@@ -603,12 +612,47 @@ final class HostDeletes {
   }
 
   private static MessageType footerSchema(String path) {
-    return FOOTERS.get(path, HostDeletes::readFooterSchema);
+    return FOOTERS.get(path, HostDeletes::readFooter).schema();
   }
 
-  private static MessageType readFooterSchema(String path) {
+  /**
+   * The bytes a string column of a data file decodes to, from its footer's size statistics, or -1
+   * when the writer did not record them.
+   */
+  static long stringBytes(String path, int fieldId) {
+    Long bytes = FOOTERS.get(path, HostDeletes::readFooter).stringBytes().get(fieldId);
+    return bytes == null ? -1 : bytes;
+  }
+
+  private static Footer readFooter(String path) {
     try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(Paths.get(path)))) {
-      return reader.getFileMetaData().getSchema();
+      MessageType schema = reader.getFileMetaData().getSchema();
+      Map<Integer, Long> bytes = Maps.newHashMap();
+      for (org.apache.parquet.hadoop.metadata.BlockMetaData block :
+          reader.getFooter().getBlocks()) {
+        for (org.apache.parquet.hadoop.metadata.ColumnChunkMetaData chunk : block.getColumns()) {
+          if (chunk.getPath().size() != 1) {
+            continue;
+          }
+          org.apache.parquet.schema.Type column = schema.getType(chunk.getPath().toArray()[0]);
+          if (column.getId() == null || !column.isPrimitive()) {
+            continue;
+          }
+          org.apache.parquet.column.statistics.SizeStatistics size = chunk.getSizeStatistics();
+          java.util.Optional<Long> unencoded =
+              size == null || !size.isValid()
+                  ? java.util.Optional.empty()
+                  : size.getUnencodedByteArrayDataBytes();
+          if (column.asPrimitiveType().getPrimitiveTypeName()
+              != org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
+            continue;
+          }
+          int id = column.getId().intValue();
+          long previous = bytes.getOrDefault(id, 0L);
+          bytes.put(id, previous < 0 || unencoded.isEmpty() ? -1 : previous + unencoded.get());
+        }
+      }
+      return new Footer(schema, bytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Cannot read the footer of " + path, e);
     }

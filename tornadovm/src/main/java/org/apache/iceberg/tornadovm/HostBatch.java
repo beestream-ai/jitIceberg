@@ -42,6 +42,13 @@ public final class HostBatch implements LiveRows {
   private final ByteArray valid;
   private final int[] bases;
   private final CudfType[] types;
+  private final StringColumns strings;
+
+  /**
+   * A batch's string columns as the device read them -- offsets and bytes of every row the batch
+   * read -- and which of those rows are live, in order.
+   */
+  record StringColumns(IntArray compacted, IntArray offsets, byte[][] chars, int numericCount) {}
 
   HostBatch(
       ScanLayout layout,
@@ -51,7 +58,9 @@ public final class HostBatch implements LiveRows {
       IntArray ints,
       LongArray longs,
       DoubleArray doubles,
-      ByteArray valid) {
+      ByteArray valid,
+      StringColumns strings) {
+    this.strings = strings;
     this.layout = layout;
     this.idByName = idByName;
     this.rows = rows;
@@ -110,5 +119,20 @@ public final class HostBatch implements LiveRows {
   @Override
   public double getDouble(int column, int row) {
     return doubles.get(base(column, CudfType.FLOAT64) + row);
+  }
+
+  @Override
+  public String getString(int column, int row) {
+    int s = column - layout.numericCount();
+    if (strings == null || s < 0) {
+      throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
+    }
+    if (isNull(column, row)) {
+      return null;
+    }
+    int source = strings.compacted().get(row);
+    int from = strings.offsets().get(s * (stride + 1) + source);
+    int to = strings.offsets().get(s * (stride + 1) + source + 1);
+    return new String(strings.chars()[s], from, to - from, java.nio.charset.StandardCharsets.UTF_8);
   }
 }

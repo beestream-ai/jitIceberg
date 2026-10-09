@@ -33,6 +33,9 @@ public interface LiveRows {
 
   double getDouble(int column, int row);
 
+  /** A string column's value, whatever its length; null when the row's value is null. */
+  String getString(int column, int row);
+
   default boolean isNull(String column, int row) {
     return isNull(column(column), row);
   }
@@ -47,5 +50,9 @@ public interface LiveRows {
 
   default double getDouble(String column, int row) {
     return getDouble(column(column), row);
+  }
+
+  default String getString(String column, int row) {
+    return getString(column(column), row);
   }
 }

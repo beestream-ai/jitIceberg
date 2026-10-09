@@ -518,7 +518,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       return switch (type) {
         case INT64 -> new long[capacity];
         case INT32 -> new int[capacity];
-        case FLOAT64 -> new double[capacity];
+        case FLOAT64, FLOAT32 -> new double[capacity];
       };
     }
 
@@ -550,6 +550,11 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     @Override
     public double getDouble(int column, int row) {
       return ((double[]) columns[column])[row];
+    }
+
+    @Override
+    public String getString(int column, int row) {
+      throw new UnsupportedOperationException("The CPU baseline reads no string columns");
     }
   }
 

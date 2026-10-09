@@ -345,6 +345,149 @@ public class TestDeviceMergeOnRead {
   }
 
   /**
+   * The flat schema of Iceberg's own delete benchmarks: float (read widened), date, timestamptz and
+   * strings longer than 8 bytes, materialized with every value checked against IcebergGenerics,
+   * under position and equality deletes. A float filter runs on the device; a filter on the long
+   * string column is refused, not compared cut.
+   */
+  @Test
+  public void testFloatsTimestampsAndLongStrings() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "longCol", Types.LongType.get()),
+            Types.NestedField.required(2, "intCol", Types.IntegerType.get()),
+            Types.NestedField.required(3, "floatCol", Types.FloatType.get()),
+            Types.NestedField.optional(4, "doubleCol", Types.DoubleType.get()),
+            Types.NestedField.optional(6, "dateCol", Types.DateType.get()),
+            Types.NestedField.optional(7, "timestampCol", Types.TimestampType.withZone()),
+            Types.NestedField.optional(8, "stringCol", Types.StringType.get()));
+    Table table = MorTables.create(temp.resolve("flat").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 2; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              3000,
+              i -> {
+                GenericRecord record = GenericRecord.create(schema);
+                long id = index * 1_000_000L + i;
+                record.setField("longCol", id);
+                record.setField("intCol", (int) (id % 2147483647));
+                record.setField("floatCol", (float) id / 3);
+                record.setField("doubleCol", i % 9 == 0 ? null : (double) id);
+                record.setField("dateCol", java.time.LocalDate.of(2026, 10, 1).plusDays(i % 30));
+                record.setField(
+                    "timestampCol",
+                    i % 7 == 0
+                        ? null
+                        : java.time.OffsetDateTime.of(
+                                2026, 10, 9, 18, 30, 0, 0, java.time.ZoneOffset.UTC)
+                            .plusSeconds(i));
+                record.setField(
+                    "stringCol",
+                    i % 11 == 0
+                        ? null
+                        : "2026-10-" + (i % 30) + "-é-" + "x".repeat((int) (i % 40)));
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(3000, 5), randomPositions(3000, 0.1, 3)));
+    MorTables.deleteEqual(table, "longCol", ImmutableList.of(7L, 1_000_008L));
+    table.refresh();
+
+    List<String> expected = Lists.newArrayList();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        expected.add(
+            flatRow(
+                record.getField("longCol"),
+                record.getField("intCol"),
+                record.getField("floatCol") == null
+                    ? null
+                    : ((Float) record.getField("floatCol")).doubleValue(),
+                record.getField("doubleCol"),
+                record.getField("dateCol") == null
+                    ? null
+                    : (long) ((java.time.LocalDate) record.getField("dateCol")).toEpochDay(),
+                record.getField("timestampCol") == null
+                    ? null
+                    : org.apache.iceberg.util.DateTimeUtil.microsFromTimestamptz(
+                        (java.time.OffsetDateTime) record.getField("timestampCol")),
+                record.getField("stringCol")));
+      }
+    }
+    expected.sort(String::compareTo);
+
+    List<String> columns =
+        ImmutableList.of(
+            "longCol", "intCol", "floatCol", "doubleCol", "dateCol", "timestampCol", "stringCol");
+    List<String> actual = java.util.Collections.synchronizedList(Lists.newArrayList());
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      for (int repeat = 0; repeat < 2; repeat++) {
+        actual.clear();
+        device.materialize(
+            columns,
+            batch -> {
+              for (int r = 0; r < batch.rows(); r++) {
+                actual.add(
+                    flatRow(
+                        batch.getLong("longCol", r),
+                        (long) batch.getInt("intCol", r),
+                        batch.getDouble("floatCol", r),
+                        batch.isNull("doubleCol", r) ? null : batch.getDouble("doubleCol", r),
+                        batch.isNull("dateCol", r) ? null : (long) batch.getInt("dateCol", r),
+                        batch.isNull("timestampCol", r) ? null : batch.getLong("timestampCol", r),
+                        batch.getString("stringCol", r)));
+              }
+            });
+        List<String> sorted = Lists.newArrayList(actual);
+        sorted.sort(String::compareTo);
+        assertThat(sorted).containsExactlyElementsOf(expected);
+      }
+    }
+
+    // A float filter runs on the device and agrees with Iceberg's evaluator.
+    org.apache.iceberg.expressions.Expression floats =
+        org.apache.iceberg.expressions.Expressions.greaterThan("floatCol", 500.25f);
+    long expectedRows = 0;
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(floats).build()) {
+      for (Record ignored : records) {
+        expectedRows++;
+      }
+    }
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table, floats)) {
+      assertThat(
+              device
+                  .aggregate(ImmutableList.of(), ImmutableList.of(DeviceValue.of("intCol")))
+                  .rows())
+          .isEqualTo(expectedRows);
+    }
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(
+            table, org.apache.iceberg.expressions.Expressions.equal("stringCol", "2026-10-1"))) {
+      org.assertj.core.api.Assertions.assertThatThrownBy(
+              () ->
+                  device.aggregate(ImmutableList.of(), ImmutableList.of(DeviceValue.of("intCol"))))
+          .hasStackTraceContaining("8 bytes");
+    }
+  }
+
+  private static String flatRow(Object... values) {
+    StringBuilder row = new StringBuilder();
+    for (Object value : values) {
+      row.append(
+              value instanceof Number number && !(value instanceof Double)
+                  ? number.longValue()
+                  : value)
+          .append('|');
+    }
+    return row.toString();
+  }
+
+  /**
    * Filters: Iceberg prunes files with the filter's statistics, the device applies the residual to
    * the rows that survive the deletes. Ranges, IN, inequality and constants of every column type.
    */

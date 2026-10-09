@@ -18,7 +18,7 @@
  */
 package org.apache.iceberg.tornadovm;
 
-import uk.ac.manchester.tornado.api.annotations.Parallel;
+import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -85,13 +85,15 @@ final class DeviceKernels {
    * @param keyValidOffset where the key column's validity bytes start in {@code valid}
    */
   static void liveRows(
+      KernelContext context,
       IntArray meta,
       ByteArray positionBits,
       ByteArray inEqualitySet,
       ByteArray valid,
       int keyValidOffset,
       ByteArray live) {
-    for (@Parallel int i = 0; i < live.getSize(); i++) {
+    int i = context.globalIdx;
+    if (i < live.getSize()) {
       byte keep = 0;
       if (i < meta.get(META_ROWS)) {
         keep = 1;
@@ -125,12 +127,14 @@ final class DeviceKernels {
    * @param segmentOffsets the batch row at which each run's data file starts
    */
   static void deletePositions(
+      KernelContext context,
       LongArray positions,
       IntArray meta,
       IntArray segmentStarts,
       IntArray segmentOffsets,
       ByteArray live) {
-    for (@Parallel int j = 0; j < positions.getSize(); j++) {
+    int j = context.globalIdx;
+    if (j < positions.getSize()) {
       if (j < meta.get(META_POSITION_ROWS)) {
         int segments = meta.get(META_POSITION_SEGMENTS);
         int s = 0;
@@ -149,6 +153,7 @@ final class DeviceKernels {
    * holds. Nulls follow Iceberg's row evaluator, which orders them first.
    */
   static void filterRows(
+      KernelContext context,
       IntArray terms,
       LongArray longConstants,
       DoubleArray doubleConstants,
@@ -158,7 +163,8 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       ByteArray live) {
-    for (@Parallel int i = 0; i < live.getSize(); i++) {
+    int i = context.globalIdx;
+    if (i < live.getSize()) {
       if (live.get(i) == 1) {
         int count = terms.get(0);
         boolean keep = true;
@@ -263,8 +269,10 @@ final class DeviceKernels {
    * (slot 0 of the INT64 buffer) is in the first {@code size[0]} sorted keys. A binary search: the
    * set is sorted once and every batch after it searches the same copy.
    */
-  static void probeSortedLongs(LongArray sorted, IntArray size, LongArray keys, ByteArray found) {
-    for (@Parallel int i = 0; i < found.getSize(); i++) {
+  static void probeSortedLongs(
+      KernelContext context, LongArray sorted, IntArray size, LongArray keys, ByteArray found) {
+    int i = context.globalIdx;
+    if (i < found.getSize()) {
       long key = keys.get(i);
       int low = 0;
       int high = size.get(0) - 1;
@@ -286,8 +294,10 @@ final class DeviceKernels {
   }
 
   /** {@link #probeSortedLongs} for INT32 keys. */
-  static void probeSortedInts(IntArray sorted, IntArray size, IntArray keys, ByteArray found) {
-    for (@Parallel int i = 0; i < found.getSize(); i++) {
+  static void probeSortedInts(
+      KernelContext context, IntArray sorted, IntArray size, IntArray keys, ByteArray found) {
+    int i = context.globalIdx;
+    if (i < found.getSize()) {
       int key = keys.get(i);
       int low = 0;
       int high = size.get(0) - 1;
@@ -312,8 +322,10 @@ final class DeviceKernels {
    * The key each row is grouped under: its value of the group column, or {@link #DEAD_GROUP} when
    * the row is deleted. With no group column ({@code keyOffset < 0}) every live row is group 0.
    */
-  static void groupKeys(ByteArray live, IntArray ints, int keyOffset, IntArray groups) {
-    for (@Parallel int i = 0; i < groups.getSize(); i++) {
+  static void groupKeys(
+      KernelContext context, ByteArray live, IntArray ints, int keyOffset, IntArray groups) {
+    int i = context.globalIdx;
+    if (i < groups.getSize()) {
       int key = DEAD_GROUP;
       if (live.get(i) == 1) {
         key = keyOffset < 0 ? 0 : ints.get(keyOffset + i);
@@ -329,8 +341,14 @@ final class DeviceKernels {
    *     a required column
    */
   static void zeroNulls(
-      DoubleArray doubles, ByteArray valid, IntArray validColumn, int slots, int stride) {
-    for (@Parallel int i = 0; i < stride; i++) {
+      KernelContext context,
+      DoubleArray doubles,
+      ByteArray valid,
+      IntArray validColumn,
+      int slots,
+      int stride) {
+    int i = context.globalIdx;
+    if (i < stride) {
       for (int s = 0; s < slots; s++) {
         int column = validColumn.get(s);
         if (column >= 0 && valid.get(column * stride + i) == 0) {
@@ -342,8 +360,15 @@ final class DeviceKernels {
 
   /** Moves the surviving rows of every INT32 slot to the front, in their original order. */
   static void gatherInts(
-      IntArray positions, IntArray count, IntArray source, int slots, int stride, IntArray target) {
-    for (@Parallel int j = 0; j < stride; j++) {
+      KernelContext context,
+      IntArray positions,
+      IntArray count,
+      IntArray source,
+      int slots,
+      int stride,
+      IntArray target) {
+    int j = context.globalIdx;
+    if (j < stride) {
       if (j < count.get(0)) {
         int row = positions.get(j);
         for (int s = 0; s < slots; s++) {
@@ -361,6 +386,7 @@ final class DeviceKernels {
    * of the batch's {@code files[0]} data files starts, in order.
    */
   static void lineage(
+      KernelContext context,
       IntArray positions,
       IntArray count,
       IntArray fileStarts,
@@ -370,7 +396,8 @@ final class DeviceKernels {
       int slot,
       int stride,
       LongArray target) {
-    for (@Parallel int j = 0; j < stride; j++) {
+    int j = context.globalIdx;
+    if (j < stride) {
       if (j < count.get(0)) {
         int row = positions.get(j);
         int n = files.get(0);
@@ -406,6 +433,7 @@ final class DeviceKernels {
    * changed[0]} is 1, so a plan re-sorts only for a new set.
    */
   static void gatherKeySet(
+      KernelContext context,
       IntArray changed,
       IntArray size,
       IntArray order,
@@ -417,7 +445,8 @@ final class DeviceKernels {
       LongArray sortedHashes,
       LongArray sortedKeys,
       ByteArray sortedNulls) {
-    for (@Parallel int j = 0; j < stride; j++) {
+    int j = context.globalIdx;
+    if (j < stride) {
       if (changed.get(0) == 1 && j < size.get(0)) {
         int from = order.get(j);
         sortedHashes.set(j, hashes.get(from));
@@ -438,6 +467,7 @@ final class DeviceKernels {
    * and its validity slot, or -1 when it cannot be null.
    */
   static void probeKeySet(
+      KernelContext context,
       IntArray spec,
       int columns,
       LongArray sortedHashes,
@@ -450,7 +480,8 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       ByteArray found) {
-    for (@Parallel int i = 0; i < stride; i++) {
+    int i = context.globalIdx;
+    if (i < stride) {
       long hash = KEY_HASH_SEED;
       for (int c = 0; c < columns; c++) {
         hash =
@@ -504,29 +535,33 @@ final class DeviceKernels {
   /**
    * Packs each string of {@code strings} cuDF-layout columns into its INT64 slot: up to 8 bytes,
    * big-endian, zero-padded, sign bit flipped -- so signed order is byte order, as Iceberg orders
-   * strings. A longer value sets {@code errors[0]}, and the host refuses the batch. Column s has
-   * its {@code stride + 1} offsets at {@code s * (stride + 1)} and its bytes at {@code s * 8 *
-   * stride}; a null packs to whatever, its validity byte says it is null.
+   * strings. A longer value sets {@code errors[s]}; the host refuses the batch only when that
+   * column is compared on the device. Column s has its {@code stride + 1} offsets at {@code s *
+   * (stride + 1)} and its bytes at {@code s * charsStride}; a null packs to whatever, its validity
+   * byte says it is null.
    */
   static void packStrings(
+      KernelContext context,
       IntArray meta,
       IntArray offsets,
       ByteArray chars,
       int strings,
       int firstSlot,
       int stride,
+      int charsStride,
       LongArray longs,
       IntArray errors) {
-    for (@Parallel int i = 0; i < stride; i++) {
+    int i = context.globalIdx;
+    if (i < stride) {
       if (i < meta.get(META_ROWS)) {
         for (int s = 0; s < strings; s++) {
           int from = offsets.get(s * (stride + 1) + i);
           int length = offsets.get(s * (stride + 1) + i + 1) - from;
           long packed = 0L;
           if (length > 8) {
-            errors.set(0, 1);
+            errors.set(s, 1);
           } else {
-            long base = 8L * s * stride + from;
+            long base = (long) s * charsStride + from;
             for (int b = 0; b < 8; b++) {
               long next = b < length ? (chars.get((int) (base + b)) & 0xFFL) : 0L;
               packed = (packed << 8) | next;
@@ -551,6 +586,7 @@ final class DeviceKernels {
    * kind (0 INT32, 1 INT64), slot and validity slot (or -1).
    */
   static void groupKeyColumns(
+      KernelContext context,
       IntArray spec,
       int keys,
       ByteArray live,
@@ -559,7 +595,8 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       LongArray out) {
-    for (@Parallel int i = 0; i < stride; i++) {
+    int i = context.globalIdx;
+    if (i < stride) {
       if (live.get(i) == 0) {
         out.set(i, DEAD_KEY);
         for (int k = 1; k < keys; k++) {
@@ -595,6 +632,7 @@ final class DeviceKernels {
    * scale a factor, {@code 2 * MAX_FACTORS} a value.
    */
   static void valueColumns(
+      KernelContext context,
       IntArray spec,
       DoubleArray constants,
       int values,
@@ -605,7 +643,8 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       DoubleArray out) {
-    for (@Parallel int i = 0; i < stride; i++) {
+    int i = context.globalIdx;
+    if (i < stride) {
       int alive = live.get(i);
       for (int v = 0; v < values; v++) {
         int base = v * VALUE_SPEC_INTS;
@@ -654,6 +693,7 @@ final class DeviceKernels {
    * its slot in that kind's buffer and its validity slot, or -1 when it cannot be null.
    */
   static void zorderKeys(
+      KernelContext context,
       IntArray spec,
       int columns,
       ByteArray live,
@@ -663,7 +703,8 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       LongArray keys) {
-    for (@Parallel int i = 0; i < stride; i++) {
+    int i = context.globalIdx;
+    if (i < stride) {
       if (live.get(i) == 0) {
         keys.set(i, 1L);
         for (int w = 1; w <= columns; w++) {
@@ -729,13 +770,15 @@ final class DeviceKernels {
 
   /** {@link #gatherInts} for INT64 slots. */
   static void gatherLongs(
+      KernelContext context,
       IntArray positions,
       IntArray count,
       LongArray source,
       int slots,
       int stride,
       LongArray target) {
-    for (@Parallel int j = 0; j < stride; j++) {
+    int j = context.globalIdx;
+    if (j < stride) {
       if (j < count.get(0)) {
         int row = positions.get(j);
         for (int s = 0; s < slots; s++) {
@@ -747,13 +790,15 @@ final class DeviceKernels {
 
   /** {@link #gatherInts} for FP64 slots. */
   static void gatherDoubles(
+      KernelContext context,
       IntArray positions,
       IntArray count,
       DoubleArray source,
       int slots,
       int stride,
       DoubleArray target) {
-    for (@Parallel int j = 0; j < stride; j++) {
+    int j = context.globalIdx;
+    if (j < stride) {
       if (j < count.get(0)) {
         int row = positions.get(j);
         for (int s = 0; s < slots; s++) {
@@ -765,13 +810,15 @@ final class DeviceKernels {
 
   /** {@link #gatherInts} for validity bytes. */
   static void gatherBytes(
+      KernelContext context,
       IntArray positions,
       IntArray count,
       ByteArray source,
       int slots,
       int stride,
       ByteArray target) {
-    for (@Parallel int j = 0; j < stride; j++) {
+    int j = context.globalIdx;
+    if (j < stride) {
       if (j < count.get(0)) {
         int row = positions.get(j);
         for (int s = 0; s < slots; s++) {
@@ -788,8 +835,14 @@ final class DeviceKernels {
    * Iceberg would write it to. Deleted and padding rows get {@link #DEAD_GROUP}.
    */
   static void bucketGroupKeys(
-      ByteArray live, LongArray longs, int offset, int buckets, IntArray groups) {
-    for (@Parallel int i = 0; i < groups.getSize(); i++) {
+      KernelContext context,
+      ByteArray live,
+      LongArray longs,
+      int offset,
+      int buckets,
+      IntArray groups) {
+    int i = context.globalIdx;
+    if (i < groups.getSize()) {
       int key = DEAD_GROUP;
       if (live.get(i) == 1) {
         long value = longs.get(offset + i);
