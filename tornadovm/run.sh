@@ -60,6 +60,7 @@ case "$mode" in
             org.apache.iceberg.tornadovm.bench.AddEqualityDeletes "$@"
         ;;
     gpu)
+        # MAIN=<class> runs another main class (a probe, say) with the same JVM settings.
         CP="$(classpath)"
         # The argfile puts TornadoVM on the module path; -da for TornadoVM packages, see build.gradle.
         # tornado.device.memory is TornadoVM's own device budget (4 GB by default); buffers a closed
@@ -69,7 +70,7 @@ case "$mode" in
         exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" -Xmx"${GPU_HEAP:-24g}" \
             -Dtornado.device.memory="${TORNADO_DEVICE_MEMORY:-20GB}" --add-opens=java.base/java.nio=ALL-UNNAMED \
             -da:tornado... -da:uk.ac.manchester.tornado... -cp "$CP" \
-            org.apache.iceberg.tornadovm.bench.MorBench "$1" gpu "${@:2}"
+            ${MAIN:-org.apache.iceberg.tornadovm.bench.MorBench} $( [ -n "${MAIN:-}" ] && echo "$@" || echo "$1 gpu ${*:2}" )
         ;;
     cpu|generics)
         CP="$(classpath):$(ls "$TORNADOVM_HOME"/share/java/tornado/tornado-{api,cudf}-*.jar | tr '\n' ':')"

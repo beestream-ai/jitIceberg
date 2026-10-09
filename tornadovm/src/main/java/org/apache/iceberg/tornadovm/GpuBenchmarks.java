@@ -58,24 +58,51 @@ public final class GpuBenchmarks {
                   default -> throw new UnsupportedOperationException("Column " + field);
                 };
           }
+          // Column by column, each loop specialised to its type: every value is still read.
           long sum = 0;
-          for (int r = 0; r < batch.rows(); r++) {
-            for (int c = 0; c < count; c++) {
-              if (batch.isNull(index[c], r)) {
-                sum += 31;
-                continue;
+          int rows = batch.rows();
+          for (int c = 0; c < count; c++) {
+            int column = index[c];
+            long part = 0;
+            switch (kind[c]) {
+              case 'i' -> {
+                for (int r = 0; r < rows; r++) {
+                  part = part * 17 + (batch.isNull(column, r) ? 31 : batch.getInt(column, r));
+                }
               }
-              sum =
-                  sum * 17
-                      + switch (kind[c]) {
-                        case 'i' -> batch.getInt(index[c], r);
-                        case 'l' -> batch.getLong(index[c], r);
-                        case 'd' -> Double.doubleToRawLongBits(batch.getDouble(index[c], r));
-                        default -> batch.getString(index[c], r).hashCode();
-                      };
+              case 'l' -> {
+                for (int r = 0; r < rows; r++) {
+                  part = part * 17 + (batch.isNull(column, r) ? 31 : batch.getLong(column, r));
+                }
+              }
+              case 'd' -> {
+                for (int r = 0; r < rows; r++) {
+                  part =
+                      part * 17
+                          + (batch.isNull(column, r)
+                              ? 31
+                              : Double.doubleToRawLongBits(batch.getDouble(column, r)));
+                }
+              }
+              default -> {
+                for (int r = 0; r < rows; r++) {
+                  java.nio.ByteBuffer utf8 = batch.getUtf8(column, r);
+                  part = part * 17 + (utf8 == null ? 31 : utf8Hash(utf8));
+                }
+              }
             }
+            sum = sum * 31 + part;
           }
           checksum.addAndGet(sum);
         });
+  }
+
+  /** Every byte of a string, without decoding it -- as Spark reads a UTF8String. */
+  private static long utf8Hash(java.nio.ByteBuffer bytes) {
+    long hash = 0;
+    for (int i = bytes.position(); i < bytes.limit(); i++) {
+      hash = hash * 31 + bytes.get(i);
+    }
+    return hash;
   }
 }

@@ -36,6 +36,17 @@ public interface LiveRows {
   /** A string column's value, whatever its length; null when the row's value is null. */
   String getString(int column, int row);
 
+  /**
+   * A string column's value as its UTF-8 bytes, without decoding or copying them -- what Spark's
+   * UTF8String holds; null when the row's value is null.
+   */
+  default java.nio.ByteBuffer getUtf8(int column, int row) {
+    String value = getString(column, row);
+    return value == null
+        ? null
+        : java.nio.ByteBuffer.wrap(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+  }
+
   default boolean isNull(String column, int row) {
     return isNull(column(column), row);
   }

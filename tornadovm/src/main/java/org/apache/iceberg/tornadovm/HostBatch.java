@@ -135,4 +135,19 @@ public final class HostBatch implements LiveRows {
     int to = strings.offsets().get(s * (stride + 1) + source + 1);
     return new String(strings.chars()[s], from, to - from, java.nio.charset.StandardCharsets.UTF_8);
   }
+
+  @Override
+  public java.nio.ByteBuffer getUtf8(int column, int row) {
+    int s = column - layout.numericCount();
+    if (strings == null || s < 0) {
+      throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
+    }
+    if (isNull(column, row)) {
+      return null;
+    }
+    int source = strings.compacted().get(row);
+    int from = strings.offsets().get(s * (stride + 1) + source);
+    int to = strings.offsets().get(s * (stride + 1) + source + 1);
+    return java.nio.ByteBuffer.wrap(strings.chars()[s], from, to - from);
+  }
 }
