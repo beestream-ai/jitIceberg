@@ -212,4 +212,79 @@ public class TestSparkGpuAggregates {
       assertThat(device.get(onDevice.size() + q).onDevice()).as(onCpu.get(q)).isFalse();
     }
   }
+
+  /**
+   * Decimal columns, as TPC-DS has them: rows read through the GPU reader, and SUM, AVG and group
+   * keys of decimals from the device aggregate, equal to Spark's exact decimal answers.
+   */
+  @Test
+  public void testDecimalReadsAndAggregates() {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "price", Types.DecimalType.of(7, 2)),
+            Types.NestedField.optional(3, "net", Types.DecimalType.of(15, 2)),
+            Types.NestedField.optional(4, "band", Types.DecimalType.of(3, 1)),
+            Types.NestedField.optional(5, "store", Types.IntegerType.get()));
+    String location = temp.resolve("sales").toString();
+    Table table = MorTables.create(location, schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              10_000,
+              i -> {
+                long id = index * 1_000_000L + i;
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("id", id);
+                record.setField(
+                    "price", java.math.BigDecimal.valueOf((id * 7919) % 9_999_999 - 4_999_999, 2));
+                record.setField(
+                    "net", java.math.BigDecimal.valueOf(9_999_999_999L - id * 1_234L, 2));
+                record.setField("band", java.math.BigDecimal.valueOf(id % 5, 1));
+                record.setField("store", (int) (id % 7));
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(new long[] {1, 2, 3}, new long[0], new long[] {9_999}));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(11L, 1_000_012L));
+    spark.read().format("iceberg").load(location).createOrReplaceTempView("sales");
+
+    List<String> onDevice =
+        ImmutableList.of(
+            "SELECT band, store, sum(price), avg(price), sum(net), avg(net), count(*) FROM sales"
+                + " WHERE price > -1234.56 GROUP BY band, store",
+            "SELECT sum(price), avg(net), count(*) FROM sales WHERE band = 0.3");
+    String rows = "SELECT * FROM sales WHERE price < 100.00";
+
+    List<Answer> cpu = Lists.newArrayList();
+    for (String sql : onDevice) {
+      cpu.add(run(sql));
+    }
+    Answer cpuRows = run(rows);
+    gpu(true);
+    List<Answer> device = Lists.newArrayList();
+    Answer gpuRows;
+    long tasks = GpuPartitionReader.TASKS.get();
+    try {
+      for (String sql : onDevice) {
+        device.add(run(sql));
+      }
+      gpuRows = run(rows);
+    } finally {
+      gpu(false);
+    }
+    for (int q = 0; q < onDevice.size(); q++) {
+      assertThat(cpu.get(q).rows()).isNotEmpty();
+      assertThat(device.get(q).onDevice()).as(onDevice.get(q)).isTrue();
+      assertThat(device.get(q).rows()).containsExactlyElementsOf(cpu.get(q).rows());
+    }
+    assertThat(GpuPartitionReader.TASKS.get()).as("GPU reader tasks").isGreaterThan(tasks);
+    assertThat(cpuRows.rows()).isNotEmpty();
+    assertThat(gpuRows.rows()).containsExactlyElementsOf(cpuRows.rows());
+  }
 }

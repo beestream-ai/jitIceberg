@@ -26,6 +26,8 @@ import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Left => _, Right => _, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction
+import org.apache.spark.sql.catalyst.expressions.aggregate.DeclarativeAggregate
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.LeafExecNode
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -76,16 +78,45 @@ case class GpuAggregateSpec(
         case ae: AggregateExpression =>
           val value: Any = aggregates(ae) match {
             case RowCount => rows
-            case SumOf(_) if rows == 0 => null
-            case SumOf(v) if ae.dataType == LongType => Math.round(totals(v))
-            case SumOf(v) => totals(v)
-            case AverageOf(_) if rows == 0 => null
-            case AverageOf(v) => totals(v) / rows
+            case SumOf(_) | AverageOf(_) if rows == 0 => null
+            case SumOf(v) => finish(ae.aggregateFunction, totals(v), rows)
+            case AverageOf(v) => finish(ae.aggregateFunction, totals(v), rows)
           }
           Literal(value, ae.dataType)
         case e if keyLiterals.contains(e.canonicalized) => keyLiterals(e.canonicalized)
       }.eval(null)
     })
+  }
+
+  /**
+   * The aggregate's result as Spark computes it from its buffer -- the sum, the row count, and for
+   * a decimal SUM whether it saw no row -- here the device's: Spark's own evaluate expression
+   * applies its result type, rounding and overflow rules. A sum the device holds exactly (a
+   * decimal's unscaled value, an integer) goes into the buffer exactly.
+   */
+  private def finish(function: AggregateFunction, sum: Double, rows: Long): Any = {
+    val buffer = function.asInstanceOf[DeclarativeAggregate]
+    val attributes = buffer.aggBufferAttributes
+    val sumType = attributes.head.dataType
+    val sumValue: Any = sumType match {
+      case DoubleType => sum
+      case LongType => Math.round(sum)
+      case d: DecimalType =>
+        val scale = function.children.head.dataType.asInstanceOf[DecimalType].scale
+        Decimal(java.math.BigDecimal.valueOf(Math.round(sum), scale), d.precision, d.scale)
+      case other => throw new IllegalStateException(s"sum buffer of $other")
+    }
+    val literals: Map[ExprId, Literal] = attributes.map { a =>
+      a.exprId -> (a.name match {
+        case "sum" => Literal(sumValue, sumType)
+        case "count" => Literal(rows, LongType)
+        case "isEmpty" => Literal(false, BooleanType)
+        case other => throw new IllegalStateException(s"buffer attribute $other of $function")
+      })
+    }.toMap
+    buffer.evaluateExpression.transform {
+      case a: AttributeReference if literals.contains(a.exprId) => literals(a.exprId)
+    }.eval(null)
   }
 
   /** A device group key -- Long, String or null -- as Spark's internal value. */
@@ -94,6 +125,8 @@ case class GpuAggregateSpec(
     case (IntegerType | DateType, n: java.lang.Number) => n.intValue()
     case (LongType | TimestampType, n: java.lang.Number) => n.longValue()
     case (StringType, s: String) => UTF8String.fromString(s)
+    case (d: DecimalType, n: java.lang.Number) =>
+      Decimal.createUnsafe(n.longValue(), d.precision, d.scale)
     case (t, v) => throw new IllegalStateException(s"group key $v for $t")
   }
 

@@ -144,8 +144,9 @@ public final class GpuAggregates {
   }
 
   /**
-   * Whether a sum of the integer column over the table, accumulated in doubles, is exact: the
-   * files' row count times the largest magnitude their bounds allow stays under 2^53.
+   * Whether a sum of the integer or decimal column over the table, accumulated in doubles, is
+   * exact: the files' row count times the largest magnitude their bounds allow -- a decimal's
+   * unscaled -- stays under 2^53.
    */
   public static boolean exactSum(Table table, String column) {
     return COLUMN_FACTS.computeIfAbsent(
@@ -173,14 +174,20 @@ public final class GpuAggregates {
         }
         Number min = org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), low);
         Number max = org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), high);
-        largest =
-            Math.max(largest, Math.max(Math.abs(min.doubleValue()), Math.abs(max.doubleValue())));
+        largest = Math.max(largest, Math.max(magnitude(min), magnitude(max)));
         rows += task.file().recordCount();
       }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
     return rows * largest < 0x1p53;
+  }
+
+  private static double magnitude(Number value) {
+    return Math.abs(
+        value instanceof java.math.BigDecimal decimal
+            ? decimal.unscaledValue().doubleValue()
+            : value.doubleValue());
   }
 
   /**

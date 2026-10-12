@@ -226,6 +226,8 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       f.`type`().typeId() match {
         case TypeID.INTEGER | TypeID.LONG | TypeID.DATE | TypeID.TIMESTAMP | TypeID.STRING =>
           Right(f.name())
+        case TypeID.DECIMAL if a.dataType.asInstanceOf[DecimalType].precision <= 18 =>
+          Right(f.name())
         case other => Left(s"cannot group by $other")
       }
     }
@@ -237,11 +239,11 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     if (ae.isDistinct || ae.filter.isDefined) {
       return Left(s"DISTINCT or FILTER: $ae")
     }
-    def valueIndex(child: Expression): Either[String, Int] =
-      deviceValue(table, child).map { value =>
-        values += value
-        values.size - 1
-      }
+    def add(value: DeviceValue): Int = {
+      values += value
+      values.size - 1
+    }
+    def valueIndex(child: Expression): Either[String, Int] = deviceValue(table, child).map(add)
     ae.aggregateFunction match {
       case Count(children) =>
         traverse(children) {
@@ -251,23 +253,38 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
         }.map(_ => RowCount)
       case s: Sum if s.child.dataType == DoubleType => valueIndex(s.child).map(SumOf)
       case a: Average if a.child.dataType == DoubleType => valueIndex(a.child).map(AverageOf)
-      case s: Sum => exactIntegerColumn(table, s.child).flatMap(valueIndex).map(SumOf)
-      case a: Average => exactIntegerColumn(table, a.child).flatMap(valueIndex).map(AverageOf)
+      case s: Sum => exactColumn(table, s.child).map(add).map(SumOf)
+      case a: Average => exactColumn(table, a.child).map(add).map(AverageOf)
       case other => Left(s"aggregate not supported: $other")
     }
   }
 
   /**
-   * An int or bigint column whose sum the device's doubles hold exactly, as a double-typed
-   * expression for [[deviceValue]]: Spark sums it as a bigint.
+   * An int, bigint or decimal (up to 18 digits, as its unscaled value) column whose sum the
+   * device's doubles hold exactly, by the files' bounds: Spark sums it as a bigint or a decimal,
+   * exactly too.
    */
-  private def exactIntegerColumn(
+  private def exactColumn(
       table: org.apache.iceberg.Table,
-      child: Expression): Either[String, Expression] = child match {
-    case a: AttributeReference if a.dataType == IntegerType || a.dataType == LongType =>
-      if (GpuAggregates.exactSum(table, a.name)) Right(Cast(a, DoubleType))
-      else Left(s"sum of ${a.name} may not be exact in doubles")
+      child: Expression): Either[String, DeviceValue] = child match {
+    // Spark's DecimalAggregates has already turned SUM and AVG of a short decimal into ones of its
+    // unscaled value: what the device sums.
+    case UnscaledValue(a: AttributeReference) if exactType(a.dataType) => exactColumn(table, a)
+    case a: AttributeReference if exactType(a.dataType) =>
+      for {
+        f <- field(table, a)
+        _ <- nullFree(table, a)
+        _ <-
+          if (GpuAggregates.exactSum(table, a.name)) Right(())
+          else Left(s"sum of ${a.name} may not be exact in doubles")
+      } yield DeviceValue.of(f.name())
     case other => Left(s"aggregate of $other")
+  }
+
+  private def exactType(dataType: DataType): Boolean = dataType match {
+    case IntegerType | LongType => true
+    case d: DecimalType => d.precision <= 18
+    case _ => false
   }
 
   private sealed trait Factor
