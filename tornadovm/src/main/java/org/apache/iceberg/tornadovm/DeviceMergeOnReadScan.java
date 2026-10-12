@@ -253,15 +253,17 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     for (String column : groupColumns) {
       org.apache.iceberg.types.Type.TypeID type = column(column).type().typeId();
       switch (type) {
-        case INTEGER, LONG, DATE, TIMESTAMP, STRING -> {}
+        case INTEGER, LONG, DATE, TIMESTAMP, STRING, DECIMAL -> {}
         default -> throw new UnsupportedOperationException("Cannot group by " + column(column));
       }
     }
     for (DeviceValue value : values) {
       for (DeviceValue.Factor factor : value.factors()) {
         org.apache.iceberg.types.Type.TypeID type = column(factor.column()).type().typeId();
+        // A decimal sums as its unscaled value.
         if (type != org.apache.iceberg.types.Type.TypeID.INTEGER
             && type != org.apache.iceberg.types.Type.TypeID.LONG
+            && type != org.apache.iceberg.types.Type.TypeID.DECIMAL
             && type != org.apache.iceberg.types.Type.TypeID.DOUBLE) {
           throw new UnsupportedOperationException("Not a numeric column: " + factor.column());
         }
@@ -1342,7 +1344,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             0,
             0,
             setColumn,
-            new CudfType[] {equalityKeyType},
+            // As the file holds it: a decimal key is read unscaled (CudfType.DECIMAL64).
+            new CudfType[] {layout.readType(equalityKeyId)},
             setRowsHolder,
             equalityCapacity,
             intKey ? setInts : new IntArray(1),

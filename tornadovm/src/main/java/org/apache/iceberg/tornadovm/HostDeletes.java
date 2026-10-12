@@ -770,7 +770,7 @@ final class HostDeletes {
           if (size == keys.length) {
             keys = Arrays.copyOf(keys, keys.length * 2);
           }
-          keys[size++] = ((Number) value).longValue();
+          keys[size++] = ScanLayout.deviceLong(key, value);
         }
       } catch (IOException e) {
         throw new UncheckedIOException(e);

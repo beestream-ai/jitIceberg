@@ -300,7 +300,7 @@ final class DevicePredicate {
         } else if (kind == CudfType.FLOAT64) {
           doubles[i] = ((Number) value).doubleValue();
         } else {
-          longs[i] = ((Number) value).longValue();
+          longs[i] = ScanLayout.deviceLong(field, value);
         }
       }
       List<Term> terms = Lists.newArrayList();

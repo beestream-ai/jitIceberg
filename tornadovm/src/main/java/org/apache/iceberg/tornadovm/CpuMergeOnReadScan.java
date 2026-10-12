@@ -519,6 +519,8 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
         case INT64 -> new long[capacity];
         case INT32 -> new int[capacity];
         case FLOAT64, FLOAT32 -> new double[capacity];
+        case DECIMAL64 ->
+            throw new UnsupportedOperationException("The CPU baseline reads no decimal columns");
       };
     }
 

@@ -92,7 +92,12 @@ final class ScanLayout {
     slotById.put(field.fieldId(), slotsPerType[type.code()]++);
     fields.add(field);
     types.add(type);
-    readTypes.add(field.type().typeId() == Type.TypeID.FLOAT ? CudfType.FLOAT32 : type);
+    readTypes.add(
+        switch (field.type().typeId()) {
+          case FLOAT -> CudfType.FLOAT32;
+          case DECIMAL -> CudfType.DECIMAL64;
+          default -> type;
+        });
     anyOptional |= field.isOptional();
   }
 
@@ -109,6 +114,15 @@ final class ScanLayout {
         // A float is read widened, exactly, to FP64 (CudfType.FLOAT32), so the device keeps one
         // floating-point buffer and every kernel sees a double.
       case DOUBLE, FLOAT -> CudfType.FLOAT64;
+        // A decimal of up to 18 digits as its unscaled value (CudfType.DECIMAL64); its scale is the
+        // column's.
+      case DECIMAL -> {
+        if (((Types.DecimalType) field.type()).precision() > MAX_DECIMAL_PRECISION) {
+          throw new UnsupportedOperationException(
+              "Column " + field.name() + " of type " + field.type() + " has over 18 digits");
+        }
+        yield CudfType.INT64;
+      }
       default ->
           throw new UnsupportedOperationException(
               "Column "
@@ -117,6 +131,21 @@ final class ScanLayout {
                   + field.type()
                   + " cannot be read on the device");
     };
+  }
+
+  /** The most digits a decimal column may have: its unscaled value is an INT64. */
+  static final int MAX_DECIMAL_PRECISION = 18;
+
+  /**
+   * A value of a column as the device holds it in an INT64 or INT32 slot: a decimal as its unscaled
+   * value at the column's scale (exactly, or not at all), any other number as itself.
+   */
+  static long deviceLong(Types.NestedField field, Object value) {
+    if (value instanceof java.math.BigDecimal decimal) {
+      int scale = ((Types.DecimalType) field.type()).scale();
+      return decimal.setScale(scale).unscaledValue().longValueExact();
+    }
+    return ((Number) value).longValue();
   }
 
   List<Types.NestedField> fields() {
@@ -189,6 +218,11 @@ final class ScanLayout {
   /** The column's position in the read, which is also its slot in the validity bytes. */
   int readIndex(int fieldId) {
     return readIndexById.get(fieldId);
+  }
+
+  /** What the read asks the shim for, for this column: see {@link #types()}. */
+  CudfType readType(int fieldId) {
+    return readTypes.get(readIndex(fieldId));
   }
 
   CudfType type(int fieldId) {
