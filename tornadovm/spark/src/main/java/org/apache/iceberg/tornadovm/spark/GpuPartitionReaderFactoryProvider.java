@@ -99,15 +99,15 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
     public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
       if (partition instanceof IcebergInputPartition iceberg
           && iceberg.allTasksOfType(FileScanTask.class)) {
+        ScanTaskGroup<FileScanTask> group = iceberg.taskGroup();
         PartitionReader<ColumnarBatch> reader =
-            reader(
-                iceberg.table(),
-                iceberg.<FileScanTask>taskGroup(),
-                iceberg.expectedSchema(),
-                iceberg.isCaseSensitive());
-        if (reader != null) {
-          return reader;
-        }
+            reader(iceberg.table(), group, iceberg.expectedSchema(), iceberg.isCaseSensitive());
+        return ScanLog.timed(
+            reader != null ? reader : delegate.createColumnarReader(partition),
+            reader != null ? "gpu" : "cpu",
+            iceberg.table(),
+            group,
+            iceberg.expectedSchema());
       }
       return delegate.createColumnarReader(partition);
     }
