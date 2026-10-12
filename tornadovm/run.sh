@@ -116,6 +116,7 @@ case "$mode" in
         # the driver JVM through an argfile whose module path leaves out the jars that clash with
         # Spark's (see SPARK_GPU_ARGFILE). The GPU JVM keeps its heap under 32 GB.
         # Defaults: the bundle of :iceberg-tornadovm-spark:sparkGpuBundle (spark/build/spark-gpu).
+        # SPARK_GPU_CONF adds Spark options (e.g. "--conf spark.iceberg.gpu.scanLog=/tmp/scans").
         : "${SPARK_HOME:?set SPARK_HOME}"
         BUNDLE="$HERE/spark/build/spark-gpu"
         SPARK_GPU_CP="${SPARK_GPU_CP:-$(ls "$BUNDLE"/jars/*.jar 2>/dev/null | paste -sd: -)}"
@@ -138,7 +139,7 @@ case "$mode" in
             --conf spark.iceberg.gpu.enabled=true \
             --conf spark.sql.iceberg.partition-reader-factory-provider=tornadovm \
             --conf spark.sql.iceberg.rewrite-runner-provider=tornadovm \
-            --conf spark.iceberg.gpu.aggregate.enabled="${SPARK_GPU_AGGREGATE:-true}" \
+            --conf spark.iceberg.gpu.aggregate.enabled="${SPARK_GPU_AGGREGATE:-true}" ${SPARK_GPU_CONF:-} \
             --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.spark.sql.iceberg.gpu.GpuAggregateExtensions \
             --conf spark.sql.catalog.default_iceberg=org.apache.iceberg.spark.SparkCatalog \
             --conf spark.sql.catalog.default_iceberg.type=hadoop \
