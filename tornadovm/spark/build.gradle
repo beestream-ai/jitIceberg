@@ -27,6 +27,23 @@ def tornadoApi = fileTree("${tornadoHome}/share/java/tornado") {
   include 'tornado-cudf-*.jar'
 }
 
+// The aggregate planning (GpuAggregateStrategy) is Scala: Spark's planner API is.
+apply plugin: 'scala'
+
+sourceSets {
+  main {
+    scala.srcDirs = ['src/main/scala']
+  }
+}
+
+tasks.withType(ScalaCompile).configureEach {
+  // The Java classes it calls are Java 21 (with preview, as :iceberg-tornadovm).
+  scalaCompileOptions.additionalParameters.removeAll { it.startsWith('-release') }
+  scalaCompileOptions.additionalParameters.add('-release:21')
+  sourceCompatibility = '21'
+  targetCompatibility = '21'
+}
+
 tasks.withType(JavaCompile).configureEach {
   options.release = 21
   options.compilerArgs += ['--enable-preview']
