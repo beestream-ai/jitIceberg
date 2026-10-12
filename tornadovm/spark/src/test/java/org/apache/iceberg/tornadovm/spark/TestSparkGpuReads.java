@@ -183,4 +183,55 @@ public class TestSparkGpuReads {
     assertThat(cpuStringFiltered).isNotEmpty();
     assertThat(gpuStringFiltered).containsExactlyElementsOf(cpuStringFiltered);
   }
+
+  @Test
+  public void testReadPolicyLeavesPositionDeletesToIcebergsReader() {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "longCol", Types.LongType.get()),
+            Types.NestedField.required(2, "intCol", Types.IntegerType.get()));
+    String location = temp.resolve("positions-only").toString();
+    Table table = MorTables.create(location, schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 2; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              5000,
+              i -> {
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("longCol", index * 1_000_000L + i);
+                record.setField("intCol", (int) (i % 97));
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(positions(5000, 0.2, 3), positions(5000, 0.05, 4)));
+    spark.read().format("iceberg").load(location).createOrReplaceTempView("p");
+    String all = "SELECT * FROM p";
+
+    gpu(false);
+    List<String> cpuRows = sorted(spark.sql(all).collectAsList());
+
+    gpu(true);
+    long before = GpuPartitionReader.TASKS.get();
+    List<String> autoRows = sorted(spark.sql(all).collectAsList());
+    long autoTasks = GpuPartitionReader.TASKS.get() - before;
+
+    SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.READ_POLICY, "always");
+    before = GpuPartitionReader.TASKS.get();
+    List<String> alwaysRows = sorted(spark.sql(all).collectAsList());
+    long alwaysTasks = GpuPartitionReader.TASKS.get() - before;
+    SparkEnv.get().conf().remove(GpuPartitionReaderFactoryProvider.READ_POLICY);
+    gpu(false);
+
+    assertThat(autoTasks).as("position deletes stay on Iceberg's reader under auto").isZero();
+    assertThat(alwaysTasks).as("Spark tasks read on the GPU with always").isGreaterThan(0);
+    assertThat(cpuRows)
+        .hasSize(10000 - positions(5000, 0.2, 3).length - positions(5000, 0.05, 4).length);
+    assertThat(autoRows).containsExactlyElementsOf(cpuRows);
+    assertThat(alwaysRows).containsExactlyElementsOf(cpuRows);
+  }
 }

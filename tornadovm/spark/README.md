@@ -48,13 +48,18 @@ The GPU wins when the work stays on the device:
 - **Expensive deletes**: equality deletes, many delete files.
 - **Compaction**: see the project's results.
 
-It does not win on join-heavy queries such as TPC-DS. There Spark's joins run on the CPU, and a
-reader that copies rows back is about as fast as 32 CPU cores reading them, or slower (0.87× geomean
-on TPC-DS SF10). Turn reads off and keep aggregates and compaction with:
+Reads are decided per Spark task, by the kinds of deletes it applies
+(`spark.iceberg.gpu.read.policy`, default `auto`): the GPU reads task groups with **equality
+deletes**, and Iceberg's own reader keeps everything else. Paired runs of the same scans on both
+readers (`spark.iceberg.gpu.scanLog`, `tornadovm/scanfit.py`) showed why:
 
-```
-spark.iceberg.gpu.read.enabled=false
-```
+- Without deletes, and with position deletes or deletion vectors, Iceberg's CPU reader is faster:
+  the GPU won 29 of 690 TPC-DS SF10 scans (186.8 s against 60.8 s of scan time summed), and a full
+  scan of 100M rows took 380-510 ms on the CPU against 475-570 ms on the GPU.
+- With equality deletes the CPU reader probes every row: the GPU read 100M rows in ~500 ms against
+  0.7 s (10K deleted keys) and 2.8-3.3 s (1M keys); with 10M keys the CPU reader ran out of memory.
+
+`always` reads every task group the GPU can on it, `never` none (as `spark.iceberg.gpu.read.enabled=false`).
 
 ## Requirements
 
@@ -102,6 +107,8 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 |---|---|---|
 | `spark.iceberg.gpu.enabled` | `false` | turns all three on (`spark-submit-gpu` sets it) |
 | `spark.iceberg.gpu.read.enabled` | `true` | reads on the GPU (`false` keeps aggregates and compaction on it) |
+| `spark.iceberg.gpu.read.policy` | `auto` | which reads: `auto` task groups with equality deletes, `always`, `never` |
+| `spark.iceberg.gpu.scanLog` | unset | a directory: per-scan timings of both readers, for `tornadovm/scanfit.py` |
 | `spark.iceberg.gpu.minRows` | `1000000` | fewest rows a Spark task must read for the GPU to read it; smaller tasks are faster on Spark's reader |
 | `spark.iceberg.gpu.aggregate.enabled` | `true` | the aggregate strategy |
 | `spark.iceberg.gpu.rewrite.enabled` | `true` | compaction on the GPU |

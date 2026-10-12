@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.tornadovm.spark;
 
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.MetadataColumns;
@@ -63,6 +64,17 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
    * GPU: for join-heavy queries, whose rows Spark's CPU joins would have to get back anyway.
    */
   public static final String READ_ENABLED = "spark.iceberg.gpu.read.enabled";
+
+  /**
+   * Which scans the device reads: {@code auto} (default) only task groups with equality deletes,
+   * {@code always} every task group it can read, {@code never} none. Measured on TPC-DS SF10 and on
+   * 100M-row merge-on-read tables (RTX 4090, 32 Spark threads): Iceberg's CPU reader is faster on
+   * files without deletes and with position deletes or deletion vectors (the device read's fixed
+   * cost and the shared GPU dominate), while the device wins where equality deletes make the CPU
+   * reader probe every row (1.4x at 10K deleted keys, 5.8x at 1M, and 10M runs out of memory on the
+   * CPU).
+   */
+  public static final String READ_POLICY = "spark.iceberg.gpu.read.policy";
 
   /** The name that selects this provider. */
   public static final String NAME = "tornadovm";
@@ -130,6 +142,10 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
         || !env.conf().getBoolean(READ_ENABLED, true)) {
       return null;
     }
+    String policy = env.conf().get(READ_POLICY, "auto");
+    if ("never".equals(policy) || ("auto".equals(policy) && !hasEqualityDeletes(taskGroup))) {
+      return null;
+    }
     if (!DeviceMergeOnReadScan.isAvailable()) {
       LOG.warn("GPU reads are on but TornadoVM with the cuDF shim is not available");
       return null;
@@ -157,6 +173,13 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
       }
     }
     return new GpuPartitionReader(GpuScans.scan(table), taskGroup, expectedSchema);
+  }
+
+  /** Whether any task of the group applies equality deletes. */
+  static boolean hasEqualityDeletes(ScanTaskGroup<FileScanTask> taskGroup) {
+    return taskGroup.tasks().stream()
+        .flatMap(task -> task.deletes().stream())
+        .anyMatch(delete -> delete.content() == FileContent.EQUALITY_DELETES);
   }
 
   /** Whether every expected column is a type the device reads and returns. */
