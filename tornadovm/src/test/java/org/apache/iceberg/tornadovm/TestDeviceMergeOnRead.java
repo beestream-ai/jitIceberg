@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
@@ -472,6 +473,125 @@ public class TestDeviceMergeOnRead {
               () ->
                   device.aggregate(ImmutableList.of(), ImmutableList.of(DeviceValue.of("intCol"))))
           .hasStackTraceContaining("8 bytes");
+    }
+  }
+
+  /**
+   * Decimal columns of up to 18 digits: read as their unscaled values, filtered by a decimal
+   * literal, an equality-delete key, a group key, and summed exactly -- each against Iceberg's own
+   * reader.
+   */
+  @Test
+  public void testDecimalColumns() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "code", Types.DecimalType.of(10, 2)),
+            Types.NestedField.required(3, "price", Types.DecimalType.of(7, 2)),
+            Types.NestedField.optional(4, "amount", Types.DecimalType.of(18, 4)),
+            Types.NestedField.required(5, "band", Types.DecimalType.of(3, 1)));
+    Table table = MorTables.create(temp.resolve("decimals").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              4000,
+              i -> {
+                long id = index * 1_000_000L + i;
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("id", id);
+                record.setField("code", BigDecimal.valueOf(id % 50_000, 2));
+                record.setField(
+                    "price", BigDecimal.valueOf((id * 7919) % 9_999_999 - 4_999_999, 2));
+                record.setField(
+                    "amount",
+                    i % 6 == 0
+                        ? null
+                        : BigDecimal.valueOf(
+                            (i % 2 == 0 ? 1 : -1) * (99_999_999_999_999L - id * 1_234_567L), 4));
+                record.setField("band", BigDecimal.valueOf(id % 5, 1));
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(4000, 9), new long[0], everyNth(4000, 13)));
+    MorTables.deleteEqual(
+        table,
+        "code",
+        ImmutableList.of(BigDecimal.valueOf(5, 2), BigDecimal.valueOf(1_000_007 % 50_000, 2)));
+    table.refresh();
+
+    org.apache.iceberg.expressions.Expression filter =
+        org.apache.iceberg.expressions.Expressions.greaterThan(
+            "price", new BigDecimal("-12345.67"));
+    List<String> expected = Lists.newArrayList();
+    Map<BigDecimal, BigDecimal[]> expectedGroups = new TreeMap<>();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
+      for (Record record : records) {
+        BigDecimal price = (BigDecimal) record.getField("price");
+        if (price.compareTo(new BigDecimal("-12345.67")) <= 0) {
+          continue; // IcebergGenerics applies the filter to files, not rows
+        }
+        BigDecimal amount = (BigDecimal) record.getField("amount");
+        expected.add(
+            flatRow(
+                record.getField("id"),
+                ((BigDecimal) record.getField("code")).unscaledValue().longValueExact(),
+                price.unscaledValue().longValueExact(),
+                amount == null ? null : amount.unscaledValue().longValueExact()));
+        BigDecimal[] sums =
+            expectedGroups.computeIfAbsent(
+                (BigDecimal) record.getField("band"),
+                ignored -> new BigDecimal[] {BigDecimal.ZERO, BigDecimal.ZERO});
+        sums[0] = sums[0].add(price);
+        sums[1] = sums[1].add(BigDecimal.ONE);
+      }
+    }
+    expected.sort(String::compareTo);
+    assertThat(expected).isNotEmpty();
+
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table, filter)) {
+      List<String> actual = java.util.Collections.synchronizedList(Lists.newArrayList());
+      device.materialize(
+          ImmutableList.of("id", "code", "price", "amount"),
+          batch -> {
+            for (int r = 0; r < batch.rows(); r++) {
+              actual.add(
+                  flatRow(
+                      batch.getLong("id", r),
+                      batch.getLong("code", r),
+                      batch.getLong("price", r),
+                      batch.isNull("amount", r) ? null : batch.getLong("amount", r)));
+            }
+          });
+      List<String> sorted = Lists.newArrayList(actual);
+      sorted.sort(String::compareTo);
+      assertThat(sorted).containsExactlyElementsOf(expected);
+
+      // Grouped by a decimal (its unscaled value), the decimal summed as its unscaled value:
+      // exact, as the sums stay far below 2^53.
+      GroupedAggregate groups =
+          device.aggregate(ImmutableList.of("band"), ImmutableList.of(DeviceValue.of("price")));
+      Map<BigDecimal, BigDecimal[]> actualGroups = new TreeMap<>();
+      groups
+          .groups()
+          .forEach(
+              (key, totals) ->
+                  actualGroups.put(
+                      BigDecimal.valueOf((Long) key.get(0), 1),
+                      new BigDecimal[] {
+                        BigDecimal.valueOf((long) totals[0], 2),
+                        BigDecimal.valueOf((long) totals[1])
+                      }));
+      assertThat(actualGroups.keySet()).containsExactlyElementsOf(expectedGroups.keySet());
+      expectedGroups.forEach(
+          (band, sums) -> {
+            assertThat(actualGroups.get(band)[0]).as("sum %s", band).isEqualByComparingTo(sums[0]);
+            assertThat(actualGroups.get(band)[1]).as("rows %s", band).isEqualByComparingTo(sums[1]);
+          });
     }
   }
 

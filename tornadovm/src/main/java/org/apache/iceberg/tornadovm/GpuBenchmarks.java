@@ -52,7 +52,7 @@ public final class GpuBenchmarks {
             kind[c] =
                 switch (field.type().typeId()) {
                   case INTEGER, DATE -> 'i';
-                  case LONG, TIMESTAMP -> 'l';
+                  case LONG, TIMESTAMP, DECIMAL -> 'l';
                   case FLOAT, DOUBLE -> 'd';
                   case STRING -> 's';
                   default -> throw new UnsupportedOperationException("Column " + field);

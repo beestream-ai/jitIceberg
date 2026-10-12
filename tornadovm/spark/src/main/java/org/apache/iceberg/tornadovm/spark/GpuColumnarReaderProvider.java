@@ -88,6 +88,12 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
       }
       switch (field.type().typeId()) {
         case INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING -> {}
+        case DECIMAL -> {
+          // Unscaled in an INT64, so up to 18 digits.
+          if (((Types.DecimalType) field.type()).precision() > 18) {
+            return false;
+          }
+        }
         default -> {
           return false;
         }

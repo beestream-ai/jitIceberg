@@ -145,7 +145,8 @@ final class HostColumnVector extends ColumnVector {
 
   @Override
   public Decimal getDecimal(int rowId, int precision, int scale) {
-    throw new UnsupportedOperationException("Decimal columns are not read on the device");
+    // A decimal of up to 18 digits, held as its unscaled value at the column's scale.
+    return isNullAt(rowId) ? null : Decimal.createUnsafe(longs[rowId], precision, scale);
   }
 
   @Override

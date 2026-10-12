@@ -146,7 +146,7 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
               batch.copyInts(column, values);
               yield HostColumnVector.ofInts(type, values, nulls);
             }
-            case LONG, TIMESTAMP -> {
+            case LONG, TIMESTAMP, DECIMAL -> {
               long[] values = new long[rows];
               batch.copyLongs(column, values);
               yield HostColumnVector.ofLongs(type, values, nulls);
