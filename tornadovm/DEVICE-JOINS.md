@@ -261,6 +261,25 @@ queries where RAPIDS saves most:
 Order: q72 as a prototype through the Java API (as q22 was), then the large-group stars (q4
 family), then sales-returns.
 
+**q72 planned from Spark (2026-10-13, `ProbeAggregates.scala`, opt-in
+`spark.iceberg.gpu.aggregate.probe`):** an aggregate over joins of two fact tables. The largest
+table and the dimensions that join it -- directly, or through an equality with its columns (q72's
+item joins `cs_item_sk`, equal to `inv_item_sk`) -- are the probe side, a star on the device. The
+second largest, which must itself be larger than a dimension, with its own dimensions, its
+conditions (q72's `d3.d_date > d1.d_date + 5`) and the left outer joins on its columns (promotion,
+returns) is the build side: a plan Spark runs and collects, side by side with the dimensions.
+Equalities between the sides are the probe key's parts -- a probe-side column or a dimension's
+integer attribute against a build-side expression, each part offset by the build side's minimum
+and range-checked on the device so parts cannot alias -- and one comparison filters the joined
+rows. A build-side group key equal to a probe-side attribute (q72's `d1.d_week_seq`, equal to
+`d2.d_week_seq`) groups by the latter. **TPC-DS q72: 11.76 to 1.04 s from Spark, the same
+answer** (RAPIDS 5.5 s); the whole suite with stars and probes **127.0 to 111.1 s, 1.13x
+geomean, 102/102 equal**. A first version also took count-only stars (q88) with a dimension as
+the build side, slower than Spark; the build side must now be a fact table. The test
+(`testProbeAggregates`) runs q72's shape on small tables. A star that fails is now remembered
+by its aggregate's canonical plan, column names and snapshots (the build plan's aliases are new
+every planning).
+
 **Sales with their returns (measured 2026-10-13, `metrics.py`):** q50, q17, q25, q29 and q93 (1.3
 to 2.5 s each, ~10.6 s together) all sort-merge join `store_sales` (28.2M rows) with
 `store_returns` (2.8M) on (customer, item, ticket) for ~1.9M matches -- the 28M-row sort
