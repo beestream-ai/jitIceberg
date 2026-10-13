@@ -365,6 +365,22 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     // Spark's DecimalAggregates has already turned SUM and AVG of a short decimal into ones of its
     // unscaled value: what the device sums.
     case UnscaledValue(a: AttributeReference) if exactType(a.dataType) => exactColumn(table, a, nulls)
+    // A sum or difference of decimals of the result's scale (TPC-DS q11's ext_list_price -
+    // ext_discount_amt): the unscaled values add up the same way.
+    case UnscaledValue(e @ (_: Add | _: Subtract)) =>
+      val scale = e.dataType.asInstanceOf[DecimalType].scale
+      exactTerms(table, e, nulls, {
+        case a: AttributeReference => a.dataType match {
+          case d: DecimalType => d.scale == scale
+          case _ => false
+        }
+        case _ => false
+      })
+    case e @ (_: Add | _: Subtract) if e.dataType == LongType || e.dataType == IntegerType =>
+      exactTerms(table, e, nulls, {
+        case a: AttributeReference => a.dataType == LongType || a.dataType == IntegerType
+        case _ => false
+      })
     // A decimal widened at its scale (a CASE's common type, say) keeps its unscaled value.
     case Cast(a: AttributeReference, to: DecimalType, _, _) if (a.dataType match {
           case from: DecimalType => from.scale == to.scale && from.precision <= to.precision
@@ -421,6 +437,46 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     case a: AttributeReference if a.dataType == IntegerType || a.dataType == LongType => Some(a)
     case _ => None
   }
+
+  /** {@code e} as signed columns, each accepted by {@code column}. */
+  private def signedColumns(
+      e: Expression,
+      column: Expression => Boolean): Option[Seq[(Double, AttributeReference)]] = e match {
+    case Add(l, r, _) => for (a <- signedColumns(l, column); b <- signedColumns(r, column)) yield a ++ b
+    case Subtract(l, r, _) =>
+      for (a <- signedColumns(l, column); b <- signedColumns(r, column))
+        yield a ++ b.map { case (s, c) => (-s, c) }
+    case Cast(c, to: DecimalType, _, _) if (c.dataType match {
+          case from: DecimalType => from.scale == to.scale && from.precision <= to.precision
+          case _ => false
+        }) =>
+      signedColumns(c, column)
+    case Cast(a: AttributeReference, LongType, _, _) if a.dataType == IntegerType && column(a) =>
+      Some(Seq(1.0 -> a))
+    case a: AttributeReference if column(a) => Some(Seq(1.0 -> a))
+    case _ => None
+  }
+
+  private def exactTerms(
+      table: org.apache.iceberg.Table,
+      e: Expression,
+      nulls: Boolean,
+      column: Expression => Boolean): Either[String, DeviceValue] =
+    signedColumns(e, column) match {
+      case Some(terms) if terms.size <= DeviceValue.MAX_FACTORS =>
+        for {
+          names <- traverse(terms.map(_._2))(a => field(table, a).map(_.name()))
+          _ <- traverse(terms.map(_._2))(a => valueMayBeNull(table, a, nulls))
+          _ <-
+            if (GpuAggregates.exactTerms(table, names.map(n => List(n).asJava).asJava)) Right(())
+            else Left(s"sum of $e may not be exact in doubles")
+        } yield terms.zip(names).tail.foldLeft(
+          if (terms.head._1 > 0) DeviceValue.of(names.head) else DeviceValue.of(names.head).negate()) {
+          case (value, ((sign, _), name)) =>
+            if (sign > 0) value.plus(DeviceValue.of(name)) else value.minus(DeviceValue.of(name))
+        }
+      case _ => Left(s"aggregate of $e")
+    }
 
   private def exactType(dataType: DataType): Boolean = dataType match {
     case IntegerType | LongType => true

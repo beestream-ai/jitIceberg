@@ -356,6 +356,22 @@ public final class GpuAggregates {
     return high < low || high - low + 1 <= Math.max(floor, perRow * rows(table));
   }
 
+  /**
+   * Whether the device's doubles hold the sum of a sum of terms exactly: rows times the sum of each
+   * term's largest magnitude (the product of its columns') below 2^53.
+   */
+  public static boolean exactTerms(Table table, List<List<String>> terms) {
+    double bound = 0;
+    for (List<String> term : terms) {
+      double product = 1;
+      for (String column : term) {
+        product *= largest(table, column);
+      }
+      bound += product;
+    }
+    return rows(table) * bound < 0x1p53;
+  }
+
   private static double rows(Table table) {
     Snapshot snapshot = table.currentSnapshot();
     return snapshot == null

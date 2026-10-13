@@ -113,7 +113,7 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 | `spark.iceberg.gpu.aggregate.enabled` | `true` | the aggregate strategy |
 | `spark.iceberg.gpu.aggregate.nullable` | `false` | aggregates of columns that may hold nulls (SUM and AVG skip nulls, COUNT(column) counts the rest). Off by default: on TPC-DS it moves many small scalar subqueries to one device scan each, slower than Spark (q9 1.5 s to 4.3 s) |
 | `spark.iceberg.gpu.aggregate.star` | `false` | star aggregates: an aggregate over inner joins of one Iceberg fact table with small dimensions, the joins done on the device by key lookup (`tornadovm/DEVICE-JOINS.md`). TPC-DS SF10: 20 star queries 1.37x geomean, the whole suite 1.08x |
-| `spark.iceberg.gpu.aggregate.star.maxGroups` | `131072` | most finest groups a star may produce (the product of its dimensions' attribute tuples); larger ones run on Spark |
+| `spark.iceberg.gpu.aggregate.star.maxGroups` | `4194304` | most finest groups a star may produce (the product of its dimensions' attribute tuples); larger ones run on Spark |
 | `spark.iceberg.gpu.aggregate.star.maxDimensionRows` | `10000000` | largest table a star treats as a dimension |
 | `spark.iceberg.gpu.aggregate.probe` | `false` | probe aggregates: an aggregate over joins of two fact tables -- the larger with its dimensions on the device, the other side a plan Spark runs and collects, joined on equalities (and one comparison) between the two. TPC-DS q72 11.8 to 1.1 s |
 | `spark.iceberg.gpu.aggregate.probe.maxBuildRows` | `20000000` | most rows the collected side may have; more and Spark runs the aggregate |

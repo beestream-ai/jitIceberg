@@ -263,7 +263,7 @@ object StarAggregates extends PredicateHelper {
   private[gpu] def maxGroups: Double = {
     val env = Option(org.apache.spark.SparkEnv.get).map(_.conf)
     org.apache.spark.sql.internal.SQLConf.get
-      .getConfString(MaxGroups, env.map(_.get(MaxGroups, "131072")).getOrElse("131072"))
+      .getConfString(MaxGroups, env.map(_.get(MaxGroups, "4194304")).getOrElse("4194304"))
       .toDouble
   }
 
