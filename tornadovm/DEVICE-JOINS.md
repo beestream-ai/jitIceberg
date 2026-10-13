@@ -361,7 +361,8 @@ SPI:
 - `GroupedStage` (core): the columns a stage reads, how many values it adds after the scan's,
   a shape for region reuse, and an `Instance` per region with hooks after the filter, the group
   keys and the values; it may group the rows itself (`groups()` / `collect`) and uploads its
-  buffers once a run (`stage`). `DeviceMergeOnReadScan.aggregate(groupColumns, values, stage)`
+  buffers once a run (`stage`). A stage that groups can fold its batches itself and report once,
+  after the run's last batch (`GroupedStage.finish`). `DeviceMergeOnReadScan.aggregate(groupColumns, values, stage)`
   runs it; `GroupedStage.Context` hands it the region's buffers and column slots.
 - `join.StarStage` implements it: the star filter and keys, the probe, the probe's sums, the dense
   aggregation. `join.JoinKernels` holds those kernels, `join.DeviceDimension` and
@@ -372,6 +373,14 @@ SPI:
   as SQL's `a - COALESCE(b, 0)` is null where `a` is (q80's profit was wrong without it).
 - Spark keeps the same split: `StarAggregates`/`ProbeAggregates` translate probe sums to
   placeholder slots and remap them after the fact's values (`DeviceAggregate.remap`).
+
+**Large-group stars (2026-10-13):** a star's dense groups used to go into the result's map each
+batch, a boxed key a group a batch; with ~500K customers (q23, q11, q74, q4) that copy-back was
+~0.8 s a star. `StarStage` now folds each batch into a flat array on the host and emits the groups
+once (`finish`): copy-back 75-140 ms. In Spark, group keys that are exactly the finest attributes
+leave each finest group its own output group (a dimension's codes are distinct tuples), so the
+driver skips its merge map. q11 1.27 to 0.89 s, q74 1.25 to 0.84 s, q4 1.92 to 1.48 s, q23a/b
+3.06/3.59 to 2.86/3.18 s, the same answers.
 
 Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
 (stars, probes, key ranges, build sums, left outer).

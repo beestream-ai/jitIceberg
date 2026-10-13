@@ -324,6 +324,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           streams,
           planned,
           (region, executed) -> ((GroupedRegion) region).collect(executed, result));
+      if (stage != null) {
+        stage.finish(result);
+      }
     } finally {
       busy(streams, false);
     }

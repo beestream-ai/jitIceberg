@@ -58,6 +58,11 @@ final class StarStage implements GroupedStage {
   private final int denseGroups;
   private final int denseCapacity;
   private final int probeCapacity;
+  // The run's dense groups folded over its batches on the host: per column of the dense output,
+  // denseGroups totals. Merging every batch's groups into the result's map would cost a boxed key
+  // a group a batch (q23's ~500K customers: ~1 s a star).
+  private double[] folded;
+  private int[] foldedCounts;
 
   StarStage(
       List<DeviceDimension> dimensions,
@@ -161,6 +166,57 @@ final class StarStage implements GroupedStage {
   @Override
   public Instance open(Context context) {
     return new Stream(context);
+  }
+
+  /**
+   * Adds a batch's dense output ({@code columns} columns of {@code denseCapacity} doubles: the
+   * sums, the row count, the non-null counts) to the run's totals; returns the batch's live rows.
+   */
+  private synchronized long fold(DoubleArray out, int columns, int[] countColumns) {
+    if (folded == null) {
+      folded = new double[columns * denseGroups];
+      foldedCounts = countColumns;
+    }
+    for (int c = 0; c < columns; c++) {
+      long from = (long) c * denseCapacity;
+      int to = c * denseGroups;
+      for (int g = 0; g < denseGroups; g++) {
+        folded[to + g] += out.get(from + g);
+      }
+    }
+    double rows = 0;
+    for (int g = 0; g < denseGroups; g++) {
+      rows += out.get((long) countColumns.length * denseCapacity + g);
+    }
+    return (long) rows;
+  }
+
+  /** Every dense group with rows, its key the codes its index holds. */
+  @Override
+  public synchronized void finish(GroupedAggregate result) {
+    if (folded == null) {
+      return;
+    }
+    int values = foldedCounts.length;
+    double[] sums = new double[values];
+    double[] nonNull = new double[values];
+    for (int g = 0; g < denseGroups; g++) {
+      double rows = folded[values * denseGroups + g];
+      if (rows == 0) {
+        continue;
+      }
+      List<Object> key = Lists.newArrayListWithCapacity(keys.size());
+      for (int k = 0; k < keys.size(); k++) {
+        key.add((long) ((g / multipliers[k]) % cardinalities[k]));
+      }
+      for (int v = 0; v < values; v++) {
+        sums[v] = folded[v * denseGroups + g];
+        int count = foldedCounts[v];
+        nonNull[v] = count < 0 ? rows : folded[(values + 1 + count) * denseGroups + g];
+      }
+      result.add(key, sums, rows, nonNull);
+    }
+    folded = null;
   }
 
   /** The star's buffers and kernels on one device stream. */
@@ -370,35 +426,17 @@ final class StarStage implements GroupedStage {
       return denseCapacity > 0;
     }
 
-    /** A dense batch: every group with rows, its key the codes its index holds. */
+    /** A dense batch, folded into the run's totals ({@link StarStage#finish}). */
     @Override
     public long collect(TornadoExecutionResult executed, GroupedAggregate result) {
       int values = context.valueCount();
       executed.transferToHost(
           new DataRange(denseOut).withOffset(0).withSize((long) columns * denseCapacity));
-      long liveRows = 0;
-      double[] sums = new double[values];
-      double[] nonNull = new double[values];
-      int groupKeys = context.groupKeys();
-      for (int g = 0; g < current.denseGroups; g++) {
-        double rows = denseOut.get((long) values * denseCapacity + g);
-        if (rows == 0) {
-          continue;
-        }
-        List<Object> key = Lists.newArrayListWithCapacity(groupKeys);
-        for (int k = 0; k < groupKeys; k++) {
-          key.add((long) ((g / current.multipliers[k]) % current.cardinalities[k]));
-        }
-        for (int v = 0; v < values; v++) {
-          sums[v] = denseOut.get((long) v * denseCapacity + g);
-          int count = context.countColumn(v);
-          nonNull[v] =
-              count < 0 ? rows : denseOut.get((long) (values + 1 + count) * denseCapacity + g);
-        }
-        result.add(key, sums, rows, nonNull);
-        liveRows += (long) rows;
+      int[] countColumns = new int[values];
+      for (int v = 0; v < values; v++) {
+        countColumns[v] = context.countColumn(v);
       }
-      return liveRows;
+      return current.fold(denseOut, columns, countColumns);
     }
 
     @Override

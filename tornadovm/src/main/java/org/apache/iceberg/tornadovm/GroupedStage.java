@@ -55,6 +55,12 @@ public interface GroupedStage {
   /** The stage's buffers and kernels for one device stream. */
   Instance open(Context context);
 
+  /**
+   * After the run's last batch, once: a stage whose instances fold their groups across batches
+   * instead of merging each batch's into the result ({@link Instance#collect}) reports them here.
+   */
+  default void finish(GroupedAggregate result) {}
+
   /** A stage on one device stream. */
   interface Instance {
     /** Takes a run's data, which reaches the device with the next batch ({@link #stage}). */
@@ -77,7 +83,10 @@ public interface GroupedStage {
       return false;
     }
 
-    /** A batch's groups, merged into {@code result}, when the stage groups; its live rows. */
+    /**
+     * A batch's groups, when the stage groups: merged into {@code result}, or folded until {@link
+     * GroupedStage#finish}; its live rows.
+     */
     default long collect(TornadoExecutionResult executed, GroupedAggregate result) {
       throw new UnsupportedOperationException("The stage does not group");
     }
