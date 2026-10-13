@@ -120,7 +120,8 @@ case class GpuStarAggregateSpec(
       import scala.concurrent.{Await, Future}
       import scala.concurrent.ExecutionContext.Implicits.global
       val jobs = dimensions.map(d => Future(StarAggregates.build(session, d)))
-      val buildRows = probe.map(p => Future(ProbeAggregates.collect(session, p)))
+      val execution = GpuAggregateExec.execution
+      val buildRows = probe.map(p => Future(ProbeAggregates.collect(session, p, execution)))
       val dims = jobs.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
       buildSide = buildRows.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
       dims
@@ -855,25 +856,32 @@ object StarAggregates extends PredicateHelper {
         size() > 32
     })
 
-  private def dimensionKey(d: StarDimension): Option[String] = {
-    val snapshots = d.plan.collect { case r: DataSourceV2ScanRelation => r }.map { r =>
+  private def dimensionKey(d: StarDimension): Option[String] =
+    planKey(
+      Project((d.key +: d.attributes) ++ d.probeAttributes, d.plan),
+      d.factColumn + "|" + (d.key +: d.attributes).map(_.name).mkString(",") + "|" +
+        d.probeAttributes.map(_.name).mkString(","))
+
+  /**
+   * A plan's identity across queries and runs, for what is built from its rows: its tables'
+   * snapshots, its columns' names (a canonical plan names every attribute "none" and refers to
+   * columns by position, so two dimensions on the same table reading other columns, q42's item
+   * categories and q52's brands, look alike otherwise) and its canonical form. None for a plan
+   * over a query stage of adaptive execution (a semi join's side), which hides its tables.
+   */
+  private[gpu] def planKey(plan: LogicalPlan, extra: String): Option[String] = {
+    val snapshots = plan.collect { case r: DataSourceV2ScanRelation => r }.map { r =>
       GpuAggregateStrategy.currentTable(r).toOption.map { t =>
         s"${t.location()}@${Option(t.currentSnapshot()).map(_.snapshotId()).orNull}"
       }
     }
-    // A canonical plan names every attribute "none" and refers to columns by position: two
-    // dimensions on the same table reading other columns (q42's item categories, q52's brands)
-    // look alike unless the columns' names are part of the key too.
-    val columns = d.plan.collect { case r: DataSourceV2ScanRelation => r.output.map(_.name) }
-    // A query stage of adaptive execution (a semi join's side) hides its tables: not cached.
-    val staged = d.plan.exists(_.isInstanceOf[org.apache.spark.sql.execution.adaptive.LogicalQueryStage])
+    val columns = plan.collect { case r: DataSourceV2ScanRelation => r.output.map(_.name) }
+    val staged = plan.exists(_.isInstanceOf[org.apache.spark.sql.execution.adaptive.LogicalQueryStage])
     if (staged || snapshots.exists(_.isEmpty)) None
     else
       Some(
-        snapshots.flatten.mkString(",") + "|" + d.factColumn + "|" + columns.mkString(";") + "|" +
-          (d.key +: d.attributes).map(_.name).mkString(",") + "|" +
-          d.probeAttributes.map(_.name).mkString(",") + "|" +
-          Project((d.key +: d.attributes) ++ d.probeAttributes, d.plan).canonicalized.toString)
+        snapshots.flatten.mkString(",") + "|" + extra + "|" + columns.mkString(";") + "|" +
+          plan.output.map(_.name).mkString(",") + "|" + plan.canonicalized.toString)
   }
 
   private[gpu] def build(session: SparkSession, d: StarDimension): Built =

@@ -629,7 +629,12 @@ public class TestSparkGpuAggregates {
             + " JOIN stock ON cs_item_sk = inv_item_sk JOIN wh ON wh_sk = inv_wh_sk"
             + " JOIN dd d1 ON cs_sold_date_sk = d1.dd_sk JOIN dd d2 ON inv_date_sk = d2.dd_sk"
             + " WHERE d1.dd_week = d2.dd_week AND inv_qoh < cs_qty GROUP BY wh_name";
-    for (String query : ImmutableList.of(sql, sums)) {
+    // q64's cs_ui: a composite-key join, grouped by a fact column, a build-side decimal sum.
+    String grouped =
+        "SELECT inv_item_sk, sum(inv_qoh), sum(cast(cs_qty AS decimal(9, 2))), count(*)"
+            + " FROM stock JOIN sales ON cs_item_sk = inv_item_sk AND cs_sold_date_sk = inv_date_sk"
+            + " GROUP BY inv_item_sk";
+    for (String query : ImmutableList.of(sql, sums, grouped)) {
       Answer cpu = run(query);
       gpu(true);
       // These tables are small: a table over 1,000 rows is a fact, as sales is.

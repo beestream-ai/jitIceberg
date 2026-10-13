@@ -412,7 +412,20 @@ need the weight as the row count first. q93's value multiplies a fact and a buil
 joined row, which build sums cannot express. q10/q35/q69's existence joins sit on `customer` in
 queries whose largest table is `customer_demographics` and whose aggregates read dimension
 columns (MIN/MAX), not a star. q16/q94's NOT EXISTS carry a non-equality (`<>` warehouse).
-Each change on its own moved no query, so none is committed.
+Each change on its own moved no query, so none was committed then.
+
+**Grouped probes (2026-10-14):** the three together, with (3) solved: cuDF's row count is a summed
+column of ones that `applyWeights` already weighs, so a probe grouped by a fact column counts
+joined rows (`join.TestStarAggregation.testGroupedProbeWeights`, repeated build keys, no
+dimension). The probe planner now takes a fact group key whose files' bounds span at most 2^18
+keys, a composite-key build table of any size, decimal build sums, and no dimension at all. The
+build's host work got cheaper (a primitive merge sort of the build keys instead of boxed indices
+under a comparator; key packing in a loop), and a query run that collects the same build side
+twice (q64's cross_sales) collects it once -- only within that run: a cache across runs made the
+repeated benchmark runs reuse the build (q72 0.39 s, q25 0.23 s) where Spark and RAPIDS compute
+it again, so it is scoped to the SQL execution. q49 1.30 to 0.55 s, q80 2.32 to 1.86 s, the same
+answers; q64's `cs_ui` runs on the device but collecting 1.4M returns rows (~1.6 s, twice) eats
+its gain: q64 is unchanged.
 
 Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
 (stars, probes, key ranges, build sums, left outer).

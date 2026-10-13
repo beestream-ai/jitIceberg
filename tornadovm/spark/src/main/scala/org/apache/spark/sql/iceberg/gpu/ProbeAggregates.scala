@@ -22,6 +22,7 @@ import org.apache.iceberg.tornadovm.join.DeviceDimension
 import org.apache.iceberg.tornadovm.join.DeviceProbe
 import org.apache.iceberg.tornadovm.join.StarAggregation.ProbeSum
 import org.apache.iceberg.tornadovm.DeviceValue
+import org.apache.iceberg.tornadovm.spark.GpuAggregates
 import org.apache.iceberg.types.Type.TypeID
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.SparkSession
@@ -50,6 +51,9 @@ import scala.collection.mutable
 object ProbeAggregates extends PredicateHelper {
   val Enabled = "spark.iceberg.gpu.aggregate.probe"
   val MaxBuildRows = "spark.iceberg.gpu.aggregate.probe.maxBuildRows"
+
+  // Most keys a fact group key may span by its files' bounds: the groups stay few.
+  private val FactKeySpan = 1 << 18
 
   import GpuAggregateStrategy.traverse
   import GpuAggregateStrategy.substitute
@@ -86,18 +90,9 @@ object ProbeAggregates extends PredicateHelper {
       // (a small one could otherwise attach through its join with the fact).
       others = sized.filter(_._1 ne factLeaf)
       _ <- if (others.nonEmpty) Right(()) else Left("one table")
-      (buildFact, _, buildFactRows) = others.maxBy(_._3)
-      // Two fact tables: a build side that is itself a dimension is a star's job (TPC-DS q88's
-      // count-only stars, slower as probes than on Spark).
-      _ <-
-        if (buildFactRows > StarAggregates.dimensionRowLimit) Right(())
-        else Left(s"no second fact table (the largest other has $buildFactRows rows)")
-      // The probe side's dimensions: small leaves joined by their key to a probe-side column,
-      // directly or through equalities.
-      attached = others.filter(_._1 ne buildFact).flatMap { case (leaf, _, rows) =>
-        // A dimension joins by one key; a table joined to the fact by several equalities (TPC-DS
-        // store_returns: customer, item, ticket) is another fact, on the build side.
-        val links = conditions.count {
+      // How many equalities join a leaf to the probe fact's columns, directly or through others.
+      links = (leaf: LogicalPlan) =>
+        conditions.count {
           case EqualTo(a: Attribute, b: Attribute) =>
             (leaf.outputSet.contains(a) && !leaf.outputSet.contains(b) &&
               factAttribute(b, equivalent, factOutput).isDefined) ||
@@ -105,7 +100,19 @@ object ProbeAggregates extends PredicateHelper {
                 factAttribute(a, equivalent, factOutput).isDefined)
           case _ => false
         }
-        if (rows > StarAggregates.dimensionRowLimit || links != 1) None
+      (buildFact, _, buildFactRows) = others.maxBy(_._3)
+      // Two fact tables: a build side that is itself a dimension is a star's job (TPC-DS q88's
+      // count-only stars, slower as probes than on Spark). A table joined to the fact by a
+      // composite key (returns by item and order, q64's) is no dimension, whatever its size.
+      _ <-
+        if (buildFactRows > StarAggregates.dimensionRowLimit || links(buildFact) >= 2) Right(())
+        else Left(s"no second fact table (the largest other has $buildFactRows rows)")
+      // The probe side's dimensions: small leaves joined by their key to a probe-side column,
+      // directly or through equalities.
+      attached = others.filter(_._1 ne buildFact).flatMap { case (leaf, _, rows) =>
+        // A dimension joins by one key; a table joined to the fact by several equalities (TPC-DS
+        // store_returns: customer, item, ticket) is another fact, on the build side.
+        if (rows > StarAggregates.dimensionRowLimit || links(leaf) != 1) None
         else
           conditions.collectFirst {
             case EqualTo(k: Attribute, other: Attribute)
@@ -196,9 +203,22 @@ object ProbeAggregates extends PredicateHelper {
         case named => swap(named).asInstanceOf[NamedExpression]
       }
       keyInputs = AttributeSet(groupExpressions.flatMap(_.references))
+      // A fact column as a group key, when its values span few keys by the files' bounds (q64's
+      // item): cuDF groups the weighted rows.
+      factKeys <- traverse(keyInputs.toSeq.filter(factOutput.contains)) { a =>
+        substitute(a, factAliases) match {
+          case c: AttributeReference =>
+            GpuAggregateStrategy.groupColumn(table, c).flatMap { column =>
+              if (GpuAggregates.denseKeys(table, column, 0.0, FactKeySpan.toDouble)) Right(a -> column)
+              else Left(s"fact group key $column spans more than $FactKeySpan keys")
+            }
+          case other => Left(s"a fact group key that is not a column: $other")
+        }
+      }
       _ <-
-        if (keyInputs.forall(a => dimensionLeaves.exists(_.outputSet.contains(a)))) Right(())
-        else Left(s"group keys not over the probe side's dimensions: $keyInputs")
+        if (keyInputs.forall(a => factOutput.contains(a) || dimensionLeaves.exists(_.outputSet.contains(a))))
+          Right(())
+        else Left(s"group keys not over the probe side: $keyInputs")
       dimensions <- traverse(attached.indices) { d =>
         val (leaf, key, factColumnAttribute) = attached(d)
         val filters = classified.collect { case DimensionFilter(`d`, c) => c }
@@ -252,7 +272,7 @@ object ProbeAggregates extends PredicateHelper {
       table,
       factFilter,
       dimensions,
-      Nil,
+      factKeys,
       deviceValues,
       Nil,
       aggregates,
@@ -276,6 +296,11 @@ object ProbeAggregates extends PredicateHelper {
     def add(e: Expression): Either[String, Int] = e.dataType match {
       case IntegerType | LongType | DoubleType =>
         buildValues += e
+        Right(StarAggregates.ProbeSlot + buildValues.size - 1)
+      // A decimal sums as its unscaled value, checked exact when collected, scaled back as the
+      // fact's decimal sums are (q64's sum of refunds, credits and charges).
+      case d: DecimalType if d.precision <= Decimal.MAX_LONG_DIGITS =>
+        buildValues += UnscaledValue(e)
         Right(StarAggregates.ProbeSlot + buildValues.size - 1)
       case other => Left(s"build-side aggregate of $other: $ae")
     }
@@ -400,7 +425,31 @@ object ProbeAggregates extends PredicateHelper {
   /** The build side's rows: each key part's value, then the compared value. */
   case class BuildRows(parts: Array[Array[Long]], compared: Array[Long], sums: Array[Array[Double]])
 
-  private[gpu] def collect(session: SparkSession, probe: StarProbe): BuildRows = {
+  /**
+   * Collected build sides by the query run, their plan and tables' snapshots: a query that
+   * repeats a subquery (q64's cross_sales, twice) collects it once. Not across runs: each run of a
+   * query collects its build sides again, as Spark computes its joins again.
+   */
+  private val collected = java.util.Collections.synchronizedMap(
+    new java.util.LinkedHashMap[String, BuildRows](8, 0.75f, true) {
+      override def removeEldestEntry(eldest: java.util.Map.Entry[String, BuildRows]): Boolean =
+        size() > 4
+    })
+
+  private[gpu] def collect(session: SparkSession, probe: StarProbe, execution: Option[String]): BuildRows =
+    execution.flatMap { run =>
+      StarAggregates.planKey(probe.build, s"$run|${probe.parts.size}|${probe.comparison.isDefined}|${probe.sums.size}")
+    } match {
+      case Some(key) =>
+        Option(collected.get(key)).getOrElse {
+          val rows = collectNow(session, probe)
+          collected.put(key, rows)
+          rows
+        }
+      case None => collectNow(session, probe)
+    }
+
+  private def collectNow(session: SparkSession, probe: StarProbe): BuildRows = {
     val rows = Dataset.ofRows(session, probe.build).queryExecution.executedPlan.executeCollect()
     if (rows.length > maxBuildRows) {
       throw new UnsupportedOperationException(s"a build side of ${rows.length} rows")
@@ -462,8 +511,14 @@ object ProbeAggregates extends PredicateHelper {
       }
       weight *= ranges(p)
     }
-    val keys = Array.tabulate(rows.compared.length) { r =>
-      (0 until n).map(p => (rows.parts(p)(r) - offsets(p)) * multipliers(p)).sum
+    val keys = new Array[Long](rows.compared.length)
+    for (p <- 0 until n) {
+      val part = rows.parts(p)
+      var r = 0
+      while (r < keys.length) {
+        keys(r) += (part(r) - offsets(p)) * multipliers(p)
+        r += 1
+      }
     }
     var withCodes = built.map(_._1).toArray
     var deviceProbe = DeviceProbe.of(keys, rows.compared, java.util.Arrays.asList(rows.sums: _*))

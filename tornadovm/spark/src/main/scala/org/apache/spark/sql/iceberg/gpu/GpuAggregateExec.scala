@@ -318,14 +318,23 @@ object GpuAggregateExec {
         size() > 64
     })
 
+  /** The SQL execution (one run of a query) an aggregate computes for, on its thread. */
+  private val executions = new ThreadLocal[String]
+
+  private[gpu] def execution: Option[String] = Option(executions.get())
+
   private[gpu] def start(exec: GpuAggregateExec): Long = {
     val id = ids.incrementAndGet()
     val session = exec.session
+    val execution = exec.sparkContext.getLocalProperty(
+      org.apache.spark.sql.execution.SQLExecution.EXECUTION_ID_KEY)
     results.put(
       id,
       threads.submit { () =>
         org.apache.spark.sql.SparkSession.setActiveSession(session)
-        exec.compute()
+        executions.set(execution)
+        try exec.compute()
+        finally executions.remove()
       })
     id
   }
