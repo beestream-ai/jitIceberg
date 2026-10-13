@@ -49,7 +49,7 @@ public final class DeviceProbe {
    * value less {@code offset}, which must lie in [0, {@code range}) for the row to join anything,
    * times {@code multiplier}.
    */
-  record Part(String column, int dimension, int attribute, int multiplier, int offset, int range) {
+  record Part(String column, int dimension, int attribute, long multiplier, int offset, int range) {
     boolean isAttribute() {
       return dimension >= 0;
     }
@@ -60,18 +60,38 @@ public final class DeviceProbe {
   private final List<Part> parts;
   private final String column;
   private final Comparison comparison;
+  private final List<double[]> sums;
 
   private DeviceProbe(
-      long[] keys, long[] values, List<Part> parts, String column, Comparison comparison) {
+      long[] keys,
+      long[] values,
+      List<Part> parts,
+      String column,
+      Comparison comparison,
+      List<double[]> sums) {
     this.keys = keys;
     this.values = values;
     this.parts = parts;
     this.column = column;
     this.comparison = comparison;
+    this.sums = sums;
   }
 
   /** The build rows: a key and a value each, in any order. */
   public static DeviceProbe of(long[] keys, long[] values) {
+    return of(keys, values, ImmutableList.of());
+  }
+
+  /**
+   * The build rows, with build-side columns ({@code NaN} for null) that {@link
+   * DeviceValue#probe(int)} sums over each fact row's joined rows, in the order given.
+   */
+  public static DeviceProbe of(long[] keys, long[] values, List<double[]> columns) {
+    for (double[] column : columns) {
+      if (column.length != keys.length) {
+        throw new IllegalArgumentException(column.length + " values for " + keys.length + " keys");
+      }
+    }
     if (keys.length != values.length) {
       throw new IllegalArgumentException(keys.length + " keys for " + values.length + " values");
     }
@@ -82,15 +102,21 @@ public final class DeviceProbe {
     Arrays.sort(order, (a, b) -> Long.compare(keys[a], keys[b]));
     long[] sortedKeys = new long[keys.length];
     long[] sortedValues = new long[keys.length];
+    List<double[]> sortedSums = new java.util.ArrayList<>();
+    columns.forEach(c -> sortedSums.add(new double[keys.length]));
     for (int i = 0; i < order.length; i++) {
       sortedKeys[i] = keys[order[i]];
       sortedValues[i] = values[order[i]];
+      for (int c = 0; c < columns.size(); c++) {
+        sortedSums.get(c)[i] = columns.get(c)[order[i]];
+      }
     }
-    return new DeviceProbe(sortedKeys, sortedValues, ImmutableList.of(), null, Comparison.ANY);
+    return new DeviceProbe(
+        sortedKeys, sortedValues, ImmutableList.of(), null, Comparison.ANY, sortedSums);
   }
 
   /** Adds {@code column * multiplier} of the fact row to its key. */
-  public DeviceProbe keyColumn(String factColumn, int multiplier) {
+  public DeviceProbe keyColumn(String factColumn, long multiplier) {
     return keyColumn(factColumn, multiplier, 0, Integer.MAX_VALUE);
   }
 
@@ -98,24 +124,24 @@ public final class DeviceProbe {
    * Adds {@code (column - offset) * multiplier} to the key; a row whose column is outside [offset,
    * offset + range) joins nothing, so parts cannot alias one another.
    */
-  public DeviceProbe keyColumn(String factColumn, int multiplier, int offset, int range) {
+  public DeviceProbe keyColumn(String factColumn, long multiplier, int offset, int range) {
     return with(new Part(factColumn, -1, -1, multiplier, offset, range));
   }
 
   /** Adds the code of the row's dimension attribute, times {@code multiplier}, to its key. */
-  public DeviceProbe keyAttribute(int dimension, int attribute, int multiplier) {
+  public DeviceProbe keyAttribute(int dimension, int attribute, long multiplier) {
     return keyAttribute(dimension, attribute, multiplier, 0, Integer.MAX_VALUE);
   }
 
   /** {@link #keyAttribute(int, int, int)} of {@code (code - offset)}, in [0, range) to join. */
   public DeviceProbe keyAttribute(
-      int dimension, int attribute, int multiplier, int offset, int range) {
+      int dimension, int attribute, long multiplier, int offset, int range) {
     return with(new Part(null, dimension, attribute, multiplier, offset, range));
   }
 
   /** Joins only build rows whose value passes {@code factColumn comparison value}. */
   public DeviceProbe where(String factColumn, Comparison how) {
-    return new DeviceProbe(keys, values, parts, factColumn, how);
+    return new DeviceProbe(keys, values, parts, factColumn, how, sums);
   }
 
   private DeviceProbe with(Part part) {
@@ -124,7 +150,8 @@ public final class DeviceProbe {
         values,
         ImmutableList.<Part>builder().addAll(parts).add(part).build(),
         column,
-        comparison);
+        comparison,
+        sums);
   }
 
   long[] keys() {
@@ -145,6 +172,10 @@ public final class DeviceProbe {
 
   Comparison comparison() {
     return comparison;
+  }
+
+  List<double[]> sums() {
+    return sums;
   }
 
   int rows() {

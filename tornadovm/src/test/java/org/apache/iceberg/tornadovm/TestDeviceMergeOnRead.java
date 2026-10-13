@@ -287,6 +287,74 @@ public class TestDeviceMergeOnRead {
     }
   }
 
+  /**
+   * A probe whose build rows carry a value column ({@link DeviceValue#probe(int)}): each fact row
+   * adds the values of the build rows it joins (one is null, skipped and not counted), next to its
+   * own weighted sum and row count.
+   */
+  @Test
+  public void testProbeBuildSums() throws IOException {
+    Table table = MorTables.create(temp.resolve("sums").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 2500);
+    MorTables.deletePositions(table, files, ImmutableList.of(everyNth(2500, 9)));
+    table.refresh();
+    int[] parity = {0, 1, 0, 1, 0, 1, 0};
+    boolean[] all = new boolean[7];
+    Arrays.fill(all, true);
+    long[] keys = {1, 1, 2, 4, 4, 6};
+    long[] values = new long[keys.length];
+    double[] amounts = {10.5, 2.0, Double.NaN, 1.25, 3.0, 7.0};
+    DeviceProbe probe = DeviceProbe.of(keys, values, ImmutableList.of(amounts)).keyColumn("k", 1);
+
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        int k = (Integer) record.getField("k");
+        int weight = 0;
+        double sum = 0;
+        int nonNull = 0;
+        for (int b = 0; b < keys.length; b++) {
+          if (keys[b] == k) {
+            weight++;
+            if (!Double.isNaN(amounts[b])) {
+              sum += amounts[b];
+              nonNull++;
+            }
+          }
+        }
+        if (weight > 0) {
+          double[] t =
+              expected.computeIfAbsent(
+                  ImmutableList.of((long) parity[k]), ignored -> new double[4]);
+          t[0] += weight * (Double) record.getField("v1");
+          t[1] += sum;
+          t[2] += weight;
+          t[3] += nonNull;
+        }
+      }
+    }
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(table, org.apache.iceberg.expressions.Expressions.alwaysTrue())) {
+      Map<List<Object>, double[]> actual =
+          device
+              .starAggregate(
+                  ImmutableList.of(DeviceDimension.of("k", 0, all).withAttribute(parity)),
+                  ImmutableList.of(DeviceDimension.Key.attribute(0, 0)),
+                  ImmutableList.of(DeviceValue.of("v1"), DeviceValue.probe(0)),
+                  probe)
+              .groups();
+      assertThat(actual.keySet()).isEqualTo(expected.keySet());
+      for (Map.Entry<List<Object>, double[]> entry : expected.entrySet()) {
+        double[] got = actual.get(entry.getKey()); // v1, probe, rows, v1 non-null, probe non-null
+        double[] want = entry.getValue();
+        assertThat(got[0]).isCloseTo(want[0], org.assertj.core.data.Offset.offset(1e-6));
+        assertThat(got[1]).isCloseTo(want[1], org.assertj.core.data.Offset.offset(1e-9));
+        assertThat(got[2]).isEqualTo(want[2]);
+        assertThat(got[4]).isEqualTo(want[3]);
+      }
+    }
+  }
+
   private static void assertStarMatches(
       Table table,
       DeviceMergeOnReadScan device,

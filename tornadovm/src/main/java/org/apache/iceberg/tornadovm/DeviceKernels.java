@@ -703,13 +703,14 @@ final class DeviceKernels {
   }
 
   /** Ints of a probe spec before its key parts: parts, build rows, comparison, value column. */
-  static final int PROBE_HEADER_INTS = 6;
+  static final int PROBE_HEADER_INTS = 8;
 
   /**
-   * Ints of a probe key part: kind, column kind, slot, first key, codes offset, multiplier, the
-   * part's offset and its range (values outside [offset, offset + range) join nothing).
+   * Ints of a probe key part: kind, column kind, slot, first key, codes offset, the multiplier's
+   * low 32 bits, the part's offset, its range (values outside [offset, offset + range) join
+   * nothing) and the multiplier's high 32 bits.
    */
-  static final int PROBE_PART_INTS = 8;
+  static final int PROBE_PART_INTS = 9;
 
   /**
    * An inner join with a small table given on the host as sorted keys and one value each: a live
@@ -731,10 +732,18 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       ByteArray live,
-      DoubleArray weights) {
+      DoubleArray weights,
+      DoubleArray buildSums,
+      DoubleArray rowSums) {
     int i = context.globalIdx;
     if (i < stride) {
       double weight = 0.0;
+      int sums = spec.get(6);
+      int buildCapacity = spec.get(7);
+      for (int k = 0; k < sums; k++) {
+        rowSums.set((2L * k) * stride + i, 0.0);
+        rowSums.set((2L * k + 1) * stride + i, 0.0);
+      }
       if (live.get(i) == 1) {
         int parts = spec.get(0);
         int rows = spec.get(1);
@@ -755,7 +764,8 @@ final class DeviceKernels {
           if (part < 0 || part >= spec.get(base + 7)) {
             inRange = false;
           }
-          key += part * spec.get(base + 5);
+          long multiplier = ((long) spec.get(base + 8) << 32) | (spec.get(base + 5) & 0xFFFFFFFFL);
+          key += part * multiplier;
         }
         long rowValue = 0;
         boolean rowNull = false;
@@ -796,6 +806,14 @@ final class DeviceKernels {
           }
           if (pass) {
             weight += 1.0;
+            for (int k = 0; k < sums; k++) {
+              double v = buildSums.get((long) k * buildCapacity + j);
+              if (Math.abs(v) <= Double.MAX_VALUE) { // not NaN: a null build value
+                long at = (2L * k) * stride + i;
+                rowSums.set(at, rowSums.get(at) + v);
+                rowSums.set(at + stride, rowSums.get(at + stride) + 1.0);
+              }
+            }
           }
         }
         if (weight == 0.0) {
@@ -803,6 +821,35 @@ final class DeviceKernels {
         }
       }
       weights.set(i, weight);
+    }
+  }
+
+  /**
+   * A probe's build-side values as value columns: for each of {@code n} probe values ({@code spec}:
+   * its value column, its build column and its non-null count column or -1), the sum of the build
+   * rows' values a row joined, and how many were not null -- after {@link #applyWeights}, which
+   * these must not be multiplied by.
+   */
+  static void probeValues(
+      KernelContext context,
+      IntArray spec,
+      int n,
+      DoubleArray rowSums,
+      int values,
+      int stride,
+      DoubleArray valueData) {
+    int i = context.globalIdx;
+    if (i < stride) {
+      for (int v = 0; v < n; v++) {
+        int column = spec.get(3 * v);
+        int k = spec.get(3 * v + 1);
+        int count = spec.get(3 * v + 2);
+        valueData.set((long) column * stride + i, rowSums.get((2L * k) * stride + i));
+        if (count >= 0) {
+          valueData.set(
+              (long) (values + 1 + count) * stride + i, rowSums.get((2L * k + 1) * stride + i));
+        }
+      }
     }
   }
 

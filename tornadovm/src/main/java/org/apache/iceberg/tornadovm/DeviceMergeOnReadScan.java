@@ -1736,6 +1736,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         "denseAggregate",
         "probeWeights",
         "applyWeights",
+        "probeValues",
         "values",
         "zorder",
         "lineage"
@@ -2540,7 +2541,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       dimensions.forEach(d -> shape.append(d.factColumn()).append(','));
       shape.append(keys).append(capacity).append('/').append(denseCapacity);
       if (probe != null) {
-        shape.append(" probe ").append(probe.parts()).append(probe.column()).append(probeCapacity);
+        shape
+            .append(" probe ")
+            .append(probe.parts())
+            .append(probe.column())
+            .append(probeCapacity)
+            .append(" sums ")
+            .append(probe.sums().size());
       }
       return shape.append(']').toString();
     }
@@ -2554,7 +2561,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         IntArray denseSpec,
         IntArray probeSpec,
         LongArray buildKeys,
-        LongArray buildValues) {
+        LongArray buildValues,
+        DoubleArray buildSums) {
       for (int k = 0; k < keys.size() && dense(); k++) {
         denseSpec.set(k, multipliers[k]);
       }
@@ -2604,7 +2612,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
       }
       if (probe != null) {
-        fillProbe(layout, offsets, probeSpec, buildKeys, buildValues);
+        fillProbe(layout, offsets, probeSpec, buildKeys, buildValues, buildSums);
       }
     }
 
@@ -2613,10 +2621,21 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         List<int[]> offsets,
         IntArray probeSpec,
         LongArray buildKeys,
-        LongArray buildValues) {
+        LongArray buildValues,
+        DoubleArray buildSums) {
       probeSpec.set(0, probe.parts().size());
       probeSpec.set(1, probe.rows());
       probeSpec.set(2, probe.comparison().ordinal());
+      probeSpec.set(6, probe.sums().size());
+      probeSpec.set(7, probeCapacity);
+      for (int k = 0; k < probe.sums().size(); k++) {
+        MemorySegment.copy(
+            MemorySegment.ofArray(probe.sums().get(k)),
+            0,
+            buildSums.getSegment(),
+            (long) k * probeCapacity * Double.BYTES,
+            (long) probe.rows() * Double.BYTES);
+      }
       if (probe.column() != null) {
         Types.NestedField field = column(probe.column());
         probeSpec.set(3, layout.type(field.fieldId()) == CudfType.INT32 ? 0 : 1);
@@ -2636,9 +2655,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           probeSpec.set(base + 3, dimensions.get(part.dimension()).firstKey());
           probeSpec.set(base + 4, offsets.get(part.dimension())[part.attribute()]);
         }
-        probeSpec.set(base + 5, part.multiplier());
+        probeSpec.set(base + 5, (int) part.multiplier());
         probeSpec.set(base + 6, part.offset());
         probeSpec.set(base + 7, part.range());
+        probeSpec.set(base + 8, (int) (part.multiplier() >>> 32));
       }
       MemorySegment.copy(
           MemorySegment.ofArray(probe.keys()),
@@ -2691,6 +2711,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final LongArray buildKeys;
     private final LongArray buildValues;
     private final DoubleArray weights;
+    // A probe's build-side value columns, each row's sums and counts of them, and the value
+    // columns they fill: (value column, build column, count column or -1) each.
+    private final DoubleArray buildSums;
+    private final DoubleArray rowSums;
+    private final IntArray probeValueSpec;
+    private final int probeValues;
     private final int denseCapacity;
     private Star current;
 
@@ -2717,6 +2743,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.buildKeys = hostLongs(probing ? star.probeCapacity : 1);
       this.buildValues = hostLongs(probing ? star.probeCapacity : 1);
       this.weights = hostDoubles(probing ? capacity : 1);
+      int buildColumns = probing ? star.probe.sums().size() : 0;
+      this.buildSums =
+          hostDoubles(Math.max(1L, (long) buildColumns * (probing ? star.probeCapacity : 0)));
+      this.rowSums = hostDoubles(Math.max(1L, 2L * buildColumns * capacity));
+      int fromProbe = (int) sums.stream().filter(v -> v.probeColumn() >= 0).count();
+      this.probeValues = fromProbe;
+      this.probeValueSpec = hostInts(Math.max(1, 3 * fromProbe));
       this.keys = groupColumns.size();
       this.groupKeyColumns = Math.max(1, keys);
       this.values = sums.size();
@@ -2740,7 +2773,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         List<DeviceValue.Factor> factors = sums.get(v).factors();
         int base = v * DeviceKernels.VALUE_SPEC_INTS;
         valueSpec.set(base, factors.size());
-        boolean canBeNull = factors.stream().anyMatch(f -> column(f.column()).isOptional());
+        boolean canBeNull =
+            sums.get(v).probeColumn() >= 0
+                || factors.stream().anyMatch(f -> column(f.column()).isOptional());
         countColumn[v] = canBeNull ? nullable++ : -1;
         valueSpec.set(base + DeviceKernels.VALUE_SPEC_INTS - 1, countColumn[v]);
         for (int f = 0; f < factors.size(); f++) {
@@ -2758,6 +2793,19 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
       }
       this.counts = nullable;
+      int filled = 0;
+      for (int v = 0; v < values; v++) {
+        int column = sums.get(v).probeColumn();
+        if (column >= 0) {
+          if (star == null || star.probe == null || column >= star.probe.sums().size()) {
+            throw new IllegalArgumentException("No probe build column " + column);
+          }
+          probeValueSpec.set(3 * filled, v);
+          probeValueSpec.set(3 * filled + 1, column);
+          probeValueSpec.set(3 * filled + 2, countColumn[v]);
+          filled++;
+        }
+      }
       this.keyColumnsData = hostLongs((long) groupKeyColumns * capacity);
       this.valueData = hostDoubles((long) (values + 1 + counts) * capacity);
       this.outKeys = hostLongs((long) groupKeyColumns * capacity);
@@ -2782,7 +2830,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           denseSpec,
           probeSpec,
           buildKeys,
-          buildValues);
+          buildValues,
+          buildSums);
       current = run;
       dimensionsChanged = true;
     }
@@ -2793,7 +2842,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       if (star != null && dimensionsChanged) {
         executionPlan.transferToDevice(joinSpec, gatherSpec, dimensionData, denseSpec);
         if (probing) {
-          executionPlan.transferToDevice(probeSpec, buildKeys, buildValues);
+          executionPlan.transferToDevice(probeSpec, buildKeys, buildValues, buildSums);
         }
         dimensionsChanged = false;
       }
@@ -2822,7 +2871,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       if (probing) {
         graph
-            .transferToDevice(DataTransferMode.FIRST_EXECUTION, probeSpec, buildKeys, buildValues)
+            .transferToDevice(
+                DataTransferMode.FIRST_EXECUTION,
+                probeSpec,
+                buildKeys,
+                buildValues,
+                buildSums,
+                probeValueSpec)
             .task(
                 "probeWeights",
                 DeviceKernels::probeWeights,
@@ -2836,7 +2891,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 valid,
                 capacity,
                 live,
-                weights);
+                weights,
+                buildSums,
+                rowSums);
       }
       graph.task(
           "groupKeys",
@@ -2885,6 +2942,18 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             values + 1 + counts,
             capacity,
             valueData);
+        if (probeValues > 0) {
+          graph.task(
+              "probeValues",
+              DeviceKernels::probeValues,
+              context,
+              probeValueSpec,
+              probeValues,
+              rowSums,
+              values,
+              capacity,
+              valueData);
+        }
       }
       if (denseCapacity > 0) {
         int columns = values + 1 + counts;
