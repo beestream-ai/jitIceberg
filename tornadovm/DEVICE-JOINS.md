@@ -302,6 +302,16 @@ device out-of-memory failure now frees the kept scans and retries once, and the 
 warning logs the cause chain. Whole suite: **127.0 to 108.1 s, 1.16x geomean, 102/102 equal**,
 no device failure left (only the planned refusals: group bounds, sparse keys).
 
+**Sums of terms, the customer stars (2026-10-13):** a device value is now a sum of products
+(`DeviceValue.plus`/`minus`/`negate`; a factor's coefficient starts a new term), a row with a null
+in any term contributing nothing, as SQL's `a - b` is null. The planner takes sums and
+differences of same-scale decimals (unscaled) and of integers, exact by the files' bounds. That
+unblocked the customer stars (q11's `ss_ext_list_price - ss_ext_discount_amt`), whose 500K
+customer tuples needed a larger group bound: `maxGroups` is back to 2^22, the earlier losses with
+large groups having been run-time failures and rebuilt dimensions, both gone. Whole suite: **127.0
+to 103.9 s, 1.21x geomean, 102/102 equal**; q11 2.00x, q31 1.72x, q74 1.60x, q23a/b 1.3x. q4 stays
+on Spark (`sum((... - ...)/2)` divides decimals per row).
+
 **Sales with their returns (measured 2026-10-13, `metrics.py`):** q50, q17, q25, q29 and q93 (1.3
 to 2.5 s each, ~10.6 s together) all sort-merge join `store_sales` (28.2M rows) with
 `store_returns` (2.8M) on (customer, item, ticket) for ~1.9M matches -- the 28M-row sort
