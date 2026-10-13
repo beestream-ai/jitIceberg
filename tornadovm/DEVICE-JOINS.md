@@ -291,6 +291,17 @@ same answers** (RAPIDS 1.26 / 1.29 s; q17 is declined: `stddev_samp`); the whole
 and probes **127.0 to 109.2 s, 1.15x geomean, 102/102 equal**. Their build side -- returns joined
 with catalog sales, collected by Spark -- is now most of their time (~0.9 s).
 
+**Variances, build-side counts, device memory (2026-10-13):** `stddev_samp`/`stddev_pop`/
+`var_samp`/`var_pop` of an integer are a sum, a sum of squares and a count on the device (either
+side of a probe), finished through Spark's own central-moment buffer (n, mean, m2 = sumSq -
+sum^2/n, exact before its one division since the sums of integers are checked exact); a
+build-side COUNT(column) sums a 0/1 indicator. q17: 2.41 to 1.17 s (RAPIDS 1.31 s). The first full
+run with them lost q22, q25, q29 and q36 to the CPU: q17's wide probe region (2.5 GB) next to the
+kept shapes ran TornadoVM out of device memory, and every star after it failed the same way. A
+device out-of-memory failure now frees the kept scans and retries once, and the CPU fallback's
+warning logs the cause chain. Whole suite: **127.0 to 108.1 s, 1.16x geomean, 102/102 equal**,
+no device failure left (only the planned refusals: group bounds, sparse keys).
+
 **Sales with their returns (measured 2026-10-13, `metrics.py`):** q50, q17, q25, q29 and q93 (1.3
 to 2.5 s each, ~10.6 s together) all sort-merge join `store_sales` (28.2M rows) with
 `store_returns` (2.8M) on (customer, item, ticket) for ~1.9M matches -- the 28M-row sort
