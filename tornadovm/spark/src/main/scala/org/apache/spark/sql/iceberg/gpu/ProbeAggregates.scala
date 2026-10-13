@@ -257,7 +257,7 @@ object ProbeAggregates extends PredicateHelper {
   }
 
   /**
-   * An aggregate of build-side columns: SUM or AVG of an integral or double expression
+   * An aggregate of build-side columns: SUM, AVG, COUNT or a variance of an integral or double expression
    * (a decimal SUM or AVG as its unscaled value, Spark's own rewrite), each a build column the
    * probe sums over every fact row's joined rows.
    */
@@ -275,8 +275,20 @@ object ProbeAggregates extends PredicateHelper {
       case other => Left(s"build-side aggregate of $other: $ae")
     }
     ae.aggregateFunction match {
+      case Count(Seq(child)) if !child.foldable =>
+        add(If(IsNotNull(child), Literal(1L), Literal(0L))).map(CountSum)
       case Sum(child, _) => add(child).map(SumOf)
       case Average(child, _) => add(child).map(AverageOf)
+      case m: CentralMomentAgg if m.children.size == 1 && GpuAggregateStrategy.secondMoment(m) =>
+        GpuAggregateStrategy.integralColumn(m.children.head) match {
+          // Its sums and sums of squares as integral build columns, checked exact when collected.
+          case Some(a) =>
+            for {
+              v <- add(Cast(a, LongType))
+              w <- add(Multiply(Cast(a, LongType), Cast(a, LongType)))
+            } yield Moment(v, w)
+          case None => Left(s"build-side moment of ${m.children.head}")
+        }
       case other => Left(s"build-side aggregate $other")
     }
   }

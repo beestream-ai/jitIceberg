@@ -120,7 +120,7 @@ class DeviceResults(
 
   private val finishes: Vector[Finish] = ordered.map { ae =>
     aggregates(ae) match {
-      case SumOf(_) | AverageOf(_) | SumAll(_) =>
+      case SumOf(_) | AverageOf(_) | SumAll(_) | Moment(_, _) =>
         val buffer = ae.aggregateFunction.asInstanceOf[DeclarativeAggregate]
         val attributes = buffer.aggBufferAttributes
         val scale = ae.aggregateFunction.children.head.dataType match {
@@ -158,6 +158,8 @@ class DeviceResults(
         case SumAll(_) if rows == 0 => null
         case SumAll(v) => finish(finishes(a), totals(v), rows)
         case AverageOf(v) => finish(finishes(a), totals(v), nonNull(v))
+        case Moment(v, w) => moment(finishes(a), totals(v), totals(w), nonNull(v))
+        case CountSum(v) => if (totals == null) 0L else Math.round(totals(v))
       }
       a += 1
     }
@@ -171,6 +173,24 @@ class DeviceResults(
    * applies its result type, rounding and overflow rules. A sum the device holds exactly (a
    * decimal's unscaled value, an integer) goes into the buffer exactly.
    */
+  /**
+   * A variance or standard deviation from the device's sum, sum of squares and count, through
+   * Spark's own evaluation of its central-moment buffer: n, the mean, and m2 = sum((x - mean)^2)
+   * = sumSq - sum^2 / n. The sums are of integers, exact in doubles (the planner checks), so m2
+   * is exact before its one division.
+   */
+  private def moment(f: Finish, sum: Double, sumSq: Double, n: Long): Any = {
+    val avg = if (n == 0) 0.0 else sum / n
+    val m2 = if (n == 0) 0.0 else sumSq - sum * sum / n
+    val buffer = f.fields.map {
+      case "n" => n.toDouble
+      case "avg" => avg
+      case "m2" => m2
+      case other => throw new IllegalStateException(s"buffer attribute $other")
+    }
+    f.evaluate.eval(new GenericInternalRow(buffer.toArray[Any]))
+  }
+
   private def finish(f: Finish, sum: Double, rows: Long): Any = {
     val sumValue: Any = f.sumType match {
       case DoubleType => sum
@@ -239,6 +259,10 @@ case class GpuAggregateExec(
       } catch {
         case e: RuntimeException =>
           logWarning(s"GPU aggregate failed, aggregating on the CPU: ${e.getMessage}")
+          logDebug("GPU aggregate failure", e)
+          if (Option(e.getCause).isDefined) {
+            logWarning(s"  caused by: ${Iterator.iterate(e.getCause)(_.getCause).takeWhile(_ != null).map(c => s"${c.getClass.getSimpleName}: ${c.getMessage}").mkString(" <- ")}")
+          }
           spec match {
             case _: GpuStarAggregateSpec => StarAggregates.remember(logical)
             case _ =>

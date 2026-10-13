@@ -73,6 +73,21 @@ public final class GpuAggregates {
    */
   private static <T> T withScan(
       Table table, Expression filter, java.util.function.Function<DeviceMergeOnReadScan, T> work) {
+    try {
+      return withScanOnce(table, filter, work);
+    } catch (RuntimeException e) {
+      if (!DeviceMergeOnReadScan.isOutOfDeviceMemory(e)) {
+        throw e;
+      }
+      // The kept scans' regions hold the device memory a new query shape needs (a wide probe's
+      // columns, say): free them all and try once more on a fresh scan.
+      releaseAll();
+      return withScanOnce(table, filter, work);
+    }
+  }
+
+  private static <T> T withScanOnce(
+      Table table, Expression filter, java.util.function.Function<DeviceMergeOnReadScan, T> work) {
     while (true) {
       DeviceMergeOnReadScan scan = scan(table, filter);
       synchronized (scan) {

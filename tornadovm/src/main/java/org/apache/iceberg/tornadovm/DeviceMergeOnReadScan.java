@@ -469,6 +469,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
   }
 
+  /** Whether a failure, or one of its causes, is the device (TornadoVM or cuDF) out of memory. */
+  public static boolean isOutOfDeviceMemory(Throwable failure) {
+    return outOfDeviceMemory(failure);
+  }
+
   private static boolean outOfDeviceMemory(Throwable failure) {
     for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
       if (cause instanceof uk.ac.manchester.tornado.api.exceptions.TornadoOutOfMemoryException) {

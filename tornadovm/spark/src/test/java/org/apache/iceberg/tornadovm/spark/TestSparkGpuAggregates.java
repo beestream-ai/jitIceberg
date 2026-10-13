@@ -402,6 +402,9 @@ public class TestSparkGpuAggregates {
                 + " AND i_category = 'category 1' GROUP BY i_class",
             "SELECT i_brand, sum(amount) FROM store_sales, item WHERE item_sk = i_item_sk"
                 + " AND i_category = 'category 1' GROUP BY i_brand",
+            // q17's: variances and standard deviations of an int column (nulls skipped).
+            "SELECT s_state, stddev_samp(qty), var_pop(qty), stddev_pop(qty), count(qty)"
+                + " FROM store_sales, store WHERE store_sk = s_store_sk GROUP BY s_state",
             // q67's value: a decimal product, nulls counted as 0.
             "SELECT i_category, i_class, sum(coalesce(price * qty, 0)) sumsales, sum(price * qty)"
                 + " FROM store_sales, item WHERE item_sk = i_item_sk"
@@ -574,7 +577,8 @@ public class TestSparkGpuAggregates {
             + " AND d1.dd_year = 2000 GROUP BY it_desc, wh_name, d1.dd_week";
     // Sums of both sides' columns over the join: the build side's summed per stock row.
     String sums =
-        "SELECT wh_name, sum(inv_qoh), sum(cs_qty), avg(cs_qty), count(*) FROM sales"
+        "SELECT wh_name, sum(inv_qoh), sum(cs_qty), avg(cs_qty), stddev_samp(cs_qty),"
+            + " stddev_samp(inv_qoh), count(cs_promo_sk), count(*) FROM sales"
             + " JOIN stock ON cs_item_sk = inv_item_sk JOIN wh ON wh_sk = inv_wh_sk"
             + " JOIN dd d1 ON cs_sold_date_sk = d1.dd_sk JOIN dd d2 ON inv_date_sk = d2.dd_sk"
             + " WHERE d1.dd_week = d2.dd_week AND inv_qoh < cs_qty GROUP BY wh_name";

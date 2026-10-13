@@ -57,6 +57,15 @@ case class CountOf(value: Int) extends DeviceAggregate
 case class SumAll(value: Int) extends DeviceAggregate
 
 /**
+ * A variance or standard deviation (Spark's second central moment) of an integral value: its sum
+ * (value {@code value}), its sum of squares (value {@code squares}) and its non-null count.
+ */
+case class Moment(value: Int, squares: Int) extends DeviceAggregate
+
+/** COUNT of a probe's build-side column: the sum of its 0/1 non-null indicator (value {@code value}). */
+case class CountSum(value: Int) extends DeviceAggregate
+
+/**
  * Plans a grouped aggregate over an Iceberg table -- SUM, AVG and COUNT of products of double
  * columns and `1 - c` / `1 + c` factors, grouped by up to four integer, date, timestamp or short
  * string columns, under a filter the device can apply -- as one device scan
@@ -320,6 +329,19 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
           case a: AttributeReference => nullFree(table, a)
           case other => Left(s"COUNT of $other")
         }.map(_ => RowCount)
+      case m: CentralMomentAgg if m.children.size == 1 && secondMoment(m) =>
+        // Of an integer (as a double): sums of it and of its square, exact in doubles.
+        integralColumn(m.children.head) match {
+          case Some(a) =>
+            for {
+              f <- field(table, a)
+              _ <- valueMayBeNull(table, a, nulls)
+              _ <-
+                if (GpuAggregates.exactProduct(table, List(f.name(), f.name()).asJava)) Right(())
+                else Left(s"squares of ${a.name} may not sum exactly in doubles")
+            } yield Moment(add(DeviceValue.of(f.name())), add(DeviceValue.of(f.name()).times(f.name())))
+          case None => Left(s"moment of $m")
+        }
       case s: Sum if s.child.dataType == DoubleType => valueIndex(s.child).map(SumOf)
       case a: Average if a.child.dataType == DoubleType => valueIndex(a.child).map(AverageOf)
       case Sum(Coalesce(Seq(v, zero: Literal)), _)
@@ -383,6 +405,21 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
           else Left(s"sum of $m may not be exact in doubles")
       } yield names.tail.foldLeft(DeviceValue.of(names.head))(_ times _)
     case other => Left(s"aggregate of $other")
+  }
+
+  /** Variance and standard deviation, sample or population: the second central moment. */
+  private[gpu] def secondMoment(m: CentralMomentAgg): Boolean = m match {
+    case _: StddevSamp | _: StddevPop | _: VarianceSamp | _: VariancePop => true
+    case _ => false
+  }
+
+  /** An int or bigint column, possibly cast to double. */
+  private[gpu] def integralColumn(e: Expression): Option[AttributeReference] = e match {
+    case Cast(a: AttributeReference, DoubleType, _, _)
+        if a.dataType == IntegerType || a.dataType == LongType =>
+      Some(a)
+    case a: AttributeReference if a.dataType == IntegerType || a.dataType == LongType => Some(a)
+    case _ => None
   }
 
   private def exactType(dataType: DataType): Boolean = dataType match {
