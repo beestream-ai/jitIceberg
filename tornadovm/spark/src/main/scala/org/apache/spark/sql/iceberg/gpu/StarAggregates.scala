@@ -19,8 +19,9 @@
 package org.apache.spark.sql.iceberg.gpu
 
 import org.apache.iceberg.expressions.{Expression => IcebergExpression}
-import org.apache.iceberg.tornadovm.DeviceDimension
-import org.apache.iceberg.tornadovm.DeviceProbe
+import org.apache.iceberg.tornadovm.join.DeviceDimension
+import org.apache.iceberg.tornadovm.join.DeviceProbe
+import org.apache.iceberg.tornadovm.join.StarAggregation.ProbeSum
 import org.apache.iceberg.tornadovm.DeviceValue
 import org.apache.iceberg.tornadovm.spark.GpuAggregates
 import org.apache.iceberg.types.Type.TypeID
@@ -30,6 +31,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Left => _, Right => _, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.LeftOuter
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.types._
@@ -55,14 +57,15 @@ case class AttributePart(dimension: Int, attribute: Int) extends ProbePart
 /**
  * The other side of a probe join ([[ProbeAggregates]]): a plan Spark runs and collects, whose
  * columns are each key part's value, then the compared value when there is a comparison; the
- * fact side's parts; how the fact's column compares with the build's value; and how many build
- * columns follow, summed over each fact row's joined rows.
+ * fact side's parts; how the fact's column compares with the build's value; and the sums of the
+ * build columns that follow over each fact row's joined rows, as the device values after the fact's.
  */
 case class StarProbe(
     build: LogicalPlan,
     parts: Seq[ProbePart],
     comparison: Option[(String, DeviceProbe.Comparison)],
-    sums: Int = 0)
+    sums: Seq[ProbeSum] = Nil,
+    outer: Boolean = false)
 
 /**
  * An aggregate of `CASE WHEN predicate THEN value [ELSE 0 | NULL] END` whose predicate reads
@@ -146,7 +149,8 @@ case class GpuStarAggregateSpec(
       deviceDimensions.asJava,
       keys.asJava,
       values.asJava,
-      deviceProbe)
+      deviceProbe,
+      probe.map(_.sums).getOrElse(Nil).asJava)
     val device = System.nanoTime()
 
     val input = finest
@@ -204,8 +208,11 @@ case class GpuStarAggregateSpec(
     result
   }
 
+  /** The device's values: the fact's, then the probe's sums. */
+  private def deviceValues: Int = values.size + probe.map(_.sums.size).getOrElse(0)
+
   /** Device values, then one slot a conditional aggregate. */
-  private def slots: Int = values.size + conditionals.size
+  private def slots: Int = deviceValues + conditionals.size
 
   /**
    * A finest group's totals with the conditionals' slots: sums, the row count, non-null counts,
@@ -218,7 +225,7 @@ case class GpuStarAggregateSpec(
     if (conditionals.isEmpty) {
       return totals
     }
-    val n = values.size
+    val n = deviceValues
     val m = conditionals.size
     val rows = totals(n)
     val out = new Array[Double](2 * (n + m) + 1)
@@ -255,6 +262,13 @@ case class GpuStarAggregateSpec(
  * declines, and Spark plans the query as usual.
  */
 object StarAggregates extends PredicateHelper {
+
+  /**
+   * Where a probe sum's index starts while the aggregates translate, before the fact's values are
+   * all known; the sums then follow the fact's values ([[DeviceAggregate.remap]]).
+   */
+  private[gpu] val ProbeSlot = 1 << 24
+
   val MaxDimensionRows = "spark.iceberg.gpu.aggregate.star.maxDimensionRows"
 
   val MaxGroups = "spark.iceberg.gpu.aggregate.star.maxGroups"
@@ -312,8 +326,9 @@ object StarAggregates extends PredicateHelper {
     for {
       upper <- aboveJoins(below)
       (upperConditions, upperAliases, joins) = upper
-      tree <- joinTree(joins)
-      (leaves, joinConditions) = tree
+      tree <- joinTreeWithOuter(joins)
+      (leaves, joinConditions, outerJoins) = tree
+      _ <- if (outerJoins.size <= 1) Right(()) else Left("more than one left outer join")
       _ <- if (leaves.size >= 2) Right(()) else Left("not a join")
       sized <- traverse(leaves) { leaf =>
         leaf.collect { case r: DataSourceV2ScanRelation => r } match {
@@ -382,6 +397,8 @@ object StarAggregates extends PredicateHelper {
       translated <- {
         val values = mutable.ArrayBuffer[DeviceValue]()
         val conditionals = mutable.ArrayBuffer[(AggregateExpression, Conditional)]()
+        val buildSums = mutable.ArrayBuffer[Expression]()
+        val probeSums = mutable.ArrayBuffer[ProbeSum]()
         def onDevice(overJoins: AggregateExpression) = {
           val overScan = GpuAggregateStrategy
             .substitute(overJoins, factAliases)
@@ -394,6 +411,10 @@ object StarAggregates extends PredicateHelper {
             .asInstanceOf[AggregateExpression]
           if (overJoins.references.subsetOf(factOutput)) {
             onDevice(overJoins).map(kind => Some(ae -> kind))
+          } else if (outerJoins.nonEmpty &&
+              overJoins.references.subsetOf(AttributeSet(factOutput.toSeq ++ outerJoins.head._1.output))) {
+            outerAggregate(overJoins, outerJoins.head._1.outputSet, factAliases, table, values, buildSums, probeSums)
+              .map(kind => Some(ae -> kind))
           } else {
             conditional(overJoins, factOutput, dimensionLeaves) match {
               case Some((plain, predicate, elseZero)) =>
@@ -417,19 +438,47 @@ object StarAggregates extends PredicateHelper {
             }
           }
         }.map { pairs =>
-          // A conditional's slot follows the device values.
+          // The probe's sums follow the fact's values, a conditional's slot the device values.
+          val probeAt = (i: Int) => if (i >= ProbeSlot) values.size + i - ProbeSlot else i
+          val placed = pairs.flatten.map { case (ae, kind) => ae -> DeviceAggregate.remap(kind, probeAt) }
           val slotted = conditionals.zipWithIndex.map { case ((ae, c), i) =>
-            val slot = values.size + i
+            val slot = values.size + probeSums.size + i
             ae -> (ae.aggregateFunction match {
               case _: org.apache.spark.sql.catalyst.expressions.aggregate.Sum => SumOf(slot)
               case _: org.apache.spark.sql.catalyst.expressions.aggregate.Average => AverageOf(slot)
               case _ => CountOf(slot)
             })
           }
-          ((pairs.flatten ++ slotted).toMap, values.toList, conditionals.map(_._2).toList)
+          (
+            (placed ++ slotted).toMap,
+            values.toList,
+            conditionals.map(_._2).toList,
+            buildSums.toList,
+            probeSums.toList)
         }
       }
-      (aggregates, values, conditionalAggregates) = translated
+      (aggregates, values, conditionalAggregates, outerSums, outerProbeSums) = translated
+      // The left outer join's side, collected by Spark: its join columns, then the summed columns.
+      outerProbe <- outerJoins.headOption match {
+        case None => Right(None)
+        case Some((right, cond)) =>
+          traverse(splitConjunctivePredicates(cond)) {
+            case EqualTo(f: Attribute, r: Attribute) if factOutput.contains(f) && right.outputSet.contains(r) =>
+              factPart(f, factAliases, table).map(_ -> (r: Expression))
+            case EqualTo(r: Attribute, f: Attribute) if factOutput.contains(f) && right.outputSet.contains(r) =>
+              factPart(f, factAliases, table).map(_ -> (r: Expression))
+            case other => Left(s"left outer join condition $other")
+          }.map { keys =>
+            val outputs = keys.map(_._2) ++ outerSums
+            Some(
+              StarProbe(
+                Project(outputs.zipWithIndex.map { case (e, i) => Alias(e, s"outer_$i")() }, right),
+                keys.map(_._1),
+                None,
+                outerProbeSums,
+                outer = true))
+          }
+      }
       _ <- if (values.nonEmpty) Right(()) else Left("no SUM or AVG")
       // What the group keys are computed from, over the joins' output.
       keyed = expand match {
@@ -514,7 +563,90 @@ object StarAggregates extends PredicateHelper {
       aggregates,
       projections.map(p => (p, expand.get.output)),
       groupExpressions,
-      resultExpressions)
+      resultExpressions,
+      outerProbe)
+  }
+
+  private def factPart(
+      f: Attribute,
+      factAliases: Map[ExprId, Expression],
+      table: org.apache.iceberg.Table): Either[String, ProbePart] =
+    GpuAggregateStrategy.substitute(f, factAliases) match {
+      case c: AttributeReference if c.dataType == IntegerType || c.dataType == LongType =>
+        GpuAggregateStrategy.field(table, c).map(fd => FactPart(fd.name()))
+      case other => Left(s"left outer join on $other")
+    }
+
+  /**
+   * SUM of a signed sum of fact-side terms and `COALESCE(b, 0)` of the left outer join's columns:
+   * each fact term an exact device value, each build term a column the probe sums over the joined
+   * rows (a decimal as its unscaled value, at the sum's scale).
+   */
+  private def outerAggregate(
+      ae: AggregateExpression,
+      outer: AttributeSet,
+      factAliases: Map[ExprId, Expression],
+      table: org.apache.iceberg.Table,
+      values: mutable.ArrayBuffer[DeviceValue],
+      buildSums: mutable.ArrayBuffer[Expression],
+      probeSums: mutable.ArrayBuffer[ProbeSum]): Either[String, DeviceAggregate] = {
+    import org.apache.spark.sql.catalyst.expressions.aggregate.Sum
+    if (ae.isDistinct || ae.filter.isDefined) return Left(s"DISTINCT or FILTER: $ae")
+    val (child, scale) = ae.aggregateFunction match {
+      case Sum(c, _) =>
+        c.dataType match {
+          case d: DecimalType => (c, Some(d.scale))
+          case LongType | IntegerType => (c, None)
+          case other => return Left(s"left outer SUM of $other")
+        }
+      case other => return Left(s"left outer aggregate $other")
+    }
+    def zero(l: Literal) = l.value != null && l.value.toString.toDouble == 0.0
+    def terms(e: Expression, sign: Long): Option[Seq[(Long, Expression)]] = e match {
+      case Add(l, r, _) => for (a <- terms(l, sign); b <- terms(r, sign)) yield a ++ b
+      case Subtract(l, r, _) => for (a <- terms(l, sign); b <- terms(r, -sign)) yield a ++ b
+      case other => Some(Seq(sign -> other))
+    }
+    def buildColumn(e: Expression): Option[Expression] = e match {
+      case Cast(c, _, _, _) => buildColumn(c)
+      case b: Attribute if outer.contains(b) =>
+        (b.dataType, scale) match {
+          case (d: DecimalType, Some(s)) if d.scale == s => Some(UnscaledValue(b))
+          case (IntegerType | LongType, None) => Some(Cast(b, LongType))
+          case _ => None
+        }
+      case _ => None
+    }
+    terms(child, 1L).toRight(s"terms of $child").flatMap { parts =>
+      traverse(parts) { case (sign, term) =>
+        term match {
+          case Coalesce(Seq(inner, z: Literal)) if zero(z) && inner.references.subsetOf(outer) =>
+            buildColumn(inner).toRight(s"build term $inner").map { b =>
+              buildSums += b
+              probeSums += ProbeSum.of(buildSums.size - 1)
+              (sign, ProbeSlot + probeSums.size - 1, false)
+            }
+          case t if t.references.nonEmpty && !t.references.exists(outer.contains) =>
+            val overScan = GpuAggregateStrategy.substitute(t, factAliases)
+            val unscaled = if (scale.isDefined) UnscaledValue(overScan) else overScan
+            GpuAggregateStrategy.exactValue(table, unscaled).map { v =>
+              values += v
+              (sign, values.size - 1, true)
+            }
+          case other => Left(s"left outer term $other")
+        }
+      }.map { ts =>
+        // SQL's a - COALESCE(b, 0) is null where a is: the build terms sum where the fact term is set.
+        val nullsFrom = ts.find(_._3).map(_._2)
+        nullsFrom.foreach { v =>
+          ts.filterNot(_._3).foreach { t =>
+            val k = t._2 - ProbeSlot
+            probeSums(k) = probeSums(k).maskedBy(v)
+          }
+        }
+        LinearSum(ts.map(t => (t._1, t._2)), nullsFrom)
+      }
+    }
   }
 
   /** A condition on one dimension: a filter, or (with the fact attribute and key) its join. */
@@ -617,6 +749,28 @@ object StarAggregates extends PredicateHelper {
     case j: Join => Right((Nil, Map.empty, j))
     case other => Left(s"not a filtered scan or a join: ${other.nodeName}")
   }
+
+  /**
+   * {@link #joinTree}, also taking left outer joins of the tree with a plain scan: their right
+   * side and condition.
+   */
+  private[gpu] def joinTreeWithOuter(plan: LogicalPlan)
+      : Either[String, (Seq[LogicalPlan], Seq[Expression], Seq[(LogicalPlan, Expression)])] =
+    plan match {
+      case Join(left, right, LeftOuter, Some(cond), _) if !right.exists(_.isInstanceOf[Join]) =>
+        joinTreeWithOuter(left).map { case (l, c, o) => (l, c, o :+ (right -> cond)) }
+      case Join(left, right, Inner, condition, _) =>
+        for (l <- joinTreeWithOuter(left); r <- joinTreeWithOuter(right))
+          yield (l._1 ++ r._1, l._2 ++ r._2 ++ condition.toSeq.flatMap(splitConjunctivePredicates), l._3 ++ r._3)
+      case j: Join => Left(s"${j.joinType} join")
+      case p if !p.exists(_.isInstanceOf[Join]) => Right((Seq(p), Nil, Nil))
+      case Project(list, child) if list.forall(_.isInstanceOf[Attribute]) => joinTreeWithOuter(child)
+      case Filter(condition, child) =>
+        joinTreeWithOuter(child).map { case (leaves, conditions, o) =>
+          (leaves, conditions ++ splitConjunctivePredicates(condition), o)
+        }
+      case other => Left(s"between joins: ${other.nodeName}")
+    }
 
   /** The leaves of a tree of inner joins (what holds no join) and every condition in it. */
   private[gpu] def joinTree(plan: LogicalPlan): Either[String, (Seq[LogicalPlan], Seq[Expression])] =

@@ -18,8 +18,9 @@
  */
 package org.apache.spark.sql.iceberg.gpu
 
-import org.apache.iceberg.tornadovm.DeviceDimension
-import org.apache.iceberg.tornadovm.DeviceProbe
+import org.apache.iceberg.tornadovm.join.DeviceDimension
+import org.apache.iceberg.tornadovm.join.DeviceProbe
+import org.apache.iceberg.tornadovm.join.StarAggregation.ProbeSum
 import org.apache.iceberg.tornadovm.DeviceValue
 import org.apache.iceberg.types.Type.TypeID
 import org.apache.spark.sql.Dataset
@@ -169,7 +170,12 @@ object ProbeAggregates extends PredicateHelper {
           } else if (ae.references.subsetOf(AttributeSet(buildSide.toSeq ++ outerOutput.toSeq))) {
             buildAggregate(ae, values, buildValues).map(ae -> _)
           } else Left(s"aggregate across both sides: $ae")
-        }.map(pairs => (pairs.toMap, values.toList, buildValues.toList))
+        }.map { pairs =>
+          // The probe's sums follow the fact's values (one, at least, for the row count).
+          val facts = math.max(values.size, 1)
+          val probeAt = (i: Int) => if (i >= StarAggregates.ProbeSlot) facts + i - StarAggregates.ProbeSlot else i
+          (pairs.map { case (ae, kind) => ae -> DeviceAggregate.remap(kind, probeAt) }.toMap, values.toList, buildValues.toList)
+        }
       }
       (aggregates, values, buildValueExpressions) = translated
       // COUNT(*) alone still needs a value column for the row count.
@@ -253,7 +259,7 @@ object ProbeAggregates extends PredicateHelper {
       None,
       groupExpressions,
       resultExpressions,
-      Some(StarProbe(build, parts, comparison.headOption, buildValueExpressions.size)))
+      Some(StarProbe(build, parts, comparison.headOption, buildValueExpressions.indices.map(ProbeSum.of))))
   }
 
   /**
@@ -270,8 +276,7 @@ object ProbeAggregates extends PredicateHelper {
     def add(e: Expression): Either[String, Int] = e.dataType match {
       case IntegerType | LongType | DoubleType =>
         buildValues += e
-        values += DeviceValue.probe(buildValues.size - 1)
-        Right(values.size - 1)
+        Right(StarAggregates.ProbeSlot + buildValues.size - 1)
       case other => Left(s"build-side aggregate of $other: $ae")
     }
     ae.aggregateFunction match {
@@ -408,7 +413,7 @@ object ProbeAggregates extends PredicateHelper {
     // build values may be null (NaN, skipped on the device).
     val compared = if (probe.comparison.isEmpty) 0 else 1
     val live = rows.filter(r => (0 until n + compared).forall(i => !r.isNullAt(i)))
-    val sums = Array.tabulate(probe.sums) { k =>
+    val sums = Array.tabulate(probe.sums.size) { k =>
       val i = n + compared + k
       live.map { r =>
         if (r.isNullAt(i)) Double.NaN
@@ -476,6 +481,9 @@ object ProbeAggregates extends PredicateHelper {
         deviceProbe = deviceProbe.keyAttribute(d, index, multipliers(p), 0, ranges(p).toInt)
     }
     probe.comparison.foreach { case (column, how) => deviceProbe = deviceProbe.where(column, how) }
+    if (probe.outer) {
+      deviceProbe = deviceProbe.leftOuter()
+    }
     (withCodes.toSeq, deviceProbe)
   }
 

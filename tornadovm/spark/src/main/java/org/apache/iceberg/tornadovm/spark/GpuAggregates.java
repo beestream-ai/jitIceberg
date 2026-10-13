@@ -30,11 +30,12 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
-import org.apache.iceberg.tornadovm.DeviceDimension;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
-import org.apache.iceberg.tornadovm.DeviceProbe;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
+import org.apache.iceberg.tornadovm.join.DeviceDimension;
+import org.apache.iceberg.tornadovm.join.DeviceProbe;
+import org.apache.iceberg.tornadovm.join.StarAggregation;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.SparkSession;
@@ -194,8 +195,8 @@ public final class GpuAggregates {
   }
 
   /**
-   * The groups of a star aggregate ({@link DeviceMergeOnReadScan#starAggregate}), in this JVM: the
-   * scan is kept per fact table snapshot and filter, the dimensions are the run's.
+   * The groups of a star aggregate ({@link StarAggregation#run}), in this JVM: the scan is kept per
+   * fact table snapshot and filter, the dimensions are the run's.
    */
   public static Map<List<Object>, double[]> starGroups(
       Table table,
@@ -203,23 +204,27 @@ public final class GpuAggregates {
       List<DeviceDimension> dimensions,
       List<DeviceDimension.Key> keys,
       List<DeviceValue> values) {
-    return starGroups(table, filter, dimensions, keys, values, null);
+    return starGroups(table, filter, dimensions, keys, values, null, List.of());
   }
 
-  /** {@link #starGroups(Table, Expression, List, List, List)} joined with a probe (or null). */
+  /**
+   * {@link #starGroups(Table, Expression, List, List, List)} joined with a probe (or null), whose
+   * sums follow the values.
+   */
   public static Map<List<Object>, double[]> starGroups(
       Table table,
       Expression filter,
       List<DeviceDimension> dimensions,
       List<DeviceDimension.Key> keys,
       List<DeviceValue> values,
-      DeviceProbe probe) {
+      DeviceProbe probe,
+      List<StarAggregation.ProbeSum> probeSums) {
     return withScan(
         table,
         filter,
         scan -> {
           Map<List<Object>, double[]> groups =
-              scan.starAggregate(dimensions, keys, values, probe).groups();
+              StarAggregation.run(scan, dimensions, keys, values, probe, probeSums).groups();
           lastStarMetrics = String.valueOf(scan.metrics());
           return groups;
         });

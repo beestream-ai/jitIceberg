@@ -120,7 +120,8 @@ class DeviceResults(
 
   private val finishes: Vector[Finish] = ordered.map { ae =>
     aggregates(ae) match {
-      case SumOf(_) | AverageOf(_) | SumAll(_) | Moment(_, _) | ScaledSum(_, _) | ScaledAverage(_, _) =>
+      case SumOf(_) | AverageOf(_) | SumAll(_) | Moment(_, _) | ScaledSum(_, _) | ScaledAverage(_, _) |
+          LinearSum(_, _) =>
         val buffer = ae.aggregateFunction.asInstanceOf[DeclarativeAggregate]
         val attributes = buffer.aggBufferAttributes
         val scale = ae.aggregateFunction.children.head.dataType match {
@@ -159,6 +160,9 @@ class DeviceResults(
         case SumAll(v) => finish(finishes(a), totals(v), rows)
         case AverageOf(v) => finish(finishes(a), totals(v), nonNull(v))
         case Moment(v, w) => moment(finishes(a), totals(v), totals(w), nonNull(v))
+        case LinearSum(_, nullsFrom) if rows == 0 || nullsFrom.exists(nonNull(_) == 0) => null
+        case LinearSum(terms, _) =>
+          finish(finishes(a), terms.map { case (c, v) => c * totals(v) }.sum, rows)
         case ScaledSum(v, _) if nonNull(v) == 0 => null
         case ScaledAverage(v, _) if nonNull(v) == 0 => null
         case ScaledSum(v, m) => finish(finishes(a), totals(v), nonNull(v), m)

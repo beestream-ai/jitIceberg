@@ -356,6 +356,23 @@ public class TestSparkGpuAggregates {
           r.setField("s_state", k % 3 == 0 ? "TN" : "GA");
           return r;
         });
+    Schema returns =
+        new Schema(
+            Types.NestedField.required(1, "r_id", Types.LongType.get()),
+            Types.NestedField.optional(2, "r_amt", Types.DecimalType.of(7, 2)),
+            Types.NestedField.optional(3, "r_loss", Types.DecimalType.of(7, 2)));
+    view(
+        "rets",
+        returns,
+        1,
+        2_000,
+        k -> {
+          GenericRecord r = GenericRecord.create(returns);
+          r.setField("r_id", k * 13); // every 13th sale returned, ids up to 26K
+          r.setField("r_amt", k % 9 == 0 ? null : java.math.BigDecimal.valueOf(k * 7 % 5000, 2));
+          r.setField("r_loss", java.math.BigDecimal.valueOf(k % 300, 2));
+          return r;
+        });
     view(
         "item_twice",
         items,
@@ -411,6 +428,11 @@ public class TestSparkGpuAggregates {
             // q17's: variances and standard deviations of an int column (nulls skipped).
             "SELECT s_state, stddev_samp(qty), var_pop(qty), stddev_pop(qty), count(qty)"
                 + " FROM store_sales, store WHERE store_sk = s_store_sk GROUP BY s_state",
+            // q80's: a left outer join to returns, sums of returned amounts (0 when none) and of
+            // the sales' profit less the returns' loss.
+            "SELECT s_state, sum(price), sum(coalesce(r_amt, 0)), sum(price - coalesce(r_loss, 0)),"
+                + " count(*) FROM store_sales LEFT OUTER JOIN rets ON id = r_id"
+                + " JOIN store ON store_sk = s_store_sk GROUP BY s_state",
             // q67's value: a decimal product, nulls counted as 0.
             "SELECT i_category, i_class, sum(coalesce(price * qty, 0)) sumsales, sum(price * qty)"
                 + " FROM store_sales, item WHERE item_sk = i_item_sk"

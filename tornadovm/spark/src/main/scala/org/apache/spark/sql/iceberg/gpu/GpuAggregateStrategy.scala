@@ -70,8 +70,33 @@ case class Moment(value: Int, squares: Int) extends DeviceAggregate
 case class ScaledSum(value: Int, multiplier: Long) extends DeviceAggregate
 case class ScaledAverage(value: Int, multiplier: Long) extends DeviceAggregate
 
+/**
+ * SUM of a signed sum of terms across a left outer join (TPC-DS q80's `net_profit -
+ * COALESCE(net_loss, 0)`): each term a device value (a fact column, or a build-side column summed
+ * over the joined rows), the result their exact signed sum; NULL when the group has no row, or
+ * when {@code nullsFrom}'s value had no non-null row.
+ */
+case class LinearSum(terms: Seq[(Long, Int)], nullsFrom: Option[Int]) extends DeviceAggregate
+
 /** COUNT of a probe's build-side column: the sum of its 0/1 non-null indicator (value {@code value}). */
 case class CountSum(value: Int) extends DeviceAggregate
+
+object DeviceAggregate {
+
+  /** The aggregate with each value index mapped by {@code f}. */
+  def remap(kind: DeviceAggregate, f: Int => Int): DeviceAggregate = kind match {
+    case RowCount => RowCount
+    case SumOf(v) => SumOf(f(v))
+    case AverageOf(v) => AverageOf(f(v))
+    case CountOf(v) => CountOf(if (v < 0) v else f(v))
+    case SumAll(v) => SumAll(f(v))
+    case Moment(v, w) => Moment(f(v), f(w))
+    case ScaledSum(v, m) => ScaledSum(f(v), m)
+    case ScaledAverage(v, m) => ScaledAverage(f(v), m)
+    case LinearSum(terms, nulls) => LinearSum(terms.map(t => (t._1, f(t._2))), nulls.map(f))
+    case CountSum(v) => CountSum(f(v))
+  }
+}
 
 /**
  * Plans a grouped aggregate over an Iceberg table -- SUM, AVG and COUNT of products of double
@@ -370,6 +395,11 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
    * device's doubles hold exactly, by the files' bounds: Spark sums it as a bigint or a decimal,
    * exactly too.
    */
+  /** An exact device value (a decimal as its unscaled value) of a fact expression. */
+  private[gpu] def exactValue(
+      table: org.apache.iceberg.Table,
+      e: Expression): Either[String, DeviceValue] = exactColumn(table, e, nulls = true)
+
   private def exactColumn(
       table: org.apache.iceberg.Table,
       child: Expression,
