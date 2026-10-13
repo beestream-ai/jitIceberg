@@ -705,8 +705,11 @@ final class DeviceKernels {
   /** Ints of a probe spec before its key parts: parts, build rows, comparison, value column. */
   static final int PROBE_HEADER_INTS = 6;
 
-  /** Ints of a probe key part: kind, column kind, slot, first key, codes offset, multiplier. */
-  static final int PROBE_PART_INTS = 6;
+  /**
+   * Ints of a probe key part: kind, column kind, slot, first key, codes offset, multiplier, the
+   * part's offset and its range (values outside [offset, offset + range) join nothing).
+   */
+  static final int PROBE_PART_INTS = 8;
 
   /**
    * An inner join with a small table given on the host as sorted keys and one value each: a live
@@ -737,6 +740,7 @@ final class DeviceKernels {
         int rows = spec.get(1);
         int comparison = spec.get(2);
         long key = 0;
+        boolean inRange = true;
         for (int p = 0; p < parts; p++) {
           int base = PROBE_HEADER_INTS + p * PROBE_PART_INTS;
           int slot = spec.get(base + 2);
@@ -747,7 +751,11 @@ final class DeviceKernels {
           if (spec.get(base) == 1) {
             value = dimensions.get(spec.get(base + 4) + (int) (value - spec.get(base + 3)));
           }
-          key += value * spec.get(base + 5);
+          long part = value - spec.get(base + 6);
+          if (part < 0 || part >= spec.get(base + 7)) {
+            inRange = false;
+          }
+          key += part * spec.get(base + 5);
         }
         long rowValue = 0;
         boolean rowNull = false;
@@ -759,7 +767,7 @@ final class DeviceKernels {
               spec.get(3) == 0 ? ints.get(slot * stride + i) : longs.get((long) slot * stride + i);
         }
         int low = 0;
-        int high = rows;
+        int high = inRange ? rows : 0;
         while (low < high) {
           int middle = (low + high) >>> 1;
           if (buildKeys.get(middle) < key) {

@@ -237,6 +237,56 @@ public class TestDeviceMergeOnRead {
     }
   }
 
+  /**
+   * A probe key part with an offset and a range: a fact value outside the range joins nothing, even
+   * when its offset value would equal a build key (k = 5 against keys 0..2 of k - 2 with a range of
+   * 3, where 5 - 2 = 3 is one past the range and a second part would make it alias).
+   */
+  @Test
+  public void testProbeKeyRanges() throws IOException {
+    Table table = MorTables.create(temp.resolve("ranges").toString(), MorTables.SCHEMA, 2);
+    writeFiles(table, 0, 1500);
+    table.refresh();
+    boolean[] all = new boolean[7];
+    Arrays.fill(all, true);
+    int[] none = new int[7];
+    // Key = (k - 2) * 1 + (code 0) * 3 over k in [2, 5): build keys 0 (k = 2) and 2 (k = 4); k = 5
+    // gives part 3, outside the range, so it must not join key 3 (none) or anything else.
+    long[] keys = {0, 2, 3};
+    long[] values = {0, 0, 0};
+    DeviceProbe probe =
+        DeviceProbe.of(keys, values).keyColumn("k", 1, 2, 3).keyAttribute(0, 0, 3, 0, 1);
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        int k = (Integer) record.getField("k");
+        if (k == 2 || k == 4) {
+          double[] totals =
+              expected.computeIfAbsent(ImmutableList.of((long) k), ignored -> new double[2]);
+          totals[0] += (Double) record.getField("v1");
+          totals[1] += 1;
+        }
+      }
+    }
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(table, org.apache.iceberg.expressions.Expressions.alwaysTrue())) {
+      Map<List<Object>, double[]> actual =
+          device
+              .starAggregate(
+                  ImmutableList.of(DeviceDimension.of("k", 0, all).withAttribute(none)),
+                  ImmutableList.of(DeviceDimension.Key.column("k")),
+                  ImmutableList.of(DeviceValue.of("v1")),
+                  probe)
+              .groups();
+      assertThat(actual.keySet()).isEqualTo(expected.keySet());
+      for (Map.Entry<List<Object>, double[]> entry : expected.entrySet()) {
+        assertThat(actual.get(entry.getKey())[1]).isEqualTo(entry.getValue()[1]);
+        assertThat(actual.get(entry.getKey())[0])
+            .isCloseTo(entry.getValue()[0], org.assertj.core.data.Offset.offset(1e-6));
+      }
+    }
+  }
+
   private static void assertStarMatches(
       Table table,
       DeviceMergeOnReadScan device,

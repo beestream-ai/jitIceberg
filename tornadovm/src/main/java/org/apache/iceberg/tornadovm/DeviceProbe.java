@@ -44,8 +44,12 @@ public final class DeviceProbe {
     GREATER_EQUAL
   }
 
-  /** A key part: a fact column, or attribute {@code attribute} of dimension {@code dimension}. */
-  record Part(String column, int dimension, int attribute, int multiplier) {
+  /**
+   * A key part: a fact column, or attribute {@code attribute} of dimension {@code dimension}; its
+   * value less {@code offset}, which must lie in [0, {@code range}) for the row to join anything,
+   * times {@code multiplier}.
+   */
+  record Part(String column, int dimension, int attribute, int multiplier, int offset, int range) {
     boolean isAttribute() {
       return dimension >= 0;
     }
@@ -87,12 +91,26 @@ public final class DeviceProbe {
 
   /** Adds {@code column * multiplier} of the fact row to its key. */
   public DeviceProbe keyColumn(String factColumn, int multiplier) {
-    return with(new Part(factColumn, -1, -1, multiplier));
+    return keyColumn(factColumn, multiplier, 0, Integer.MAX_VALUE);
+  }
+
+  /**
+   * Adds {@code (column - offset) * multiplier} to the key; a row whose column is outside [offset,
+   * offset + range) joins nothing, so parts cannot alias one another.
+   */
+  public DeviceProbe keyColumn(String factColumn, int multiplier, int offset, int range) {
+    return with(new Part(factColumn, -1, -1, multiplier, offset, range));
   }
 
   /** Adds the code of the row's dimension attribute, times {@code multiplier}, to its key. */
   public DeviceProbe keyAttribute(int dimension, int attribute, int multiplier) {
-    return with(new Part(null, dimension, attribute, multiplier));
+    return keyAttribute(dimension, attribute, multiplier, 0, Integer.MAX_VALUE);
+  }
+
+  /** {@link #keyAttribute(int, int, int)} of {@code (code - offset)}, in [0, range) to join. */
+  public DeviceProbe keyAttribute(
+      int dimension, int attribute, int multiplier, int offset, int range) {
+    return with(new Part(null, dimension, attribute, multiplier, offset, range));
   }
 
   /** Joins only build rows whose value passes {@code factColumn comparison value}. */

@@ -99,6 +99,11 @@ public final class DeviceDimension {
     return attributes;
   }
 
+  /** How many attributes this dimension carries. */
+  public int attributeCount() {
+    return attributes.size();
+  }
+
   /** Ints this dimension takes on the device: the mask and every attribute. */
   long ints() {
     return (long) keys() * (1 + attributes.size());

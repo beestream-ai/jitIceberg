@@ -2637,6 +2637,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           probeSpec.set(base + 4, offsets.get(part.dimension())[part.attribute()]);
         }
         probeSpec.set(base + 5, part.multiplier());
+        probeSpec.set(base + 6, part.offset());
+        probeSpec.set(base + 7, part.range());
       }
       MemorySegment.copy(
           MemorySegment.ofArray(probe.keys()),
