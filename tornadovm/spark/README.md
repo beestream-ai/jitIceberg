@@ -111,6 +111,7 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 | `spark.iceberg.gpu.scanLog` | unset | a directory: per-scan timings of both readers, for `tornadovm/scanfit.py` |
 | `spark.iceberg.gpu.minRows` | `1000000` | fewest rows a Spark task must read for the GPU to read it; smaller tasks are faster on Spark's reader |
 | `spark.iceberg.gpu.aggregate.enabled` | `true` | the aggregate strategy |
+| `spark.iceberg.gpu.aggregate.nullable` | `false` | aggregates of columns that may hold nulls (SUM and AVG skip nulls, COUNT(column) counts the rest). Off by default: on TPC-DS it moves many small scalar subqueries to one device scan each, slower than Spark (q9 1.5 s to 4.3 s) |
 | `spark.iceberg.gpu.rewrite.enabled` | `true` | compaction on the GPU |
 
 | JVM property (driver) | Default | |

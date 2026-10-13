@@ -162,7 +162,8 @@ public final class GpuAggregates {
   /**
    * Sums of the columns and the row count per {@code bucket(buckets, column)} of a required LONG
    * column -- Iceberg's bucket transform, evaluated on the device -- as {@link
-   * GroupedAggregate#groups()} gives them: keyed by the bucket, sums then the row count.
+   * GroupedAggregate#groups()} gives them: keyed by the bucket, sums, the row count, then each
+   * column's non-null count.
    */
   public static Map<List<Object>, double[]> aggregateByBucket(
       Table table, Expression filter, String column, int buckets, List<String> sumColumns) {
@@ -176,8 +177,11 @@ public final class GpuAggregates {
         .groups()
         .forEach(
             (bucket, group) -> {
-              double[] totals = java.util.Arrays.copyOf(group.sums(), sumColumns.size() + 1);
-              totals[sumColumns.size()] = group.count();
+              int n = sumColumns.size();
+              double[] totals = java.util.Arrays.copyOf(group.sums(), 2 * n + 1);
+              totals[n] = group.count();
+              // The summed columns are null-free (the strategy checks): each counts every row.
+              java.util.Arrays.fill(totals, n + 1, 2 * n + 1, group.count());
               groups.put(List.of((long) bucket), totals);
             });
     return groups;

@@ -2284,6 +2284,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int keys;
     private final int groupKeyColumns;
     private final int values;
+    // A value's non-null count column after the row count, or -1 when it cannot be null.
+    private final int[] countColumn;
+    private final int counts;
     private final boolean[] stringKey;
     private final boolean[] nullableKey;
     private final IntArray groupSpec;
@@ -2315,10 +2318,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       this.valueSpec = hostInts((long) values * DeviceKernels.VALUE_SPEC_INTS);
       this.valueConstants = hostDoubles(2L * values * DeviceValue.MAX_FACTORS);
+      this.countColumn = new int[values];
+      int nullable = 0;
       for (int v = 0; v < values; v++) {
         List<DeviceValue.Factor> factors = sums.get(v).factors();
         int base = v * DeviceKernels.VALUE_SPEC_INTS;
         valueSpec.set(base, factors.size());
+        boolean canBeNull = factors.stream().anyMatch(f -> column(f.column()).isOptional());
+        countColumn[v] = canBeNull ? nullable++ : -1;
+        valueSpec.set(base + DeviceKernels.VALUE_SPEC_INTS - 1, countColumn[v]);
         for (int f = 0; f < factors.size(); f++) {
           DeviceValue.Factor factor = factors.get(f);
           Types.NestedField field = column(factor.column());
@@ -2333,11 +2341,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           valueConstants.set(c + 1, factor.scale());
         }
       }
+      this.counts = nullable;
       this.keyColumnsData = hostLongs((long) groupKeyColumns * capacity);
-      this.valueData = hostDoubles((long) (values + 1) * capacity);
+      this.valueData = hostDoubles((long) (values + 1 + counts) * capacity);
       this.outKeys = hostLongs((long) groupKeyColumns * capacity);
-      this.outSums = hostDoubles((long) (values + 1) * capacity);
-      this.size = new int[] {capacity, groupKeyColumns, values + 1};
+      this.outSums = hostDoubles((long) (values + 1 + counts) * capacity);
+      this.size = new int[] {capacity, groupKeyColumns, values + 1 + counts};
     }
 
     @Override
@@ -2395,12 +2404,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         executed.transferToHost(
             new DataRange(outKeys).withOffset((long) k * capacity).withSize(groups));
       }
-      for (int v = 0; v <= values; v++) {
+      for (int v = 0; v <= values + counts; v++) {
         executed.transferToHost(
             new DataRange(outSums).withOffset((long) v * capacity).withSize(groups));
       }
       long liveRows = 0;
       double[] sums = new double[values];
+      double[] nonNull = new double[values];
       for (int g = 0; g < groups; g++) {
         if (outKeys.get(g) == DeviceKernels.DEAD_KEY) {
           continue;
@@ -2418,7 +2428,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           sums[v] = outSums.get((long) v * capacity + g);
         }
         double rows = outSums.get((long) values * capacity + g);
-        result.add(key, sums, rows);
+        for (int v = 0; v < values; v++) {
+          nonNull[v] =
+              countColumn[v] < 0
+                  ? rows
+                  : outSums.get((long) (values + 1 + countColumn[v]) * capacity + g);
+        }
+        result.add(key, sums, rows, nonNull);
         liveRows += (long) rows;
       }
       return liveRows;

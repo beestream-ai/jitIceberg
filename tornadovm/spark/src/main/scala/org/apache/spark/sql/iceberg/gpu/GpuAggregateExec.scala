@@ -73,6 +73,8 @@ case class GpuAggregateSpec(
 
   private def row(key: Seq[AnyRef], totals: Array[Double]): InternalRow = {
     val rows = if (totals == null) 0L else totals(values.size).toLong
+    // The rows where value v is not null: COUNT(v), AVG's divisor, 0 when SUM is NULL.
+    def nonNull(v: Int): Long = if (totals == null) 0L else totals(values.size + 1 + v).toLong
     val keyLiterals = groupExpressions.zip(key).map { case (e, value) =>
       e.canonicalized -> Literal(sparkValue(e.dataType, value), e.dataType)
     }.toMap
@@ -81,9 +83,11 @@ case class GpuAggregateSpec(
         case ae: AggregateExpression =>
           val value: Any = aggregates(ae) match {
             case RowCount => rows
-            case SumOf(_) | AverageOf(_) if rows == 0 => null
-            case SumOf(v) => finish(ae.aggregateFunction, totals(v), rows)
-            case AverageOf(v) => finish(ae.aggregateFunction, totals(v), rows)
+            case CountOf(v) => nonNull(v)
+            case SumOf(v) if nonNull(v) == 0 => null
+            case AverageOf(v) if nonNull(v) == 0 => null
+            case SumOf(v) => finish(ae.aggregateFunction, totals(v), nonNull(v))
+            case AverageOf(v) => finish(ae.aggregateFunction, totals(v), nonNull(v))
           }
           Literal(value, ae.dataType)
         case e if keyLiterals.contains(e.canonicalized) => keyLiterals(e.canonicalized)

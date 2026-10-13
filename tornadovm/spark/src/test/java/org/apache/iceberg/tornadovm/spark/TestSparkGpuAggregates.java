@@ -37,6 +37,7 @@ import org.apache.spark.SparkEnv;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.iceberg.gpu.GpuAggregateStrategy;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -83,6 +84,8 @@ public class TestSparkGpuAggregates {
     SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.ENABLED, Boolean.toString(on));
     // These tables are small: read them on the device anyway.
     SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.MIN_ROWS, "0");
+    // Aggregates of nullable columns are opt-in; these tests cover them.
+    SparkEnv.get().conf().set(GpuAggregateStrategy.NullableValues(), Boolean.toString(on));
   }
 
   /** The query's rows, sorted, and whether the device aggregate produced them. */
@@ -176,12 +179,19 @@ public class TestSparkGpuAggregates {
             "SELECT shipdate, avg(price * qty) FROM lineitem WHERE id < 3000 GROUP BY shipdate",
             "SELECT flag, sum(id) FROM lineitem GROUP BY flag",
             "SELECT default_iceberg.system.bucket(16, id) b, count(*), sum(price), avg(disc)"
-                + " FROM lineitem WHERE disc > 0.02 GROUP BY b");
-    // Declined when planned (a SUM over nulls), or failed on the device (a group
+                + " FROM lineitem WHERE disc > 0.02 GROUP BY b",
+            // Nullable values: SUM and AVG skip nulls, COUNT(column) counts the rest. sparse is
+            // null exactly where qty % 5 == 1, so those groups sum to NULL with a count of 0.
+            "SELECT flag, sum(sparse), avg(sparse), count(sparse), count(*) FROM lineitem"
+                + " GROUP BY flag",
+            "SELECT qty, sum(sparse), avg(sparse), count(sparse), count(*) FROM lineitem"
+                + " GROUP BY qty",
+            "SELECT status, sum(sparse * disc), avg(price * (1 - disc)), sum(price)"
+                + " FROM lineitem WHERE shipdate > DATE '1993-01-01' GROUP BY status");
+    // Declined when planned (a computed group key), or failed on the device (a group
     // string over 8 bytes): the CPU answers.
     List<String> onCpu =
         ImmutableList.of(
-            "SELECT flag, sum(sparse) FROM lineitem GROUP BY flag",
             // TPC-DS q54's shape: the group key a projected expression, declined without failing.
             "SELECT segment, count(*), sum(price) FROM (SELECT CAST(price / 50 AS INT) segment,"
                 + " price FROM lineitem) GROUP BY segment",
@@ -217,6 +227,15 @@ public class TestSparkGpuAggregates {
     }
     for (int q = 0; q < onCpu.size() - 1; q++) {
       assertThat(device.get(onDevice.size() + q).onDevice()).as(onCpu.get(q)).isFalse();
+    }
+
+    // By default a SUM over a column that may hold nulls stays on Spark.
+    String nullable = "SELECT flag, sum(sparse) FROM lineitem GROUP BY flag";
+    SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.ENABLED, "true");
+    try {
+      assertThat(run(nullable).onDevice()).as("nullable values off by default").isFalse();
+    } finally {
+      gpu(false);
     }
   }
 

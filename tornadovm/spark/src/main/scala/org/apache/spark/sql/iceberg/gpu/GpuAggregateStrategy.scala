@@ -51,6 +51,7 @@ sealed trait DeviceAggregate
 case object RowCount extends DeviceAggregate
 case class SumOf(value: Int) extends DeviceAggregate
 case class AverageOf(value: Int) extends DeviceAggregate
+case class CountOf(value: Int) extends DeviceAggregate
 
 /**
  * Plans a grouped aggregate over an Iceberg table -- SUM, AVG and COUNT of products of double
@@ -64,6 +65,14 @@ case class AverageOf(value: Int) extends DeviceAggregate
 object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
   val Enabled = "spark.iceberg.gpu.enabled"
   val AggregateEnabled = "spark.iceberg.gpu.aggregate.enabled"
+
+  /**
+   * Aggregates of columns that may hold nulls (SUM and AVG skip them, COUNT(column) counts the
+   * rest), off by default: measured on TPC-DS SF10, they turn many small scalar subqueries (q9's
+   * fifteen) into one device scan each, slower than Spark's CPU (q9 1.5 s to 4.3 s). They pay where
+   * one device aggregate replaces a large CPU one, as with equality deletes.
+   */
+  val NullableValues = "spark.iceberg.gpu.aggregate.nullable"
 
   /** Read options that pick another state of the table than its current one. */
   private val TimeTravel = Set(
@@ -81,13 +90,14 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     override def initialValue(): Boolean = false
   }
 
-  private def enabled: Boolean = {
+  private def flag(key: String, default: String): Boolean = {
     val env = Option(SparkEnv.get).map(_.conf)
-    def flag(key: String, default: String): Boolean =
-      SQLConf.get.getConfString(key, env.map(_.get(key, default)).getOrElse(default)).toBoolean
-    flag(Enabled, "false") && flag(AggregateEnabled, "true") &&
-      env.exists(_.get("spark.master", "").startsWith("local"))
+    SQLConf.get.getConfString(key, env.map(_.get(key, default)).getOrElse(default)).toBoolean
   }
+
+  private def enabled: Boolean =
+    flag(Enabled, "false") && flag(AggregateEnabled, "true") &&
+      Option(SparkEnv.get).exists(_.conf.get("spark.master", "").startsWith("local"))
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case agg: Aggregate if !planningFallback.get() && enabled =>
@@ -152,7 +162,9 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
         else
           traverse(pairs.collect { case (ae, kind) if kind != RowCount => ae }) { ae =>
             ae.aggregateFunction.children match {
-              case Seq(a: AttributeReference) if a.dataType == DoubleType => Right(a.name)
+              // The bucket kernel sums plain columns and counts rows, not non-null values.
+              case Seq(a: AttributeReference) if a.dataType == DoubleType =>
+                nullFree(table, a).map(_ => a.name)
               case _ => Left(s"bucket aggregates sum plain double columns only: $ae")
             }
           }
@@ -250,6 +262,10 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     }
     def valueIndex(child: Expression): Either[String, Int] = deviceValue(table, child).map(add)
     ae.aggregateFunction match {
+      case Count(Seq(a: AttributeReference))
+          if a.nullable && flag(NullableValues, "false") && nullFree(table, a).isLeft =>
+        // COUNT of a column that may hold nulls: the rows where it is not null.
+        valueIndex(a).map(CountOf)
       case Count(children) =>
         traverse(children) {
           case l: Literal if l.value != null => Right(())
@@ -278,7 +294,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     case a: AttributeReference if exactType(a.dataType) =>
       for {
         f <- field(table, a)
-        _ <- nullFree(table, a)
+        _ <- valueMayBeNull(table, a)
         _ <-
           if (GpuAggregates.exactSum(table, a.name)) Right(())
           else Left(s"sum of ${a.name} may not be exact in doubles")
@@ -298,9 +314,9 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
   private case class OnePlus(column: String) extends Factor
 
   /**
-   * A product of non-null numeric columns and `1 - c`, `1 + c` factors, with at least one plain
-   * column: what [[DeviceValue]] evaluates. Non-null, so that a group's sum is never SQL's NULL
-   * and its row count is AVG's count.
+   * A product of numeric columns and `1 - c`, `1 + c` factors, with at least one plain column: what
+   * [[DeviceValue]] evaluates. A row where any factor's column is null adds nothing to the sum and
+   * is not counted in the value's non-null count, AVG's divisor (SQL's semantics for the product).
    */
   private def deviceValue(
       table: org.apache.iceberg.Table,
@@ -315,7 +331,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     def numeric(a: AttributeReference): Either[String, String] =
       field(table, a).flatMap { f =>
         f.`type`().typeId() match {
-          case TypeID.DOUBLE | TypeID.INTEGER | TypeID.LONG => nullFree(table, a).map(_ => f.name())
+          case TypeID.DOUBLE | TypeID.INTEGER | TypeID.LONG => valueMayBeNull(table, a).map(_ => f.name())
           case other => Left(s"not a device value column: $other")
         }
       }
@@ -344,6 +360,10 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       }
     }
   }
+
+  /** A value column: null-free, or nullable values switched on ([[NullableValues]]). */
+  private def valueMayBeNull(table: org.apache.iceberg.Table, a: Attribute): Either[String, Unit] =
+    if (flag(NullableValues, "false")) Right(()) else nullFree(table, a)
 
   private def nullFree(table: org.apache.iceberg.Table, a: Attribute): Either[String, Unit] =
     if (!a.nullable || GpuAggregates.nullFree(table, a.name)) Right(())

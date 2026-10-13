@@ -622,14 +622,18 @@ final class DeviceKernels {
     }
   }
 
-  /** Ints of {@code spec} a value: its factor count, then kind, slot and validity slot a factor. */
-  static final int VALUE_SPEC_INTS = 1 + 3 * DeviceValue.MAX_FACTORS;
+  /**
+   * Ints of {@code spec} a value: its factor count, then kind, slot and validity slot a factor,
+   * then the index of its non-null count column ({@code -1} for a value that cannot be null).
+   */
+  static final int VALUE_SPEC_INTS = 2 + 3 * DeviceValue.MAX_FACTORS;
 
   /**
    * Each {@link DeviceValue} of every live row, a column at {@code stride}, then a column of 1 a
-   * live row to count with: a product of {@code (offset + scale * column)} factors, 0 when a
-   * factor's column is null. A dropped row gets 0 everywhere. {@code constants} holds offset and
-   * scale a factor, {@code 2 * MAX_FACTORS} a value.
+   * live row to count with, then for each value that can be null a column of 1 where it is not: a
+   * product of {@code (offset + scale * column)} factors, 0 when a factor's column is null, as
+   * SQL's SUM skips it. A dropped row gets 0 everywhere. {@code constants} holds offset and scale a
+   * factor, {@code 2 * MAX_FACTORS} a value.
    */
   static void valueColumns(
       KernelContext context,
@@ -669,6 +673,12 @@ final class DeviceKernels {
           product = product * (constants.get(c) + constants.get(c + 1) * x);
         }
         out.set((long) v * stride + i, alive == 1 && isNull == 0 ? product : 0.0);
+        int countColumn = spec.get(base + VALUE_SPEC_INTS - 1);
+        if (countColumn >= 0) {
+          out.set(
+              (long) (values + 1 + countColumn) * stride + i,
+              alive == 1 && isNull == 0 ? 1.0 : 0.0);
+        }
       }
       out.set((long) values * stride + i, alive == 1 ? 1.0 : 0.0);
     }

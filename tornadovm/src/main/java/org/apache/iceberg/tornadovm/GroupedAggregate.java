@@ -35,15 +35,20 @@ public final class GroupedAggregate {
     this.values = values;
   }
 
-  synchronized void add(List<Object> key, double[] sums, double rows) {
-    double[] totals = groups.computeIfAbsent(key, ignored -> new double[values + 1]);
+  synchronized void add(List<Object> key, double[] sums, double rows, double[] nonNull) {
+    double[] totals = groups.computeIfAbsent(key, ignored -> new double[2 * values + 1]);
     for (int v = 0; v < values; v++) {
       totals[v] += sums[v];
+      totals[values + 1 + v] += nonNull[v];
     }
     totals[values] += rows;
   }
 
-  /** Each group's sums, in the order the values were given, then its row count. */
+  /**
+   * Each group's sums, in the order the values were given (a null value adds nothing, as in SQL's
+   * SUM), then its row count, then each value's count of rows where it is not null (SQL's
+   * COUNT(value), AVG's divisor, and 0 when SUM is NULL).
+   */
   public synchronized Map<List<Object>, double[]> groups() {
     return Maps.newHashMap(groups);
   }
