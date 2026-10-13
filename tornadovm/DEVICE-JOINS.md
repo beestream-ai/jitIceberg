@@ -382,6 +382,15 @@ leave each finest group its own output group (a dimension's codes are distinct t
 driver skips its merge map. q11 1.27 to 0.89 s, q74 1.25 to 0.84 s, q4 1.92 to 1.48 s, q23a/b
 3.06/3.59 to 2.86/3.18 s, the same answers.
 
+**Left semi joins (2026-10-13):** `x IN (subquery)` on a dense integer key is a dimension with no
+attributes: its mask is the distinct keys of the subquery, which Spark runs (any plan, an
+adaptive query stage included; those are not cached, as a stage hides its tables). A semi join on
+a fact column becomes such a dimension (`Distinct(Project(key, right))`); one on a dimension's
+columns (q14's `i_item_sk IN (cross items)`, q23's `c_customer_sk IN (best customers)`) joins
+that dimension's plan. Nothing changes on the device. q23b 4.87 to 1.57 s, q14a 4.11 to 1.75 s,
+q14b 3.27 to 1.33 s, the same answers (RAPIDS 2.44 / - / 2.59 s). Left anti and existence joins
+(q16, q10, q35, q69) remain on Spark.
+
 Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
 (stars, probes, key ranges, build sums, left outer).
 

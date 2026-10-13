@@ -32,6 +32,7 @@ import org.apache.spark.sql.catalyst.expressions.{Left => _, Right => _, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.LeftOuter
+import org.apache.spark.sql.catalyst.plans.LeftSemi
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.types._
@@ -333,10 +334,10 @@ object StarAggregates extends PredicateHelper {
     for {
       upper <- aboveJoins(below)
       (upperConditions, upperAliases, joins) = upper
-      tree <- joinTreeWithOuter(joins)
-      (leaves, joinConditions, outerJoins) = tree
+      tree <- starJoins(joins)
+      StarJoins(leaves, joinConditions, outerJoins, semiJoins) = tree
       _ <- if (outerJoins.size <= 1) Right(()) else Left("more than one left outer join")
-      _ <- if (leaves.size >= 2) Right(()) else Left("not a join")
+      _ <- if (leaves.size + semiJoins.size >= 2) Right(()) else Left("not a join")
       sized <- traverse(leaves) { leaf =>
         leaf.collect { case r: DataSourceV2ScanRelation => r } match {
           case Seq(relation) =>
@@ -346,7 +347,7 @@ object StarAggregates extends PredicateHelper {
       }
       (factLeaf, factRelation, _) = sized.maxBy(_._3)
       dimensionLeaves = sized.filter(_._1 ne factLeaf).map(_._1)
-      maxRows = sized.filter(_._1 ne factLeaf).map(_._3).max
+      maxRows = sized.filter(_._1 ne factLeaf).map(_._3).foldLeft(0L)(math.max)
       _ <-
         if (maxRows <= dimensionRowLimit) Right(())
         else Left(s"a dimension of $maxRows rows: not a star")
@@ -380,6 +381,13 @@ object StarAggregates extends PredicateHelper {
       factFilters = classified.collect { case Left(c) => c }
       filter <- GpuAggregateStrategy.icebergFilter(factFilters ++ factConditions)
       dimensionParts = classified.collect { case Right(part) => part }
+      // Left semi joins on a dimension's columns, by dimension; the others are on the fact's.
+      dimensionSemis = semiJoins.flatMap { semi =>
+        val own = semi._2.references -- semi._1.outputSet
+        val d = dimensionLeaves.indexWhere(l => own.nonEmpty && own.subsetOf(l.outputSet))
+        if (d >= 0) Some(d -> semi) else None
+      }
+      factSemis = semiJoins.filterNot(s => dimensionSemis.exists(_._2 eq s))
       // The Expand's value columns (the same child attribute in every projection) and what the
       // aggregates and group keys read.
       passThrough = expand.toSeq.flatMap { e =>
@@ -540,8 +548,13 @@ object StarAggregates extends PredicateHelper {
               _ <- denseByStatistics(dimensionLeaves(d), key)
             } yield {
               val leaf = dimensionLeaves(d)
+              val filtered = if (filters.isEmpty) leaf else Filter(filters.reduce(And), leaf)
               StarDimension(
-                if (filters.isEmpty) leaf else Filter(filters.reduce(And), leaf),
+                // A left semi join on the dimension's columns (q14's `i_item_sk IN (cross items)`)
+                // filters its rows: Spark runs it with the dimension's plan.
+                dimensionSemis.filter(_._1 == d).foldLeft(filtered: LogicalPlan) { case (p, (_, (right, cond))) =>
+                  Join(p, right, LeftSemi, Some(cond), JoinHint.NONE)
+                },
                 column,
                 key,
                 keyInputs.toSeq.filter(leaf.outputSet.contains))
@@ -558,12 +571,31 @@ object StarAggregates extends PredicateHelper {
         case Some((d, _)) => Left(s"grouped by attributes of ${d.key.name}'s table, over $maxGroups rows")
         case None => Right(())
       }
+      // A left semi join on a fact column (q23's `ss_item_sk IN (frequent items)`) is a dimension
+      // with no attributes: the distinct keys of its right side, a mask over their range.
+      semiDimensions <- traverse(factSemis) { case (right, cond) =>
+        val key = cond match {
+          case EqualTo(f: Attribute, k: Attribute) if factOutput.contains(f) && right.outputSet.contains(k) =>
+            Right((f, k))
+          case EqualTo(k: Attribute, f: Attribute) if factOutput.contains(f) && right.outputSet.contains(k) =>
+            Right((f, k))
+          case other => Left(s"left semi join condition $other")
+        }
+        for {
+          pair <- key
+          column <- factColumn(pair._1)
+          _ <- (table.schema().findField(column).`type`().typeId(), pair._2.dataType) match {
+            case (TypeID.INTEGER | TypeID.LONG, IntegerType | LongType) => Right(())
+            case other => Left(s"left semi join on $other")
+          }
+        } yield StarDimension(Distinct(Project(Seq(pair._2), right)), column, pair._2, Nil)
+      }
       deviceKeys = dimensions.count(_.attributes.nonEmpty) + factKeys.size
       _ <- if (deviceKeys <= 4) Right(()) else Left(s"$deviceKeys device group keys, at most 4")
     } yield GpuStarAggregateSpec(
       table,
       filter,
-      dimensions,
+      dimensions ++ semiDimensions,
       factKeys,
       values,
       conditionalAggregates,
@@ -758,24 +790,34 @@ object StarAggregates extends PredicateHelper {
   }
 
   /**
-   * {@link #joinTree}, also taking left outer joins of the tree with a plain scan: their right
-   * side and condition.
+   * A star's joins: the leaves of its inner joins and every condition in them, its left outer joins
+   * of a plain scan and its left semi joins (each the right side and the condition).
    */
-  private[gpu] def joinTreeWithOuter(plan: LogicalPlan)
-      : Either[String, (Seq[LogicalPlan], Seq[Expression], Seq[(LogicalPlan, Expression)])] =
+  private[gpu] case class StarJoins(
+      leaves: Seq[LogicalPlan],
+      conditions: Seq[Expression],
+      outer: Seq[(LogicalPlan, Expression)] = Nil,
+      semi: Seq[(LogicalPlan, Expression)] = Nil) {
+    def ++(other: StarJoins): StarJoins =
+      StarJoins(leaves ++ other.leaves, conditions ++ other.conditions, outer ++ other.outer, semi ++ other.semi)
+  }
+
+  /** {@link #joinTree}, also taking left outer joins of a plain scan and left semi joins. */
+  private[gpu] def starJoins(plan: LogicalPlan): Either[String, StarJoins] =
     plan match {
       case Join(left, right, LeftOuter, Some(cond), _) if !right.exists(_.isInstanceOf[Join]) =>
-        joinTreeWithOuter(left).map { case (l, c, o) => (l, c, o :+ (right -> cond)) }
+        starJoins(left).map(j => j.copy(outer = j.outer :+ (right -> cond)))
+      // The right side is any plan: Spark runs it, and the keys it returns are a dimension's.
+      case Join(left, right, LeftSemi, Some(cond), _) =>
+        starJoins(left).map(j => j.copy(semi = j.semi :+ (right -> cond)))
       case Join(left, right, Inner, condition, _) =>
-        for (l <- joinTreeWithOuter(left); r <- joinTreeWithOuter(right))
-          yield (l._1 ++ r._1, l._2 ++ r._2 ++ condition.toSeq.flatMap(splitConjunctivePredicates), l._3 ++ r._3)
+        for (l <- starJoins(left); r <- starJoins(right))
+          yield (l ++ r).copy(conditions = l.conditions ++ r.conditions ++ condition.toSeq.flatMap(splitConjunctivePredicates))
       case j: Join => Left(s"${j.joinType} join")
-      case p if !p.exists(_.isInstanceOf[Join]) => Right((Seq(p), Nil, Nil))
-      case Project(list, child) if list.forall(_.isInstanceOf[Attribute]) => joinTreeWithOuter(child)
+      case p if !p.exists(_.isInstanceOf[Join]) => Right(StarJoins(Seq(p), Nil))
+      case Project(list, child) if list.forall(_.isInstanceOf[Attribute]) => starJoins(child)
       case Filter(condition, child) =>
-        joinTreeWithOuter(child).map { case (leaves, conditions, o) =>
-          (leaves, conditions ++ splitConjunctivePredicates(condition), o)
-        }
+        starJoins(child).map(j => j.copy(conditions = j.conditions ++ splitConjunctivePredicates(condition)))
       case other => Left(s"between joins: ${other.nodeName}")
     }
 
@@ -823,7 +865,9 @@ object StarAggregates extends PredicateHelper {
     // dimensions on the same table reading other columns (q42's item categories, q52's brands)
     // look alike unless the columns' names are part of the key too.
     val columns = d.plan.collect { case r: DataSourceV2ScanRelation => r.output.map(_.name) }
-    if (snapshots.exists(_.isEmpty)) None
+    // A query stage of adaptive execution (a semi join's side) hides its tables: not cached.
+    val staged = d.plan.exists(_.isInstanceOf[org.apache.spark.sql.execution.adaptive.LogicalQueryStage])
+    if (staged || snapshots.exists(_.isEmpty)) None
     else
       Some(
         snapshots.flatten.mkString(",") + "|" + d.factColumn + "|" + columns.mkString(";") + "|" +

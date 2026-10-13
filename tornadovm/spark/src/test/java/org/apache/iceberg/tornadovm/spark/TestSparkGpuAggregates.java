@@ -433,6 +433,17 @@ public class TestSparkGpuAggregates {
             "SELECT s_state, sum(price), sum(coalesce(r_amt, 0)), sum(price - coalesce(r_loss, 0)),"
                 + " count(*) FROM store_sales LEFT OUTER JOIN rets ON id = r_id"
                 + " JOIN store ON store_sk = s_store_sk GROUP BY s_state",
+            // q23's and q14's: left semi joins, fact keys IN a subquery's (repeated) keys.
+            "SELECT s_state, sum(amount), count(*) FROM store_sales, store WHERE store_sk = s_store_sk"
+                + " AND item_sk IN (SELECT item_sk FROM store_sales GROUP BY item_sk"
+                + " HAVING count(*) > 130) GROUP BY s_state",
+            "SELECT sum(amount), count(*) FROM store_sales WHERE item_sk IN"
+                + " (SELECT i_item_sk FROM item WHERE i_brand LIKE 'brand #1%')"
+                + " AND date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_moy = 3)",
+            // A left semi join on a dimension's key, applied with the dimension's plan.
+            "SELECT i_brand, sum(amount) FROM store_sales, item WHERE item_sk = i_item_sk"
+                + " AND i_item_sk IN (SELECT item_sk FROM store_sales GROUP BY item_sk"
+                + " HAVING count(*) > 130) GROUP BY i_brand",
             // q67's value: a decimal product, nulls counted as 0.
             "SELECT i_category, i_class, sum(coalesce(price * qty, 0)) sumsales, sum(price * qty)"
                 + " FROM store_sales, item WHERE item_sk = i_item_sk"
