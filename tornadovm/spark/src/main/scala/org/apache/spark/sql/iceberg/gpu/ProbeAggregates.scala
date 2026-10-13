@@ -431,8 +431,9 @@ object ProbeAggregates extends PredicateHelper {
    * query collects its build sides again, as Spark computes its joins again.
    */
   private val collected = java.util.Collections.synchronizedMap(
-    new java.util.LinkedHashMap[String, BuildRows](8, 0.75f, true) {
-      override def removeEldestEntry(eldest: java.util.Map.Entry[String, BuildRows]): Boolean =
+    new java.util.LinkedHashMap[String, java.util.concurrent.CompletableFuture[BuildRows]](8, 0.75f, true) {
+      override def removeEldestEntry(
+          eldest: java.util.Map.Entry[String, java.util.concurrent.CompletableFuture[BuildRows]]): Boolean =
         size() > 4
     })
 
@@ -441,10 +442,23 @@ object ProbeAggregates extends PredicateHelper {
       StarAggregates.planKey(probe.build, s"$run|${probe.parts.size}|${probe.comparison.isDefined}|${probe.sums.size}")
     } match {
       case Some(key) =>
-        Option(collected.get(key)).getOrElse {
-          val rows = collectNow(session, probe)
-          collected.put(key, rows)
-          rows
+        // The two sides of a self-join start together: the second waits for the first's rows.
+        val mine = new java.util.concurrent.CompletableFuture[BuildRows]()
+        val running = collected.putIfAbsent(key, mine)
+        if (running != null) {
+          try running.join()
+          catch { case e: java.util.concurrent.CompletionException => throw e.getCause }
+        } else {
+          try {
+            val rows = collectNow(session, probe)
+            mine.complete(rows)
+            rows
+          } catch {
+            case e: Throwable =>
+              collected.remove(key, mine)
+              mine.completeExceptionally(e)
+              throw e
+          }
         }
       case None => collectNow(session, probe)
     }
