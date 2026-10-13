@@ -391,6 +391,13 @@ that dimension's plan. Nothing changes on the device. q23b 4.87 to 1.57 s, q14a 
 q14b 3.27 to 1.33 s, the same answers (RAPIDS 2.44 / - / 2.59 s). Left anti and existence joins
 (q16, q10, q35, q69) remain on Spark.
 
+**Aggregates over a union (2026-10-13):** an aggregate without group keys over a UNION ALL
+(q23a's `sum(sales)` over catalog and web sales) plans each branch as an aggregate of its own --
+a star, a probe, a scan, whichever planner takes it (`GpuAggregateStrategy.planDevice`, now one
+chain of planners) -- and adds the branches' partial SUMs and COUNTs on the driver
+(`UnionAggregates`, Spark only). q23a 4.18 to 0.59 s, the same answer (RAPIDS 2.13 s). AVG and
+group keys over a union (q14a's ROLLUP, q5) stay on Spark.
+
 Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
 (stars, probes, key ranges, build sums, left outer).
 

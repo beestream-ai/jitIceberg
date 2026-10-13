@@ -444,6 +444,10 @@ public class TestSparkGpuAggregates {
             "SELECT i_brand, sum(amount) FROM store_sales, item WHERE item_sk = i_item_sk"
                 + " AND i_item_sk IN (SELECT item_sk FROM store_sales GROUP BY item_sk"
                 + " HAVING count(*) > 130) GROUP BY i_brand",
+            // q23a's: sums over a UNION ALL of two stars, each branch on the device.
+            "SELECT sum(v), count(*), sum(q) FROM (SELECT amount v, qty q FROM store_sales, store"
+                + " WHERE store_sk = s_store_sk AND s_state = 'TN' UNION ALL SELECT amount, qty"
+                + " FROM store_sales, date_dim WHERE date_sk = d_date_sk AND d_moy = 3) u",
             // q67's value: a decimal product, nulls counted as 0.
             "SELECT i_category, i_class, sum(coalesce(price * qty, 0)) sumsales, sum(price * qty)"
                 + " FROM store_sales, item WHERE item_sk = i_item_sk"

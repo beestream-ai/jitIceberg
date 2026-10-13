@@ -152,34 +152,38 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case agg: Aggregate if !planningFallback.get() && enabled =>
-      // Whatever planning on the device cannot handle -- even by failing -- plans as Spark would.
-      scala.util.Try(deviceSpec(agg)).toEither.left.map(e => s"planning failed: $e").joinRight match {
+      planDevice(agg) match {
         case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
-        case Left(reason) if flag(StarEnabled, "false") =>
-          scala.util.Try(StarAggregates.spec(agg)).toEither.left
-            .map(e => s"planning failed: $e")
-            .joinRight match {
-            case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
-            case Left(starReason) if flag(ProbeAggregates.Enabled, "false") =>
-              scala.util.Try(ProbeAggregates.spec(agg)).toEither.left
-                .map(e => s"planning failed: $e")
-                .joinRight match {
-                case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
-                case Left(probeReason) =>
-                  logInfo(
-                    s"GPU aggregate declined: $reason; as a star aggregate: $starReason;" +
-                      s" as a probe aggregate: $probeReason")
-                  Nil
-              }
-            case Left(starReason) =>
-              logInfo(s"GPU aggregate declined: $reason; as a star aggregate: $starReason")
-              Nil
-          }
-        case Left(reason) =>
-          logInfo(s"GPU aggregate declined: $reason")
+        case Left(reasons) =>
+          logInfo(s"GPU aggregate declined: $reasons")
           Nil
       }
     case _ => Nil
+  }
+
+  /**
+   * The aggregate as the first planner that takes it plans it for the device -- over one scan,
+   * a star of joins, a probe join, a union of those -- or why each declined. Whatever planning
+   * cannot handle, even by failing, plans as Spark would.
+   */
+  private[gpu] def planDevice(agg: Aggregate): Either[String, DeviceAggregateSpec] = {
+    val joins =
+      (if (flag(StarEnabled, "false")) Seq("as a star aggregate: " -> (StarAggregates.spec _)) else Nil) ++
+        (if (flag(ProbeAggregates.Enabled, "false")) Seq("as a probe aggregate: " -> (ProbeAggregates.spec _))
+         else Nil)
+    val unions =
+      if (joins.isEmpty) Nil
+      else Seq("as a union aggregate: " -> ((a: Aggregate) => UnionAggregates.spec(a, planDevice)))
+    val planners: Seq[(String, Aggregate => Either[String, DeviceAggregateSpec])] =
+      Seq("" -> (deviceSpec _)) ++ joins ++ unions
+    val reasons = Seq.newBuilder[String]
+    val planned = planners.iterator.map { case (name, planner) =>
+      scala.util.Try(planner(agg)).toEither.left.map(e => s"planning failed: $e").joinRight.left.map { reason =>
+        reasons += name + reason
+        reason
+      }
+    }.find(_.isRight)
+    planned.getOrElse(Left(reasons.result().mkString("; ")))
   }
 
   private def deviceSpec(agg: Aggregate): Either[String, GpuAggregateSpec] = {
