@@ -79,6 +79,8 @@ public class TestSparkGpuAggregates {
 
   private static void gpu(boolean on) {
     SparkEnv.get().conf().set(GpuColumnarReaderProvider.ENABLED, Boolean.toString(on));
+    // These tables are small: read them on the device anyway.
+    SparkEnv.get().conf().set(GpuColumnarReaderProvider.MIN_ROWS, "0");
   }
 
   /** The query's rows, sorted, and whether the device aggregate produced them. */
@@ -178,6 +180,9 @@ public class TestSparkGpuAggregates {
     List<String> onCpu =
         ImmutableList.of(
             "SELECT flag, sum(sparse) FROM lineitem GROUP BY flag",
+            // TPC-DS q54's shape: the group key a projected expression, declined without failing.
+            "SELECT segment, count(*), sum(price) FROM (SELECT CAST(price / 50 AS INT) segment,"
+                + " price FROM lineitem) GROUP BY segment",
             "SELECT comment, sum(price) FROM lineitem GROUP BY comment");
 
     List<Answer> cpu = Lists.newArrayList();

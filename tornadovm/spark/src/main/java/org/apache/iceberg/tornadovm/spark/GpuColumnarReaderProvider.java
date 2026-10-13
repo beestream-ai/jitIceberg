@@ -46,6 +46,14 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
   /** The Spark configuration key that turns GPU reads on. */
   public static final String ENABLED = "spark.iceberg.gpu.enabled";
 
+  /**
+   * The fewest rows a Spark task must read for the device to read it: below that, a GPU round trip
+   * costs more than Spark's own reader takes for a small file -- a dimension table, say.
+   */
+  public static final String MIN_ROWS = "spark.iceberg.gpu.minRows";
+
+  private static final long DEFAULT_MIN_ROWS = 1_000_000L;
+
   @Override
   public PartitionReader<ColumnarBatch> create(
       Table table,
@@ -62,6 +70,11 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
     }
     if (!readable(expectedSchema)) {
       LOG.info("Reading on the CPU: the device does not read the columns of {}", expectedSchema);
+      return null;
+    }
+    long rows = taskGroup.tasks().stream().mapToLong(task -> task.file().recordCount()).sum();
+    if (rows < env.conf().getLong(MIN_ROWS, DEFAULT_MIN_ROWS)) {
+      LOG.debug("Reading on the CPU: {} rows", rows);
       return null;
     }
     for (FileScanTask task : taskGroup.tasks()) {
@@ -99,6 +112,8 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
         }
       }
     }
-    return !schema.columns().isEmpty();
+    // The device scan reads at least one numeric column, strings riding along.
+    return schema.columns().stream()
+        .anyMatch(field -> field.type().typeId() != org.apache.iceberg.types.Type.TypeID.STRING);
   }
 }

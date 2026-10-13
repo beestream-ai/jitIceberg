@@ -34,7 +34,24 @@ final class GpuScans {
   @SuppressWarnings("ShutdownHook")
   private static void closeAtExit() {
     Runtime.getRuntime()
-        .addShutdownHook(new Thread(() -> SCANS.values().forEach(DeviceMergeOnReadScan::close)));
+        .addShutdownHook(
+            new Thread(
+                () -> closeWithin(() -> SCANS.values().forEach(DeviceMergeOnReadScan::close))));
+  }
+
+  /**
+   * Runs {@code close} at exit for at most 10 seconds: freeing the device must not keep a JVM from
+   * exiting -- a scan stuck on a broken device would hold it, and the host memory, forever.
+   */
+  static void closeWithin(Runnable close) {
+    Thread closing = new Thread(close, "tornadovm-close");
+    closing.setDaemon(true);
+    closing.start();
+    try {
+      closing.join(10_000);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
   }
 
   static {

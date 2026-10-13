@@ -77,6 +77,8 @@ public class TestSparkGpuReads {
 
   private static void gpu(boolean on) {
     SparkEnv.get().conf().set(GpuColumnarReaderProvider.ENABLED, Boolean.toString(on));
+    // These tables are small: read them on the device anyway.
+    SparkEnv.get().conf().set(GpuColumnarReaderProvider.MIN_ROWS, "0");
   }
 
   private static List<String> sorted(List<Row> rows) {

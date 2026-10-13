@@ -59,11 +59,13 @@ public final class GpuAggregates {
     Runtime.getRuntime()
         .addShutdownHook(
             new Thread(
-                () -> {
-                  synchronized (SCANS) {
-                    SCANS.values().forEach(DeviceMergeOnReadScan::close);
-                  }
-                }));
+                () ->
+                    GpuScans.closeWithin(
+                        () -> {
+                          synchronized (SCANS) {
+                            SCANS.values().forEach(DeviceMergeOnReadScan::close);
+                          }
+                        })));
   }
 
   static {

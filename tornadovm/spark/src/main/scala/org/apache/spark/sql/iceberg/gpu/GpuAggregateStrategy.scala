@@ -91,7 +91,8 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case agg: Aggregate if !planningFallback.get() && enabled =>
-      deviceSpec(agg) match {
+      // Whatever planning on the device cannot handle -- even by failing -- plans as Spark would.
+      scala.util.Try(deviceSpec(agg)).toEither.left.map(e => s"planning failed: $e").joinRight match {
         case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
         case Left(reason) =>
           logInfo(s"GPU aggregate declined: $reason")
@@ -105,8 +106,12 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       source <- scanOf(agg.child)
       (conditions, aliases, relation) = source
       groupExpressions = agg.groupingExpressions.map(substitute(_, aliases))
-      resultExpressions = agg.aggregateExpressions.map(
-        substitute(_, aliases).asInstanceOf[NamedExpression])
+      resultExpressions = agg.aggregateExpressions.map {
+        // An output that is a projected alias keeps its name and id, now over what it stands for.
+        case a: Attribute if aliases.contains(a.exprId) =>
+          Alias(aliases(a.exprId), a.name)(exprId = a.exprId)
+        case named => substitute(named, aliases).asInstanceOf[NamedExpression]
+      }
       table <- relation.relation.table match {
         case t: SparkTable
             if t.snapshotId() == null &&
