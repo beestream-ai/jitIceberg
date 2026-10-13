@@ -280,6 +280,17 @@ the build side, slower than Spark; the build side must now be a fact table. The 
 by its aggregate's canonical plan, column names and snapshots (the build plan's aliases are new
 every planning).
 
+**Build rows with values (2026-10-13):** a probe's build rows can carry value columns
+(`DeviceValue.probe(k)`): each fact row adds the values of the build rows it joins, nulls skipped
+and counted apart, next to its own sums taken once a joined row. The planner turns SUM and AVG of
+build-only expressions into such columns (a decimal as its unscaled value, checked exact on the
+collected rows), and a table joined to the fact by more than one equality (store_returns: customer,
+item, ticket) is no longer taken for a dimension. Key multipliers are 64-bit (q25's key spans
+ticket x item x customer, ~10^17). **q25 2.46 to 1.04 s and q29 2.39 to 1.04 s from Spark, the
+same answers** (RAPIDS 1.26 / 1.29 s; q17 is declined: `stddev_samp`); the whole suite with stars
+and probes **127.0 to 109.2 s, 1.15x geomean, 102/102 equal**. Their build side -- returns joined
+with catalog sales, collected by Spark -- is now most of their time (~0.9 s).
+
 **Sales with their returns (measured 2026-10-13, `metrics.py`):** q50, q17, q25, q29 and q93 (1.3
 to 2.5 s each, ~10.6 s together) all sort-merge join `store_sales` (28.2M rows) with
 `store_returns` (2.8M) on (customer, item, ticket) for ~1.9M matches -- the 28M-row sort

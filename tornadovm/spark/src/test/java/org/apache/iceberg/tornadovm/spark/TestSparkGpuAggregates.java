@@ -456,7 +456,8 @@ public class TestSparkGpuAggregates {
    * item and on the week -- a date dimension's attribute on each side -- where the stock on hand is
    * below the quantity sold; the sales side with its own dimension filter, a condition across its
    * two dates and a left outer join to promotions. Grouped by the item's description, the
-   * warehouse's name and the week, counting rows: the same answer on the device as on Spark.
+   * warehouse's name and the week, counting rows; and sums of both sides' columns over the join
+   * (the sales side's summed per stock row): the same answers on the device as on Spark.
    */
   @Test
   public void testProbeAggregates() {
@@ -571,21 +572,29 @@ public class TestSparkGpuAggregates {
             + " LEFT OUTER JOIN promo ON cs_promo_sk = p_sk"
             + " WHERE d1.dd_week = d2.dd_week AND inv_qoh < cs_qty AND d3.dd_day > d1.dd_day + 2"
             + " AND d1.dd_year = 2000 GROUP BY it_desc, wh_name, d1.dd_week";
-    Answer cpu = run(sql);
-    gpu(true);
-    // These tables are small: a table over 1,000 rows is a fact, as sales is.
-    SparkEnv.get().conf().set(StarAggregates.MaxDimensionRows(), "1000");
-    Answer device;
-    try {
-      device = run(sql);
-    } finally {
-      gpu(false);
-      SparkEnv.get().conf().remove(StarAggregates.MaxDimensionRows());
+    // Sums of both sides' columns over the join: the build side's summed per stock row.
+    String sums =
+        "SELECT wh_name, sum(inv_qoh), sum(cs_qty), avg(cs_qty), count(*) FROM sales"
+            + " JOIN stock ON cs_item_sk = inv_item_sk JOIN wh ON wh_sk = inv_wh_sk"
+            + " JOIN dd d1 ON cs_sold_date_sk = d1.dd_sk JOIN dd d2 ON inv_date_sk = d2.dd_sk"
+            + " WHERE d1.dd_week = d2.dd_week AND inv_qoh < cs_qty GROUP BY wh_name";
+    for (String query : ImmutableList.of(sql, sums)) {
+      Answer cpu = run(query);
+      gpu(true);
+      // These tables are small: a table over 1,000 rows is a fact, as sales is.
+      SparkEnv.get().conf().set(StarAggregates.MaxDimensionRows(), "1000");
+      Answer device;
+      try {
+        device = run(query);
+      } finally {
+        gpu(false);
+        SparkEnv.get().conf().remove(StarAggregates.MaxDimensionRows());
+      }
+      assertThat(cpu.onDevice()).isFalse();
+      assertThat(cpu.rows()).isNotEmpty();
+      assertThat(device.onDevice()).as(query).isTrue();
+      assertSameAnswer(device.rows(), cpu.rows());
     }
-    assertThat(cpu.onDevice()).isFalse();
-    assertThat(cpu.rows()).isNotEmpty();
-    assertThat(device.onDevice()).as(sql).isTrue();
-    assertSameAnswer(device.rows(), cpu.rows());
   }
 
   /**

@@ -55,12 +55,14 @@ case class AttributePart(dimension: Int, attribute: Int) extends ProbePart
 /**
  * The other side of a probe join ([[ProbeAggregates]]): a plan Spark runs and collects, whose
  * columns are each key part's value, then the compared value when there is a comparison; the
- * fact side's parts; and how the fact's column compares with the build's value.
+ * fact side's parts; how the fact's column compares with the build's value; and how many build
+ * columns follow, summed over each fact row's joined rows.
  */
 case class StarProbe(
     build: LogicalPlan,
     parts: Seq[ProbePart],
-    comparison: Option[(String, DeviceProbe.Comparison)])
+    comparison: Option[(String, DeviceProbe.Comparison)],
+    sums: Int = 0)
 
 /**
  * An aggregate of `CASE WHEN predicate THEN value [ELSE 0 | NULL] END` whose predicate reads

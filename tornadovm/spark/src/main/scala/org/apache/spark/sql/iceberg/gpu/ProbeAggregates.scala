@@ -94,7 +94,17 @@ object ProbeAggregates extends PredicateHelper {
       // The probe side's dimensions: small leaves joined by their key to a probe-side column,
       // directly or through equalities.
       attached = others.filter(_._1 ne buildFact).flatMap { case (leaf, _, rows) =>
-        if (rows > StarAggregates.dimensionRowLimit) None
+        // A dimension joins by one key; a table joined to the fact by several equalities (TPC-DS
+        // store_returns: customer, item, ticket) is another fact, on the build side.
+        val links = conditions.count {
+          case EqualTo(a: Attribute, b: Attribute) =>
+            (leaf.outputSet.contains(a) && !leaf.outputSet.contains(b) &&
+              factAttribute(b, equivalent, factOutput).isDefined) ||
+              (leaf.outputSet.contains(b) && !leaf.outputSet.contains(a) &&
+                factAttribute(a, equivalent, factOutput).isDefined)
+          case _ => false
+        }
+        if (rows > StarAggregates.dimensionRowLimit || links != 1) None
         else
           conditions.collectFirst {
             case EqualTo(k: Attribute, other: Attribute)
@@ -143,11 +153,12 @@ object ProbeAggregates extends PredicateHelper {
       aggregateExpressions = agg.aggregateExpressions
         .flatMap(_.collect { case ae: AggregateExpression => ae })
         .distinct
+      outerOutput = AttributeSet(outerJoins.flatMap(_._1.output))
       translated <- {
         val values = mutable.ArrayBuffer[DeviceValue]()
+        val buildValues = mutable.ArrayBuffer[Expression]()
         traverse(aggregateExpressions) { ae =>
-          if (!ae.references.subsetOf(factOutput)) Left(s"aggregate of other columns: $ae")
-          else
+          if (ae.references.subsetOf(factOutput)) {
             GpuAggregateStrategy
               .deviceAggregate(
                 table,
@@ -155,9 +166,12 @@ object ProbeAggregates extends PredicateHelper {
                 values,
                 nullable = true)
               .map(ae -> _)
-        }.map(pairs => (pairs.toMap, values.toList))
+          } else if (ae.references.subsetOf(AttributeSet(buildSide.toSeq ++ outerOutput.toSeq))) {
+            buildAggregate(ae, values, buildValues).map(ae -> _)
+          } else Left(s"aggregate across both sides: $ae")
+        }.map(pairs => (pairs.toMap, values.toList, buildValues.toList))
       }
-      (aggregates, values) = translated
+      (aggregates, values, buildValueExpressions) = translated
       // COUNT(*) alone still needs a value column for the row count.
       deviceValues = if (values.isEmpty) List(DeviceValue.of(anyNumeric(table, factOutput))) else values
       // A group key from the build side equal to a probe-side dimension's attribute (q72's
@@ -225,7 +239,7 @@ object ProbeAggregates extends PredicateHelper {
         buildLeaves,
         classified.collect { case BuildCondition(c) => c },
         outerJoins,
-        keyParts.map(_.build) ++ comparisons.map(_.build))
+        keyParts.map(_.build) ++ comparisons.map(_.build) ++ buildValueExpressions)
       deviceKeys = dimensions.count(_.attributes.nonEmpty)
       _ <- if (deviceKeys <= 4) Right(()) else Left(s"$deviceKeys device group keys, at most 4")
     } yield GpuStarAggregateSpec(
@@ -239,7 +253,32 @@ object ProbeAggregates extends PredicateHelper {
       None,
       groupExpressions,
       resultExpressions,
-      Some(StarProbe(build, parts, comparison.headOption)))
+      Some(StarProbe(build, parts, comparison.headOption, buildValueExpressions.size)))
+  }
+
+  /**
+   * An aggregate of build-side columns: SUM or AVG of an integral or double expression
+   * (a decimal SUM or AVG as its unscaled value, Spark's own rewrite), each a build column the
+   * probe sums over every fact row's joined rows.
+   */
+  private def buildAggregate(
+      ae: AggregateExpression,
+      values: mutable.ArrayBuffer[DeviceValue],
+      buildValues: mutable.ArrayBuffer[Expression]): Either[String, DeviceAggregate] = {
+    import org.apache.spark.sql.catalyst.expressions.aggregate._
+    if (ae.isDistinct || ae.filter.isDefined) return Left(s"DISTINCT or FILTER: $ae")
+    def add(e: Expression): Either[String, Int] = e.dataType match {
+      case IntegerType | LongType | DoubleType =>
+        buildValues += e
+        values += DeviceValue.probe(buildValues.size - 1)
+        Right(values.size - 1)
+      case other => Left(s"build-side aggregate of $other: $ae")
+    }
+    ae.aggregateFunction match {
+      case Sum(child, _) => add(child).map(SumOf)
+      case Average(child, _) => add(child).map(AverageOf)
+      case other => Left(s"build-side aggregate $other")
+    }
   }
 
   private sealed trait Role
@@ -342,7 +381,7 @@ object ProbeAggregates extends PredicateHelper {
   }
 
   /** The build side's rows: each key part's value, then the compared value. */
-  case class BuildRows(parts: Array[Array[Long]], compared: Array[Long])
+  case class BuildRows(parts: Array[Array[Long]], compared: Array[Long], sums: Array[Array[Double]])
 
   private[gpu] def collect(session: SparkSession, probe: StarProbe): BuildRows = {
     val rows = Dataset.ofRows(session, probe.build).queryExecution.executedPlan.executeCollect()
@@ -353,11 +392,33 @@ object ProbeAggregates extends PredicateHelper {
     val types = probe.build.output.map(_.dataType)
     def long(row: InternalRow, i: Int) =
       if (types(i) == IntegerType) row.getInt(i).toLong else row.getLong(i)
-    // An inner equality never joins a null; a null compared value joins nothing either.
-    val live = rows.filter(r => (0 until types.size).forall(i => !r.isNullAt(i)))
+    // An inner equality never joins a null; a null compared value joins nothing either. Summed
+    // build values may be null (NaN, skipped on the device).
+    val compared = if (probe.comparison.isEmpty) 0 else 1
+    val live = rows.filter(r => (0 until n + compared).forall(i => !r.isNullAt(i)))
+    val sums = Array.tabulate(probe.sums) { k =>
+      val i = n + compared + k
+      live.map { r =>
+        if (r.isNullAt(i)) Double.NaN
+        else
+          types(i) match {
+            case IntegerType => r.getInt(i).toDouble
+            case LongType => r.getLong(i).toDouble
+            case _ => r.getDouble(i)
+          }
+      }
+    }
+    // Integral sums (decimals as unscaled values) must stay exact in the device's doubles.
+    sums.zipWithIndex.foreach { case (column, k) =>
+      if (types(n + compared + k) != DoubleType &&
+          column.filterNot(_.isNaN).map(math.abs).sum >= math.pow(2, 53)) {
+        throw new UnsupportedOperationException(s"build column $k may not sum exactly in doubles")
+      }
+    }
     BuildRows(
       Array.tabulate(n)(p => live.map(long(_, p))),
-      if (probe.comparison.isEmpty) new Array[Long](live.length) else live.map(long(_, n)))
+      if (compared == 0) new Array[Long](live.length) else live.map(long(_, n)),
+      sums)
   }
 
   /**
@@ -379,7 +440,7 @@ object ProbeAggregates extends PredicateHelper {
     var weight = 1L
     for (p <- n - 1 to 0 by -1) {
       multipliers(p) = weight
-      if (weight > Int.MaxValue || ranges(p) > Long.MaxValue / 4 / weight) {
+      if (ranges(p) > Long.MaxValue / 4 / weight) {
         throw new UnsupportedOperationException("probe key space too large")
       }
       weight *= ranges(p)
@@ -388,10 +449,10 @@ object ProbeAggregates extends PredicateHelper {
       (0 until n).map(p => (rows.parts(p)(r) - offsets(p)) * multipliers(p)).sum
     }
     var withCodes = built.map(_._1).toArray
-    var deviceProbe = DeviceProbe.of(keys, rows.compared)
+    var deviceProbe = DeviceProbe.of(keys, rows.compared, java.util.Arrays.asList(rows.sums: _*))
     probe.parts.zipWithIndex.foreach {
       case (FactPart(column), p) =>
-        deviceProbe = deviceProbe.keyColumn(column, multipliers(p).toInt, offsets(p).toInt, ranges(p).toInt)
+        deviceProbe = deviceProbe.keyColumn(column, multipliers(p), offsets(p).toInt, ranges(p).toInt)
       case (AttributePart(d, j), p) =>
         val raw = built(d)._3(j)
         val codes = raw.map { v =>
@@ -400,7 +461,7 @@ object ProbeAggregates extends PredicateHelper {
         }
         val index = (if (dimensions(d).attributes.nonEmpty) 1 else 0) + countAttributes(withCodes(d), dimensions(d))
         withCodes(d) = withCodes(d).withAttribute(codes)
-        deviceProbe = deviceProbe.keyAttribute(d, index, multipliers(p).toInt, 0, ranges(p).toInt)
+        deviceProbe = deviceProbe.keyAttribute(d, index, multipliers(p), 0, ranges(p).toInt)
     }
     probe.comparison.foreach { case (column, how) => deviceProbe = deviceProbe.where(column, how) }
     (withCodes.toSeq, deviceProbe)
