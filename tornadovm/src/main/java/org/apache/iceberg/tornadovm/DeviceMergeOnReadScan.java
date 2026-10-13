@@ -316,6 +316,42 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private final Map<String, SharedPool> sharedPools =
       new java.util.concurrent.ConcurrentHashMap<>();
 
+  /**
+   * Every pool in this JVM that holds device buffers, least recently used first. A query engine
+   * reads many tables and projections, each a pool of its own; past {@link #MAX_POOLS} the idle
+   * ones give their device memory back.
+   */
+  private static final Map<SharedPool, Boolean> LIVE_POOLS =
+      new java.util.LinkedHashMap<>(16, 0.75f, true);
+
+  private static final int MAX_POOLS = Integer.getInteger("iceberg.tornadovm.sharedPools", 6);
+
+  /** Frees the least recently used idle pools, other than {@code except}, down to {@code keep}. */
+  private static void evictIdle(SharedPool except, int keep) {
+    List<SharedPool> pools;
+    synchronized (LIVE_POOLS) {
+      pools = Lists.newArrayList(LIVE_POOLS.keySet());
+    }
+    int live = pools.size();
+    for (SharedPool pool : pools) {
+      if (live <= keep) {
+        return;
+      }
+      if (pool != except && pool.releaseIfIdle()) {
+        live--;
+      }
+    }
+  }
+
+  private static boolean outOfDeviceMemory(Throwable failure) {
+    for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+      if (cause instanceof uk.ac.manchester.tornado.api.exceptions.TornadoOutOfMemoryException) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Regions that take batches from any caller's request, for one projection. */
   private final class SharedPool {
     private final java.util.concurrent.LinkedBlockingQueue<Work> queue =
@@ -344,7 +380,26 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     long run(
         Planned planned,
         java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch) {
+      try {
+        return runOnce(planned, perBatch);
+      } catch (RuntimeException e) {
+        if (!outOfDeviceMemory(e)) {
+          throw e;
+        }
+        // Every other idle pool gives its memory back, and this one rebuilds once.
+        evictIdle(this, 0);
+        releaseIfIdle();
+        return runOnce(planned, perBatch);
+      }
+    }
+
+    private long runOnce(
+        Planned planned,
+        java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch) {
       ensureFits(planned);
+      synchronized (LIVE_POOLS) {
+        LIVE_POOLS.put(this, Boolean.TRUE);
+      }
       lock.readLock().lock();
       try {
         ScanMetrics batchMetrics = new ScanMetrics();
@@ -388,11 +443,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           return;
         }
         if (regions != null) {
-          for (int r = 0; r < regions.size(); r++) {
-            queue.add(new Work(null, -1, null, null, null, null));
-          }
-          regions.forEach(Region::close);
+          stopRegions();
         }
+        evictIdle(this, MAX_POOLS - 1);
         List<Region> created = Lists.newArrayList();
         for (int r = 0; r < STREAMS; r++) {
           Region region = new MaterializeRegion(planned);
@@ -405,15 +458,39 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
     }
 
+    /** Stops the region threads and frees their device buffers; the write lock is held. */
+    private void stopRegions() {
+      for (int r = 0; r < regions.size(); r++) {
+        queue.add(new Work(null, -1, null, null, null, null));
+      }
+      regions.forEach(Region::close);
+      regions = null;
+      synchronized (LIVE_POOLS) {
+        LIVE_POOLS.remove(this);
+      }
+    }
+
+    /** Frees the device buffers unless a request is in flight; the next request rebuilds them. */
+    boolean releaseIfIdle() {
+      if (!lock.writeLock().tryLock()) {
+        return false;
+      }
+      try {
+        if (regions == null) {
+          return false;
+        }
+        stopRegions();
+        return true;
+      } finally {
+        lock.writeLock().unlock();
+      }
+    }
+
     void close() {
       lock.writeLock().lock();
       try {
         if (regions != null) {
-          for (int r = 0; r < regions.size(); r++) {
-            queue.add(new Work(null, -1, null, null, null, null));
-          }
-          regions.forEach(Region::close);
-          regions = null;
+          stopRegions();
         }
         hostPool.shutdown();
       } finally {
@@ -422,7 +499,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     private void loop(Region region) {
-      TornadoExecutionPlan executionPlan = region.plan();
+      TornadoExecutionPlan executionPlan;
+      RuntimeException broken = null;
+      try {
+        executionPlan = region.plan();
+      } catch (RuntimeException e) {
+        // Out of device memory, say: this region fails the work it takes rather than leave it.
+        executionPlan = null;
+        broken = e;
+      }
       while (true) {
         Work work;
         try {
@@ -433,6 +518,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
         if (work.planned() == null) {
           return;
+        }
+        if (broken != null) {
+          work.done().completeExceptionally(broken);
+          continue;
         }
         try {
           work.done()
@@ -1010,6 +1099,37 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    */
   private abstract static class Region implements AutoCloseable {
     /**
+     * Where this region's host buffers live, freed when the region closes. TornadoVM's own arrays
+     * come from automatic arenas, which give their memory back only when the garbage collector
+     * finds them unreachable: a query engine opening and closing regions for many tables would hold
+     * gigabytes of dead buffers until an old-generation collection.
+     */
+    private final java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofShared();
+
+    private java.lang.foreign.MemorySegment hostSegment(long elements, int bytes) {
+      return arena.allocate(
+          uk.ac.manchester.tornado.api.types.arrays.TornadoNativeArray.ARRAY_HEADER
+              + elements * bytes,
+          Long.BYTES);
+    }
+
+    final IntArray hostInts(long elements) {
+      return IntArray.fromSegmentShallow(hostSegment(elements, Integer.BYTES));
+    }
+
+    final LongArray hostLongs(long elements) {
+      return LongArray.fromSegmentShallow(hostSegment(elements, Long.BYTES));
+    }
+
+    final DoubleArray hostDoubles(long elements) {
+      return DoubleArray.fromSegmentShallow(hostSegment(elements, Double.BYTES));
+    }
+
+    final ByteArray hostBytes(long elements) {
+      return ByteArray.fromSegmentShallow(hostSegment(elements, Byte.BYTES));
+    }
+
+    /**
      * Per field of the layout, whether no file of the current batch holds a null there (by its
      * metrics), so that its validity bytes need not come back.
      */
@@ -1031,7 +1151,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final long[] rowsHolder = new long[1];
     final int[] columns;
     final int[] probeSizes = new int[2];
-    final IntArray meta = new IntArray(DeviceKernels.META_SIZE);
+    final IntArray meta = hostInts(DeviceKernels.META_SIZE);
     final ByteArray positionBits;
     final StringBuilder positionPath = new StringBuilder(PATH_CAPACITY);
     final long[] positionRowsHolder = new long[1];
@@ -1044,16 +1164,16 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final int[] setColumn = new int[1];
     final boolean filtered;
     final IntArray filterTerms =
-        new IntArray(1 + DevicePredicate.TERM_INTS * DevicePredicate.MAX_TERMS);
-    final LongArray filterLongs = new LongArray(DevicePredicate.MAX_CONSTANTS);
-    final DoubleArray filterDoubles = new DoubleArray(DevicePredicate.MAX_CONSTANTS);
+        hostInts(1 + DevicePredicate.TERM_INTS * DevicePredicate.MAX_TERMS);
+    final LongArray filterLongs = hostLongs(DevicePredicate.MAX_CONSTANTS);
+    final DoubleArray filterDoubles = hostDoubles(DevicePredicate.MAX_CONSTANTS);
     final ByteArray inSet;
     final IntArray setInts;
     final LongArray setLongs;
     final IntArray sortedInts;
     final LongArray sortedLongs;
     final int[] sortSize = new int[1];
-    final IntArray setSize = new IntArray(1);
+    final IntArray setSize = hostInts(1);
     // Equality deletes over several columns: the set as loaded, then in hash order.
     final int keyColumns;
     final IntArray keySpec;
@@ -1062,7 +1182,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     final ByteArray rawNulls;
     final IntArray keyOrder;
     final int[] keySortSize = {0, 1};
-    final IntArray keySetChanged = new IntArray(1);
+    final IntArray keySetChanged = hostInts(1);
     final LongArray keyHashes;
     final LongArray keyValues;
     final ByteArray keyNulls;
@@ -1134,10 +1254,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.columns = new int[layout.numericCount()];
       this.stringColumns = new int[layout.stringCount()];
       long strings = layout.stringCount();
-      this.stringOffsets = new IntArray(strings == 0 ? 1 : (int) (strings * (capacity + 1L)));
+      this.stringOffsets = hostInts(strings == 0 ? 1 : (int) (strings * (capacity + 1L)));
       this.stringStride = planned.stringStride;
-      this.stringChars = new ByteArray(strings == 0 ? 1L : strings * stringStride);
-      this.stringErrors = new IntArray((int) Math.max(1, strings));
+      this.stringChars = hostBytes(strings == 0 ? 1L : strings * stringStride);
+      this.stringErrors = hostInts(Math.max(1, strings));
       this.keyedIds = new java.util.HashSet<>(planned.keyedIds);
       this.probeSizes[0] = capacity;
 
@@ -1145,7 +1265,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.keyColumns = planned.keyIds.size();
       boolean composite = keyColumns > 1;
       long keyCells = composite ? (long) keyColumns * equalityCapacity : 1L;
-      this.keySpec = new IntArray(Math.max(1, 3 * keyColumns));
+      this.keySpec = hostInts(Math.max(1, 3 * keyColumns));
       for (int c = 0; c < keyColumns; c++) {
         int keyId = planned.keyIds.get(c);
         keySpec.set(3 * c, layout.type(keyId) == CudfType.INT32 ? 0 : 1);
@@ -1156,37 +1276,35 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 ? layout.readIndex(keyId)
                 : -1);
       }
-      this.rawHashes = new LongArray(composite ? equalityCapacity : 1);
-      this.rawKeys = new LongArray(keyCells);
-      this.rawNulls = new ByteArray(keyCells);
-      this.keyOrder = new IntArray(composite ? equalityCapacity : 1);
-      this.keyHashes = new LongArray(composite ? equalityCapacity : 1);
-      this.keyValues = new LongArray(keyCells);
-      this.keyNulls = new ByteArray(keyCells);
-      this.positionBits = new ByteArray((capacity + 7) / 8);
-      this.positions = new LongArray(positionCapacity);
-      this.segmentStarts = new IntArray(maxFiles);
-      this.segmentOffsets = new IntArray(maxFiles);
-      this.inSet = new ByteArray(equality || composite ? capacity : 1);
-      this.setInts =
-          new IntArray(equality && equalityKeyType == CudfType.INT32 ? equalityCapacity : 1);
+      this.rawHashes = hostLongs(composite ? equalityCapacity : 1);
+      this.rawKeys = hostLongs(keyCells);
+      this.rawNulls = hostBytes(keyCells);
+      this.keyOrder = hostInts(composite ? equalityCapacity : 1);
+      this.keyHashes = hostLongs(composite ? equalityCapacity : 1);
+      this.keyValues = hostLongs(keyCells);
+      this.keyNulls = hostBytes(keyCells);
+      this.positionBits = hostBytes((capacity + 7) / 8);
+      this.positions = hostLongs(positionCapacity);
+      this.segmentStarts = hostInts(maxFiles);
+      this.segmentOffsets = hostInts(maxFiles);
+      this.inSet = hostBytes(equality || composite ? capacity : 1);
+      this.setInts = hostInts(equality && equalityKeyType == CudfType.INT32 ? equalityCapacity : 1);
       this.setLongs =
-          new LongArray(equality && equalityKeyType == CudfType.INT64 ? equalityCapacity : 1);
+          hostLongs(equality && equalityKeyType == CudfType.INT64 ? equalityCapacity : 1);
       boolean sortedInt = equality && SORTED_PROBE && equalityKeyType == CudfType.INT32;
       boolean sortedLong = equality && SORTED_PROBE && equalityKeyType == CudfType.INT64;
-      this.sortedInts = new IntArray(sortedInt ? equalityCapacity : 1);
-      this.sortedLongs = new LongArray(sortedLong ? equalityCapacity : 1);
-      this.ints = new IntArray(Math.max(1L, (long) layout.slots(CudfType.INT32) * capacity));
-      this.longs = new LongArray(Math.max(1L, (long) layout.slots(CudfType.INT64) * capacity));
-      this.doubles =
-          new DoubleArray(Math.max(1L, (long) layout.slots(CudfType.FLOAT64) * capacity));
+      this.sortedInts = hostInts(sortedInt ? equalityCapacity : 1);
+      this.sortedLongs = hostLongs(sortedLong ? equalityCapacity : 1);
+      this.ints = hostInts(Math.max(1L, (long) layout.slots(CudfType.INT32) * capacity));
+      this.longs = hostLongs(Math.max(1L, (long) layout.slots(CudfType.INT64) * capacity));
+      this.doubles = hostDoubles(Math.max(1L, (long) layout.slots(CudfType.FLOAT64) * capacity));
       // The string read writes validity for its columns whether or not they are optional.
       this.valid =
-          new ByteArray(
+          hostBytes(
               layout.anyOptional() || layout.stringCount() > 0
                   ? (long) layout.fields().size() * capacity
                   : 1L);
-      this.live = new ByteArray(capacity);
+      this.live = hostBytes(capacity);
     }
 
     boolean fits(Planned planned) {
@@ -1327,10 +1445,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           new CudfType[] {CudfType.INT64},
           positionRowsHolder,
           positionCapacity,
-          new IntArray(1),
+          hostInts(1),
           positions,
-          new DoubleArray(1),
-          new ByteArray(1),
+          hostDoubles(1),
+          hostBytes(1),
           false);
       int keyValidOffset = 0;
       if (equality) {
@@ -1348,10 +1466,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             new CudfType[] {layout.readType(equalityKeyId)},
             setRowsHolder,
             equalityCapacity,
-            intKey ? setInts : new IntArray(1),
-            intKey ? new LongArray(1) : setLongs,
-            new DoubleArray(1),
-            new ByteArray(1),
+            intKey ? setInts : hostInts(1),
+            intKey ? hostLongs(1) : setLongs,
+            hostDoubles(1),
+            hostBytes(1),
             false);
         // The key is slot 0 of its type, so the probe reads it from offset 0.
         if (SORTED_PROBE) {
@@ -1610,6 +1728,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                     }
                     plan = null;
                   }
+                  // The device copies are gone with the plan; the host buffers go now, not at
+                  // the next collection.
+                  arena.close();
                 })
             .get();
       } catch (java.util.concurrent.ExecutionException e) {
@@ -1631,10 +1752,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final IntArray groupKeys;
     private final IntArray sumKeys;
     private final DoubleArray sums;
-    private final IntArray sumGroups = new IntArray(1);
+    private final IntArray sumGroups = hostInts(1);
     private final IntArray countKeys;
     private final DoubleArray counts;
-    private final IntArray countGroups = new IntArray(1);
+    private final IntArray countGroups = hostInts(1);
     private final IntArray validColumn;
 
     AggregateRegion(Planned planned, String groupColumn, int buckets, String[] sumNames) {
@@ -1651,11 +1772,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         validColumns[c] = field.isOptional() ? layout.readIndex(field.fieldId()) : -1;
       }
       this.validColumn = IntArray.fromArray(validColumns);
-      this.groupKeys = new IntArray(capacity);
-      this.sumKeys = new IntArray(capacity);
-      this.sums = new DoubleArray((long) sumColumns * capacity);
-      this.countKeys = new IntArray(capacity);
-      this.counts = new DoubleArray(capacity);
+      this.groupKeys = hostInts(capacity);
+      this.sumKeys = hostInts(capacity);
+      this.sums = hostDoubles((long) sumColumns * capacity);
+      this.countKeys = hostInts(capacity);
+      this.counts = hostDoubles(capacity);
     }
 
     @Override
@@ -1763,7 +1884,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int doubleSlots;
     private final int validSlots;
     private final IntArray compacted;
-    private final IntArray liveCount = new IntArray(1);
+    private final IntArray liveCount = hostInts(1);
     private final IntArray outInts;
     private final LongArray outLongs;
     private final DoubleArray outDoubles;
@@ -1813,11 +1934,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.longSlots = layout.slots(CudfType.INT64);
       this.doubleSlots = layout.slots(CudfType.FLOAT64);
       this.validSlots = layout.anyOptional() ? layout.fields().size() : 0;
-      this.compacted = new IntArray(capacity);
-      this.outInts = new IntArray(Math.max(1L, (long) intSlots * capacity));
-      this.outLongs = new LongArray(Math.max(1L, (long) (longSlots + extraLongSlots) * capacity));
-      this.outDoubles = new DoubleArray(Math.max(1L, (long) doubleSlots * capacity));
-      this.outValid = new ByteArray(Math.max(1L, (long) validSlots * capacity));
+      this.compacted = hostInts(capacity);
+      this.outInts = hostInts(Math.max(1L, (long) intSlots * capacity));
+      this.outLongs = hostLongs(Math.max(1L, (long) (longSlots + extraLongSlots) * capacity));
+      this.outDoubles = hostDoubles(Math.max(1L, (long) doubleSlots * capacity));
+      this.outValid = hostBytes(Math.max(1L, (long) validSlots * capacity));
       for (Types.NestedField field : layout.fields()) {
         idByName.put(field.name(), field.fieldId());
       }
@@ -1968,7 +2089,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final DoubleArray valueData;
     private final LongArray outKeys;
     private final DoubleArray outSums;
-    private final IntArray outGroups = new IntArray(1);
+    private final IntArray outGroups = hostInts(1);
     private final int[] size;
 
     GroupedRegion(Planned planned, List<String> groupColumns, List<DeviceValue> sums) {
@@ -1978,7 +2099,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.values = sums.size();
       this.stringKey = new boolean[keys];
       this.nullableKey = new boolean[keys];
-      this.groupSpec = new IntArray(Math.max(1, 3 * keys));
+      this.groupSpec = hostInts(Math.max(1, 3 * keys));
       for (int k = 0; k < keys; k++) {
         Types.NestedField field = column(groupColumns.get(k));
         stringKey[k] = layout.isString(field.fieldId());
@@ -1988,8 +2109,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         groupSpec.set(3 * k + 1, layout.slot(field.fieldId()));
         groupSpec.set(3 * k + 2, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
       }
-      this.valueSpec = new IntArray(values * DeviceKernels.VALUE_SPEC_INTS);
-      this.valueConstants = new DoubleArray(2L * values * DeviceValue.MAX_FACTORS);
+      this.valueSpec = hostInts((long) values * DeviceKernels.VALUE_SPEC_INTS);
+      this.valueConstants = hostDoubles(2L * values * DeviceValue.MAX_FACTORS);
       for (int v = 0; v < values; v++) {
         List<DeviceValue.Factor> factors = sums.get(v).factors();
         int base = v * DeviceKernels.VALUE_SPEC_INTS;
@@ -2008,10 +2129,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           valueConstants.set(c + 1, factor.scale());
         }
       }
-      this.keyColumnsData = new LongArray((long) groupKeyColumns * capacity);
-      this.valueData = new DoubleArray((long) (values + 1) * capacity);
-      this.outKeys = new LongArray((long) groupKeyColumns * capacity);
-      this.outSums = new DoubleArray((long) (values + 1) * capacity);
+      this.keyColumnsData = hostLongs((long) groupKeyColumns * capacity);
+      this.valueData = hostDoubles((long) (values + 1) * capacity);
+      this.outKeys = hostLongs((long) groupKeyColumns * capacity);
+      this.outSums = hostDoubles((long) (values + 1) * capacity);
       this.size = new int[] {capacity, groupKeyColumns, values + 1};
     }
 
@@ -2109,7 +2230,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final boolean[] optional;
     private final boolean lineage;
     private final IntArray fileStarts;
-    private final IntArray fileCount = new IntArray(1);
+    private final IntArray fileCount = hostInts(1);
     private final LongArray firstRowIds;
     private final LongArray sequences;
     private final int zColumns;
@@ -2127,10 +2248,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       super(planned, lineage ? 2 : 0);
       this.lineage = lineage;
       this.zColumns = zorderColumns.size();
-      this.zSpec = new IntArray(Math.max(1, 3 * zColumns));
+      this.zSpec = hostInts(Math.max(1, 3 * zColumns));
       this.zSize = new int[] {0, zColumns + 1};
-      this.zKeys = new LongArray(zColumns == 0 ? 1L : (long) (zColumns + 1) * capacity);
-      this.zOrder = new IntArray(zColumns == 0 ? 1 : capacity);
+      this.zKeys = hostLongs(zColumns == 0 ? 1L : (long) (zColumns + 1) * capacity);
+      this.zOrder = hostInts(zColumns == 0 ? 1 : capacity);
       for (int c = 0; c < zColumns; c++) {
         Types.NestedField field = table.schema().findField(zorderColumns.get(c));
         if (field == null) {
@@ -2143,9 +2264,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             3 * c + 2,
             layout.anyOptional() && field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
       }
-      this.fileStarts = new IntArray(maxFiles);
-      this.firstRowIds = new LongArray(maxFiles);
-      this.sequences = new LongArray(maxFiles);
+      this.fileStarts = hostInts(maxFiles);
+      this.firstRowIds = hostLongs(maxFiles);
+      this.sequences = hostLongs(maxFiles);
       List<Types.NestedField> fields = Lists.newArrayList(layout.fields());
       if (lineage) {
         fields.add(MetadataColumns.ROW_ID);
