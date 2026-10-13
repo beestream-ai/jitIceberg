@@ -112,6 +112,9 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 | `spark.iceberg.gpu.minRows` | `1000000` | fewest rows a Spark task must read for the GPU to read it; smaller tasks are faster on Spark's reader |
 | `spark.iceberg.gpu.aggregate.enabled` | `true` | the aggregate strategy |
 | `spark.iceberg.gpu.aggregate.nullable` | `false` | aggregates of columns that may hold nulls (SUM and AVG skip nulls, COUNT(column) counts the rest). Off by default: on TPC-DS it moves many small scalar subqueries to one device scan each, slower than Spark (q9 1.5 s to 4.3 s) |
+| `spark.iceberg.gpu.aggregate.star` | `false` | star aggregates: an aggregate over inner joins of one Iceberg fact table with small dimensions, the joins done on the device by key lookup (`tornadovm/DEVICE-JOINS.md`). TPC-DS SF10: 20 star queries 1.37x geomean, the whole suite 1.08x |
+| `spark.iceberg.gpu.aggregate.star.maxGroups` | `131072` | most finest groups a star may produce (the product of its dimensions' attribute tuples); larger ones run on Spark |
+| `spark.iceberg.gpu.aggregate.star.maxDimensionRows` | `10000000` | largest table a star treats as a dimension |
 | `spark.iceberg.gpu.rewrite.enabled` | `true` | compaction on the GPU |
 
 | JVM property (driver) | Default | |
@@ -123,6 +126,9 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 | `iceberg.tornadovm.cacheDir` | `java.io.tmpdir`/`iceberg-tornadovm-cache` | local copies of object-store files |
 | `iceberg.tornadovm.cacheBytes` | 64 GB | the cache's size; least recently used files go first |
 | `iceberg.tornadovm.fetchThreads` | `16` | parallel fetches from the object store |
+| `iceberg.tornadovm.aggregateShapes` | `6` | aggregate query shapes (group columns, values, a star's joins) whose device regions are kept JVM-wide; past this the least recently used idle ones are freed |
+| `iceberg.tornadovm.keptScans` | `8` | device scans (table snapshot and filter) the aggregate strategy keeps |
+| `iceberg.tornadovm.eagerZeroes` | `false` | allocate regions' host buffers zero-filled up front instead of as lazily mapped pages (which need `--enable-native-access=ALL-UNNAMED`; without it the scan falls back to this) |
 | `iceberg.tornadovm.sharedPools` | `6` | table and projection shapes that keep device buffers. Past this, the least recently used idle ones are freed |
 | `iceberg.tornadovm.spark.debug` | `false` | per-task timings on stderr |
 | `iceberg.tornadovm.debug` | `false` | per-batch and per-compaction-group sizes on stderr |

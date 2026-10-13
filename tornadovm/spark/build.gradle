@@ -102,7 +102,7 @@ tasks.register('tornadoModules') {
 test {
   dependsOn 'tornadoModules'
   useJUnitPlatform()
-  jvmArgs '--enable-preview', "@${tornadoArgfile.get().asFile}", '-da:tornado...', '-da:uk.ac.manchester.tornado...'
+  jvmArgs '--enable-preview', "@${tornadoArgfile.get().asFile}", '--enable-native-access=ALL-UNNAMED', '-da:tornado...', '-da:uk.ac.manchester.tornado...'
   jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
   if (project.hasProperty('extraJvmArgs')) {
     jvmArgs project.extraJvmArgs

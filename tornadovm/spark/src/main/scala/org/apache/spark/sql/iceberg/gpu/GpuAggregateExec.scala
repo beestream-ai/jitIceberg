@@ -36,6 +36,11 @@ import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 import scala.collection.JavaConverters._
 
+/** What [[GpuAggregateExec]] runs: an aggregate's result rows, computed with the device. */
+trait DeviceAggregateSpec {
+  def run(): Seq[InternalRow]
+}
+
 /** An aggregate as the device computes it: see [[GpuAggregateStrategy]]. */
 case class GpuAggregateSpec(
     table: org.apache.iceberg.Table,
@@ -46,7 +51,8 @@ case class GpuAggregateSpec(
     sumColumns: Seq[String],
     values: Seq[DeviceValue],
     aggregates: Map[AggregateExpression, DeviceAggregate],
-    resultExpressions: Seq[NamedExpression]) {
+    resultExpressions: Seq[NamedExpression])
+    extends DeviceAggregateSpec {
 
   /** The result rows: each output expression with its aggregates and group columns filled in. */
   def run(): Seq[InternalRow] = {
@@ -71,28 +77,92 @@ case class GpuAggregateSpec(
     }
   }
 
-  private def row(key: Seq[AnyRef], totals: Array[Double]): InternalRow = {
-    val rows = if (totals == null) 0L else totals(values.size).toLong
+  private lazy val results =
+    new DeviceResults(groupExpressions, values.size, aggregates, resultExpressions)
+
+  private def row(key: Seq[AnyRef], totals: Array[Double]): InternalRow =
+    results.row(
+      groupExpressions.zip(key).map { case (e, value) => DeviceResults.sparkValue(e.dataType, value) },
+      totals)
+
+  override def toString: String =
+    s"${table.name()} filter=$filter group=${groupColumns.mkString("[", ", ", "]")} " +
+      bucket.map { case (c, n) => s"bucket($n, $c) " }.getOrElse("") +
+      s"values=${values.mkString("[", ", ", "]")}"
+}
+
+/**
+ * The rows of a device aggregate, from its groups' sums and counts: the output expressions are
+ * bound once -- each group expression and aggregate a slot of an input row, each aggregate's
+ * evaluation (Spark's own, over its buffer) bound to the buffer the device's totals fill -- and
+ * evaluated per group.
+ */
+class DeviceResults(
+    groupExpressions: Seq[Expression],
+    values: Int,
+    aggregates: Map[AggregateExpression, DeviceAggregate],
+    resultExpressions: Seq[NamedExpression]) {
+  private val ordered = aggregates.keys.toVector
+  private val slots = ordered.zipWithIndex.toMap
+  private val groups = groupExpressions.size
+  private val keySlots = groupExpressions.zipWithIndex.map { case (e, i) => e.canonicalized -> i }.toMap
+
+  private val outputs: Seq[Expression] = resultExpressions.map { output =>
+    output.transformDown {
+      case ae: AggregateExpression => BoundReference(groups + slots(ae), ae.dataType, nullable = true)
+      case e if keySlots.contains(e.canonicalized) =>
+        BoundReference(keySlots(e.canonicalized), e.dataType, nullable = true)
+    }
+  }
+
+  /** Per aggregate with a sum: its buffer's fields and Spark's evaluation bound to them. */
+  private case class Finish(sumType: DataType, scale: Int, fields: Seq[String], evaluate: Expression)
+
+  private val finishes: Vector[Finish] = ordered.map { ae =>
+    aggregates(ae) match {
+      case SumOf(_) | AverageOf(_) | SumAll(_) =>
+        val buffer = ae.aggregateFunction.asInstanceOf[DeclarativeAggregate]
+        val attributes = buffer.aggBufferAttributes
+        val scale = ae.aggregateFunction.children.head.dataType match {
+          case d: DecimalType => d.scale
+          case _ => 0
+        }
+        Finish(
+          attributes.head.dataType,
+          scale,
+          attributes.map(_.name),
+          BindReferences.bindReference(buffer.evaluateExpression, attributes))
+      case _ => null
+    }
+  }
+
+  /**
+   * One result row. {@code key} holds the group expressions' values, as Spark's internal values;
+   * {@code totals} the group's sums, its row count and each value's non-null count, or null for a
+   * global aggregate of no rows (counts 0, sums and averages NULL).
+   */
+  def row(key: Seq[Any], totals: Array[Double]): InternalRow = {
+    val rows = if (totals == null) 0L else totals(values).toLong
     // The rows where value v is not null: COUNT(v), AVG's divisor, 0 when SUM is NULL.
-    def nonNull(v: Int): Long = if (totals == null) 0L else totals(values.size + 1 + v).toLong
-    val keyLiterals = groupExpressions.zip(key).map { case (e, value) =>
-      e.canonicalized -> Literal(sparkValue(e.dataType, value), e.dataType)
-    }.toMap
-    InternalRow.fromSeq(resultExpressions.map { output =>
-      output.transformDown {
-        case ae: AggregateExpression =>
-          val value: Any = aggregates(ae) match {
-            case RowCount => rows
-            case CountOf(v) => nonNull(v)
-            case SumOf(v) if nonNull(v) == 0 => null
-            case AverageOf(v) if nonNull(v) == 0 => null
-            case SumOf(v) => finish(ae.aggregateFunction, totals(v), nonNull(v))
-            case AverageOf(v) => finish(ae.aggregateFunction, totals(v), nonNull(v))
-          }
-          Literal(value, ae.dataType)
-        case e if keyLiterals.contains(e.canonicalized) => keyLiterals(e.canonicalized)
-      }.eval(null)
-    })
+    def nonNull(v: Int): Long = if (totals == null) 0L else totals(values + 1 + v).toLong
+    val input = new Array[Any](groups + ordered.size)
+    key.copyToArray(input)
+    var a = 0
+    while (a < ordered.size) {
+      input(groups + a) = aggregates(ordered(a)) match {
+        case RowCount => rows
+        case CountOf(v) => nonNull(v)
+        case SumOf(v) if nonNull(v) == 0 => null
+        case AverageOf(v) if nonNull(v) == 0 => null
+        case SumOf(v) => finish(finishes(a), totals(v), nonNull(v))
+        case SumAll(_) if rows == 0 => null
+        case SumAll(v) => finish(finishes(a), totals(v), rows)
+        case AverageOf(v) => finish(finishes(a), totals(v), nonNull(v))
+      }
+      a += 1
+    }
+    val row = new GenericInternalRow(input)
+    InternalRow.fromSeq(outputs.map(_.eval(row)))
   }
 
   /**
@@ -101,33 +171,27 @@ case class GpuAggregateSpec(
    * applies its result type, rounding and overflow rules. A sum the device holds exactly (a
    * decimal's unscaled value, an integer) goes into the buffer exactly.
    */
-  private def finish(function: AggregateFunction, sum: Double, rows: Long): Any = {
-    val buffer = function.asInstanceOf[DeclarativeAggregate]
-    val attributes = buffer.aggBufferAttributes
-    val sumType = attributes.head.dataType
-    val sumValue: Any = sumType match {
+  private def finish(f: Finish, sum: Double, rows: Long): Any = {
+    val sumValue: Any = f.sumType match {
       case DoubleType => sum
       case LongType => Math.round(sum)
       case d: DecimalType =>
-        val scale = function.children.head.dataType.asInstanceOf[DecimalType].scale
-        Decimal(java.math.BigDecimal.valueOf(Math.round(sum), scale), d.precision, d.scale)
+        Decimal(java.math.BigDecimal.valueOf(Math.round(sum), f.scale), d.precision, d.scale)
       case other => throw new IllegalStateException(s"sum buffer of $other")
     }
-    val literals: Map[ExprId, Literal] = attributes.map { a =>
-      a.exprId -> (a.name match {
-        case "sum" => Literal(sumValue, sumType)
-        case "count" => Literal(rows, LongType)
-        case "isEmpty" => Literal(false, BooleanType)
-        case other => throw new IllegalStateException(s"buffer attribute $other of $function")
-      })
-    }.toMap
-    buffer.evaluateExpression.transform {
-      case a: AttributeReference if literals.contains(a.exprId) => literals(a.exprId)
-    }.eval(null)
+    val buffer = f.fields.map {
+      case "sum" => sumValue
+      case "count" => rows
+      case "isEmpty" => false
+      case other => throw new IllegalStateException(s"buffer attribute $other")
+    }
+    f.evaluate.eval(new GenericInternalRow(buffer.toArray[Any]))
   }
+}
 
+object DeviceResults {
   /** A device group key -- Long, String or null -- as Spark's internal value. */
-  private def sparkValue(dataType: DataType, value: AnyRef): Any = (dataType, value) match {
+  def sparkValue(dataType: DataType, value: AnyRef): Any = (dataType, value) match {
     case (_, null) => null
     case (IntegerType | DateType, n: java.lang.Number) => n.intValue()
     case (LongType | TimestampType, n: java.lang.Number) => n.longValue()
@@ -136,11 +200,6 @@ case class GpuAggregateSpec(
       Decimal.createUnsafe(n.longValue(), d.precision, d.scale)
     case (t, v) => throw new IllegalStateException(s"group key $v for $t")
   }
-
-  override def toString: String =
-    s"${table.name()} filter=$filter group=${groupColumns.mkString("[", ", ", "]")} " +
-      bucket.map { case (c, n) => s"bucket($n, $c) " }.getOrElse("") +
-      s"values=${values.mkString("[", ", ", "]")}"
 }
 
 /**
@@ -151,7 +210,7 @@ case class GpuAggregateSpec(
  */
 case class GpuAggregateExec(
     output: Seq[Attribute],
-    @transient spec: GpuAggregateSpec,
+    @transient spec: DeviceAggregateSpec,
     @transient logical: LogicalPlan)
     extends LeafExecNode {
 
@@ -159,7 +218,20 @@ case class GpuAggregateExec(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "deviceTime" -> SQLMetrics.createTimingMetric(sparkContext, "device aggregate time"))
 
+  /**
+   * Starts the aggregate on a driver thread and returns at once: Spark materializes a query's
+   * stages one after another, so a subquery computed here in line would hold back the others --
+   * TPC-DS q77's six star aggregates ran in series while Spark's own plans overlap. The one-row
+   * RDD's task waits for the result. Local mode only (the strategy's precondition): the task
+   * finds the result in this JVM. When the device cannot run it after all, the same thread
+   * aggregates on the CPU and collects the rows.
+   */
   override protected def doExecute(): RDD[InternalRow] = {
+    val id = GpuAggregateExec.start(this)
+    sparkContext.parallelize(Seq(id), 1).mapPartitions(ids => GpuAggregateExec.await(ids.next()))
+  }
+
+  private[gpu] def compute(): Seq[InternalRow] = {
     val start = System.nanoTime()
     val rows =
       try {
@@ -167,6 +239,10 @@ case class GpuAggregateExec(
       } catch {
         case e: RuntimeException =>
           logWarning(s"GPU aggregate failed, aggregating on the CPU: ${e.getMessage}")
+          spec match {
+            case star: GpuStarAggregateSpec => StarAggregates.remember(star)
+            case _ =>
+          }
           None
       }
     rows match {
@@ -174,19 +250,54 @@ case class GpuAggregateExec(
         longMetric("deviceTime") += (System.nanoTime() - start) / 1000000
         longMetric("numOutputRows") += result.size
         val toUnsafe = UnsafeProjection.create(schema)
-        sparkContext.parallelize(result.map(r => toUnsafe(r).copy(): InternalRow).toVector, 1)
+        result.map(r => toUnsafe(r).copy(): InternalRow).toVector
       case None => cpu()
     }
   }
 
-  private def cpu(): RDD[InternalRow] = {
+  private def cpu(): Seq[InternalRow] = {
     GpuAggregateStrategy.planningFallback.set(true)
     try {
-      Dataset.ofRows(session, logical).queryExecution.toRdd
+      Dataset.ofRows(session, logical).queryExecution.executedPlan.executeCollect().toVector
     } finally {
       GpuAggregateStrategy.planningFallback.set(false)
     }
   }
 
   override def simpleString(maxFields: Int): String = s"GpuIcebergAggregate $spec"
+}
+
+object GpuAggregateExec {
+  private val threads = java.util.concurrent.Executors.newCachedThreadPool { runnable =>
+    val thread = new Thread(runnable, "gpu-aggregate")
+    thread.setDaemon(true)
+    thread
+  }
+  private val ids = new java.util.concurrent.atomic.AtomicLong()
+
+  // Results by id; kept for the last few so that an RDD computed again still finds its rows.
+  private val results = java.util.Collections.synchronizedMap(
+    new java.util.LinkedHashMap[Long, java.util.concurrent.Future[Seq[InternalRow]]](64, 0.75f, false) {
+      override def removeEldestEntry(
+          eldest: java.util.Map.Entry[Long, java.util.concurrent.Future[Seq[InternalRow]]]): Boolean =
+        size() > 64
+    })
+
+  private[gpu] def start(exec: GpuAggregateExec): Long = {
+    val id = ids.incrementAndGet()
+    val session = exec.session
+    results.put(
+      id,
+      threads.submit { () =>
+        org.apache.spark.sql.SparkSession.setActiveSession(session)
+        exec.compute()
+      })
+    id
+  }
+
+  private[gpu] def await(id: Long): Iterator[InternalRow] =
+    Option(results.get(id))
+      .getOrElse(throw new IllegalStateException(s"GPU aggregate $id is no longer kept"))
+      .get()
+      .iterator
 }

@@ -86,6 +86,32 @@ public class TestSparkGpuAggregates {
     SparkEnv.get().conf().set(GpuPartitionReaderFactoryProvider.MIN_ROWS, "0");
     // Aggregates of nullable columns are opt-in; these tests cover them.
     SparkEnv.get().conf().set(GpuAggregateStrategy.NullableValues(), Boolean.toString(on));
+    SparkEnv.get().conf().set(GpuAggregateStrategy.StarEnabled(), Boolean.toString(on));
+  }
+
+  /** A small Iceberg table of the given rows, as a temporary view. */
+  private void view(
+      String name,
+      Schema schema,
+      int files,
+      long rows,
+      java.util.function.LongFunction<GenericRecord> row) {
+    String location = temp.resolve(name).toString();
+    Table table = MorTables.create(location, schema, 2);
+    List<DataFile> written = Lists.newArrayList();
+    long perFile = (rows + files - 1) / files;
+    for (int f = 0; f < files; f++) {
+      long from = f * perFile;
+      long count = Math.min(perFile, rows - from);
+      written.add(MorTables.writeDataFile(table, count, i -> row.apply(from + i)));
+    }
+    MorTables.append(table, written);
+    if (name.equals("store_sales")) {
+      MorTables.deletePositions(
+          table, written, ImmutableList.of(new long[] {0, 9, 1_234}, new long[] {7}, new long[0]));
+      MorTables.deleteEqual(table, "id", ImmutableList.of(5L, 12_345L, 29_999L));
+    }
+    spark.read().format("iceberg").load(location).createOrReplaceTempView(name);
   }
 
   /** The query's rows, sorted, and whether the device aggregate produced them. */
@@ -236,6 +262,189 @@ public class TestSparkGpuAggregates {
       assertThat(run(nullable).onDevice()).as("nullable values off by default").isFalse();
     } finally {
       gpu(false);
+    }
+  }
+
+  /**
+   * Star aggregates: a fact table under deletes, inner-joined with date, item and store dimensions
+   * -- TPC-DS q3's and q22's shapes (ROLLUP, AVG of a nullable column), three joins with filters on
+   * the fact and dimension tables, fact columns as group keys, a global aggregate -- the same
+   * answers with the joins on the device as on Spark. A left join, an aggregate of a dimension
+   * column and a fact column as a group key are declined; a dimension with a repeated key fails on
+   * the device and runs on the CPU.
+   */
+  @Test
+  public void testStarAggregates() {
+    Schema sales =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "date_sk", Types.LongType.get()),
+            Types.NestedField.optional(3, "item_sk", Types.IntegerType.get()),
+            Types.NestedField.optional(4, "store_sk", Types.LongType.get()),
+            Types.NestedField.optional(5, "qty", Types.IntegerType.get()),
+            Types.NestedField.optional(6, "price", Types.DecimalType.of(7, 2)),
+            Types.NestedField.optional(7, "amount", Types.DoubleType.get()));
+    view(
+        "store_sales",
+        sales,
+        3,
+        30_000,
+        id -> {
+          GenericRecord r = GenericRecord.create(sales);
+          r.setField("id", id);
+          r.setField("date_sk", id % 97 == 0 ? null : 2_415_022L + (id * 31) % 420);
+          r.setField("item_sk", (int) (1 + (id * 17) % 230)); // items 201..230 are not in item
+          r.setField("store_sk", 1 + id % 12);
+          r.setField("qty", id % 13 == 0 ? null : (int) (id % 40));
+          r.setField("price", java.math.BigDecimal.valueOf((id * 7919) % 99_999, 2));
+          r.setField("amount", (id % 1000) * 0.5);
+          return r;
+        });
+    Schema dates =
+        new Schema(
+            Types.NestedField.required(1, "d_date_sk", Types.LongType.get()),
+            Types.NestedField.optional(2, "d_year", Types.LongType.get()),
+            Types.NestedField.optional(3, "d_moy", Types.IntegerType.get()));
+    view(
+        "date_dim",
+        dates,
+        1,
+        400,
+        k -> {
+          GenericRecord r = GenericRecord.create(dates);
+          r.setField("d_date_sk", 2_415_022L + k);
+          r.setField("d_year", 2000L + k / 120);
+          r.setField("d_moy", (int) (1 + (k / 10) % 12));
+          return r;
+        });
+    Schema items =
+        new Schema(
+            Types.NestedField.required(1, "i_item_sk", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "i_brand", Types.StringType.get()),
+            Types.NestedField.optional(3, "i_class", Types.StringType.get()),
+            Types.NestedField.optional(4, "i_category", Types.StringType.get()),
+            Types.NestedField.optional(5, "i_product_name", Types.StringType.get()));
+    view(
+        "item",
+        items,
+        1,
+        200,
+        k -> {
+          GenericRecord r = GenericRecord.create(items);
+          r.setField("i_item_sk", (int) (1 + k));
+          r.setField("i_brand", "brand #" + (k % 9));
+          r.setField("i_class", "class " + (k % 4));
+          r.setField("i_category", k % 11 == 0 ? null : "category " + (k % 3));
+          r.setField("i_product_name", "a product name longer than eight bytes " + (k % 50));
+          return r;
+        });
+    Schema stores =
+        new Schema(
+            Types.NestedField.required(1, "s_store_sk", Types.LongType.get()),
+            Types.NestedField.optional(2, "s_state", Types.StringType.get()));
+    view(
+        "store",
+        stores,
+        1,
+        10, // stores 11 and 12 are not in store
+        k -> {
+          GenericRecord r = GenericRecord.create(stores);
+          r.setField("s_store_sk", 1 + k);
+          r.setField("s_state", k % 3 == 0 ? "TN" : "GA");
+          return r;
+        });
+    view(
+        "item_twice",
+        items,
+        1,
+        40,
+        k -> {
+          GenericRecord r = GenericRecord.create(items);
+          r.setField("i_item_sk", (int) (1 + k % 20));
+          r.setField("i_brand", "brand #" + (k % 2));
+          return r;
+        });
+
+    List<String> onDevice =
+        ImmutableList.of(
+            // q3
+            "SELECT d_year, i_brand, sum(price) s FROM date_dim, store_sales, item"
+                + " WHERE d_date_sk = date_sk AND item_sk = i_item_sk AND d_moy = 11"
+                + " GROUP BY d_year, i_brand",
+            // q22
+            "SELECT i_product_name, i_brand, i_class, i_category, avg(qty) qoh"
+                + " FROM store_sales, date_dim, item, store WHERE date_sk = d_date_sk"
+                + " AND item_sk = i_item_sk AND store_sk = s_store_sk AND d_year BETWEEN 2000 AND 2001"
+                + " GROUP BY ROLLUP(i_product_name, i_brand, i_class, i_category)",
+            // Three joins, fact and dimension filters, a dimension's key as a group key.
+            "SELECT s_state, i_category, s_store_sk, count(*), sum(amount), avg(price), count(qty)"
+                + " FROM store_sales JOIN item ON item_sk = i_item_sk JOIN store ON s_store_sk = store_sk"
+                + " JOIN date_dim ON d_date_sk = date_sk WHERE amount > 10 AND i_brand LIKE 'brand #1%'"
+                + " AND d_moy IN (1, 2, 12) GROUP BY s_state, i_category, s_store_sk",
+            "SELECT sum(amount), count(*) FROM store_sales, store WHERE store_sk = s_store_sk"
+                + " AND s_state = 'TN'",
+            "SELECT d_year, d_moy, sum(qty) FROM store_sales, date_dim WHERE date_sk = d_date_sk"
+                + " GROUP BY CUBE(d_year, d_moy)",
+            // q43's and q21's shape: aggregates of a CASE on dimension columns.
+            "SELECT s_state, sum(CASE WHEN d_moy = 1 THEN price END) jan,"
+                + " sum(CASE WHEN d_moy = 2 THEN price ELSE 0 END) feb,"
+                + " count(CASE WHEN d_moy > 6 THEN 1 END) late,"
+                + " avg(CASE WHEN d_year = 2000 THEN amount END) y2000,"
+                + " sum(CASE WHEN d_year = 2001 THEN qty ELSE 0 END) q2001, count(*)"
+                + " FROM store_sales, date_dim, store WHERE date_sk = d_date_sk"
+                + " AND store_sk = s_store_sk GROUP BY s_state",
+            // The same filtered dimension read for other columns, one query after the other (q42
+            // and q52): built dimensions are kept, and must not be mistaken for each other.
+            "SELECT i_class, sum(amount) FROM store_sales, item WHERE item_sk = i_item_sk"
+                + " AND i_category = 'category 1' GROUP BY i_class",
+            "SELECT i_brand, sum(amount) FROM store_sales, item WHERE item_sk = i_item_sk"
+                + " AND i_category = 'category 1' GROUP BY i_brand",
+            // q67's value: a decimal product, nulls counted as 0.
+            "SELECT i_category, i_class, sum(coalesce(price * qty, 0)) sumsales, sum(price * qty)"
+                + " FROM store_sales, item WHERE item_sk = i_item_sk"
+                + " GROUP BY ROLLUP(i_category, i_class)");
+    List<String> onCpu =
+        ImmutableList.of(
+            "SELECT i_brand, count(*) FROM store_sales LEFT JOIN item ON item_sk = i_item_sk"
+                + " GROUP BY i_brand",
+            "SELECT i_brand, sum(d_moy) FROM store_sales, date_dim, item"
+                + " WHERE date_sk = d_date_sk AND item_sk = i_item_sk GROUP BY i_brand",
+            // A fact column as a group key: groups unbounded.
+            "SELECT store_sk, i_brand, sum(amount) FROM store_sales, item WHERE item_sk = i_item_sk"
+                + " GROUP BY store_sk, i_brand",
+            // Planned on the device, failed there (item_twice repeats keys): Spark answers.
+            "SELECT i_brand, sum(amount) FROM store_sales, item_twice WHERE item_sk = i_item_sk"
+                + " GROUP BY i_brand");
+
+    List<Answer> cpu = Lists.newArrayList();
+    for (String sql : onDevice) {
+      cpu.add(run(sql));
+    }
+    for (String sql : onCpu) {
+      cpu.add(run(sql));
+    }
+    gpu(true);
+    List<Answer> device = Lists.newArrayList();
+    try {
+      for (String sql : onDevice) {
+        device.add(run(sql));
+      }
+      for (String sql : onCpu) {
+        device.add(run(sql));
+      }
+    } finally {
+      gpu(false);
+    }
+    for (int q = 0; q < cpu.size(); q++) {
+      assertThat(cpu.get(q).onDevice()).isFalse();
+      assertThat(cpu.get(q).rows()).isNotEmpty();
+      assertSameAnswer(device.get(q).rows(), cpu.get(q).rows());
+    }
+    for (int q = 0; q < onDevice.size(); q++) {
+      assertThat(device.get(q).onDevice()).as(onDevice.get(q)).isTrue();
+    }
+    for (int q = 0; q < onCpu.size() - 1; q++) {
+      assertThat(device.get(onDevice.size() + q).onDevice()).as(onCpu.get(q)).isFalse();
     }
   }
 

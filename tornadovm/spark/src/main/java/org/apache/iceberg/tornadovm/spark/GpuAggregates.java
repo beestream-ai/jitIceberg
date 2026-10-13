@@ -30,6 +30,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
+import org.apache.iceberg.tornadovm.DeviceDimension;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
@@ -43,19 +44,56 @@ import org.apache.spark.sql.SparkSession;
  * most recently used, as each holds device memory.
  */
 public final class GpuAggregates {
-  private static final int KEPT = 4;
+  // A TPC-DS query reads up to six fact tables (q77: three channels' sales and returns), each its
+  // own scan; their host buffers are only resident where touched (LazyZeroes).
+  private static final int KEPT = Integer.getInteger("iceberg.tornadovm.keptScans", 8);
 
   private static final Map<String, DeviceMergeOnReadScan> SCANS =
       new LinkedHashMap<>(16, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, DeviceMergeOnReadScan> eldest) {
           if (size() > KEPT) {
-            eldest.getValue().close();
+            // Closed once the map's lock is released, under the scan's own: a query may still be
+            // running on it.
+            EVICTED.add(eldest.getValue());
             return true;
           }
           return false;
         }
       };
+
+  // Scans dropped from SCANS, to close outside its lock (guarded by SCANS).
+  private static final List<DeviceMergeOnReadScan> EVICTED = new ArrayList<>();
+
+  /**
+   * Runs {@code work} on the kept scan of a table snapshot and filter, holding that scan only:
+   * aggregates on different scans run side by side (a query's subqueries over several fact tables),
+   * ones on the same scan in turn.
+   */
+  private static <T> T withScan(
+      Table table, Expression filter, java.util.function.Function<DeviceMergeOnReadScan, T> work) {
+    while (true) {
+      DeviceMergeOnReadScan scan = scan(table, filter);
+      synchronized (scan) {
+        if (!scan.isClosed()) {
+          return work.apply(scan);
+        }
+      }
+    }
+  }
+
+  private static void closeEvicted() {
+    List<DeviceMergeOnReadScan> closing;
+    synchronized (SCANS) {
+      closing = new ArrayList<>(EVICTED);
+      EVICTED.clear();
+    }
+    for (DeviceMergeOnReadScan scan : closing) {
+      synchronized (scan) {
+        scan.close();
+      }
+    }
+  }
 
   static {
     ExitCleanup.register(
@@ -75,9 +113,10 @@ public final class GpuAggregates {
   /** Frees every kept scan's device memory -- for a compaction, which needs the room. */
   static void releaseAll() {
     synchronized (SCANS) {
-      SCANS.values().forEach(DeviceMergeOnReadScan::close);
+      EVICTED.addAll(SCANS.values());
       SCANS.clear();
     }
+    closeEvicted();
   }
 
   private static String factKey(Table table, String column, String fact) {
@@ -139,24 +178,41 @@ public final class GpuAggregates {
   }
 
   /**
+   * The groups of a star aggregate ({@link DeviceMergeOnReadScan#starAggregate}), in this JVM: the
+   * scan is kept per fact table snapshot and filter, the dimensions are the run's.
+   */
+  public static Map<List<Object>, double[]> starGroups(
+      Table table,
+      Expression filter,
+      List<DeviceDimension> dimensions,
+      List<DeviceDimension.Key> keys,
+      List<DeviceValue> values) {
+    return withScan(
+        table,
+        filter,
+        scan -> {
+          Map<List<Object>, double[]> groups =
+              scan.starAggregate(dimensions, keys, values).groups();
+          lastStarMetrics = String.valueOf(scan.metrics());
+          return groups;
+        });
+  }
+
+  private static volatile String lastStarMetrics = "";
+
+  /** The device scan's metrics of the last star aggregate, for the planner's log. */
+  public static String lastStarMetrics() {
+    return lastStarMetrics;
+  }
+
+  /**
    * Sums of the values and the row count per group, over the live rows of the table's current
    * snapshot that pass the filter. Throws when the device cannot run it (a group string longer than
    * 8 bytes, a filter it lacks); the caller then aggregates on the CPU.
    */
   public static GroupedAggregate aggregate(
       Table table, Expression filter, List<String> groupColumns, List<DeviceValue> values) {
-    Snapshot snapshot = table.currentSnapshot();
-    String key =
-        table.location()
-            + "@"
-            + (snapshot == null ? "empty" : snapshot.snapshotId())
-            + "|"
-            + filter;
-    synchronized (SCANS) {
-      DeviceMergeOnReadScan scan =
-          SCANS.computeIfAbsent(key, ignored -> DeviceMergeOnReadScan.of(table, filter));
-      return scan.aggregate(groupColumns, values);
-    }
+    return withScan(table, filter, scan -> scan.aggregate(groupColumns, values));
   }
 
   /**
@@ -168,10 +224,11 @@ public final class GpuAggregates {
   public static Map<List<Object>, double[]> aggregateByBucket(
       Table table, Expression filter, String column, int buckets, List<String> sumColumns) {
     org.apache.iceberg.tornadovm.AggregateResult result;
-    synchronized (SCANS) {
-      result =
-          scan(table, filter).aggregateByBucket(column, buckets, sumColumns.toArray(new String[0]));
-    }
+    result =
+        withScan(
+            table,
+            filter,
+            scan -> scan.aggregateByBucket(column, buckets, sumColumns.toArray(new String[0])));
     Map<List<Object>, double[]> groups = new LinkedHashMap<>();
     result
         .groups()
@@ -195,7 +252,12 @@ public final class GpuAggregates {
             + (snapshot == null ? "empty" : snapshot.snapshotId())
             + "|"
             + filter;
-    return SCANS.computeIfAbsent(key, ignored -> DeviceMergeOnReadScan.of(table, filter));
+    DeviceMergeOnReadScan scan;
+    synchronized (SCANS) {
+      scan = SCANS.computeIfAbsent(key, ignored -> DeviceMergeOnReadScan.of(table, filter));
+    }
+    closeEvicted();
+    return scan;
   }
 
   /**
@@ -204,17 +266,40 @@ public final class GpuAggregates {
    * unscaled -- stays under 2^53.
    */
   public static boolean exactSum(Table table, String column) {
-    return COLUMN_FACTS.computeIfAbsent(
-        factKey(table, column, "exact"), ignored -> computeExactSum(table, column));
+    return exactProduct(table, List.of(column));
   }
 
-  private static boolean computeExactSum(Table table, String column) {
+  /**
+   * Whether the device's doubles hold the sum of the product of these int, bigint or decimal
+   * columns (decimals as unscaled values) exactly, by the files' bounds: rows times the product of
+   * the columns' largest magnitudes below 2^53.
+   */
+  public static boolean exactProduct(Table table, List<String> columns) {
+    double bound = rows(table);
+    for (String column : columns) {
+      bound *= largest(table, column);
+    }
+    return bound < 0x1p53;
+  }
+
+  /**
+   * Whether an int or bigint column's values, by the files' bounds, span at most {@code perRow}
+   * keys a row of the table (or {@code floor} keys): a dimension key a star aggregate can index by.
+   * False when the bounds are unknown.
+   */
+  public static boolean denseKeys(Table table, String column, double perRow, double floor) {
+    return COLUMN_FACTS.computeIfAbsent(
+        factKey(table, column, "dense " + perRow + " " + floor),
+        ignored -> computeDenseKeys(table, column, perRow, floor));
+  }
+
+  private static boolean computeDenseKeys(Table table, String column, double perRow, double floor) {
     Types.NestedField field = table.schema().findField(column);
     if (field == null) {
       return false;
     }
-    double rows = 0;
-    double largest = 0;
+    double low = Double.POSITIVE_INFINITY;
+    double high = Double.NEGATIVE_INFINITY;
     try (CloseableIterable<FileScanTask> tasks = table.newScan().includeColumnStats().planFiles()) {
       for (FileScanTask task : tasks) {
         Map<Integer, java.nio.ByteBuffer> lower = task.file().lowerBounds();
@@ -222,20 +307,69 @@ public final class GpuAggregates {
         if (lower == null || upper == null) {
           return false;
         }
-        java.nio.ByteBuffer low = lower.get(field.fieldId());
-        java.nio.ByteBuffer high = upper.get(field.fieldId());
-        if (low == null || high == null) {
+        java.nio.ByteBuffer min = lower.get(field.fieldId());
+        java.nio.ByteBuffer max = upper.get(field.fieldId());
+        if (min == null || max == null) {
           return false;
         }
-        Number min = org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), low);
-        Number max = org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), high);
-        largest = Math.max(largest, Math.max(magnitude(min), magnitude(max)));
-        rows += task.file().recordCount();
+        low =
+            Math.min(
+                low,
+                ((Number) org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), min))
+                    .doubleValue());
+        high =
+            Math.max(
+                high,
+                ((Number) org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), max))
+                    .doubleValue());
       }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
-    return rows * largest < 0x1p53;
+    return high < low || high - low + 1 <= Math.max(floor, perRow * rows(table));
+  }
+
+  private static double rows(Table table) {
+    Snapshot snapshot = table.currentSnapshot();
+    return snapshot == null
+        ? 0
+        : Double.parseDouble(snapshot.summary().getOrDefault("total-records", "Infinity"));
+  }
+
+  // A column's largest magnitude in a snapshot, by its files' bounds; infinite when unknown.
+  private static final Map<String, Double> LARGEST = new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static double largest(Table table, String column) {
+    return LARGEST.computeIfAbsent(
+        factKey(table, column, "largest"), ignored -> computeLargest(table, column));
+  }
+
+  private static double computeLargest(Table table, String column) {
+    Types.NestedField field = table.schema().findField(column);
+    if (field == null) {
+      return Double.POSITIVE_INFINITY;
+    }
+    double largest = 0;
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().includeColumnStats().planFiles()) {
+      for (FileScanTask task : tasks) {
+        Map<Integer, java.nio.ByteBuffer> lower = task.file().lowerBounds();
+        Map<Integer, java.nio.ByteBuffer> upper = task.file().upperBounds();
+        if (lower == null || upper == null) {
+          return Double.POSITIVE_INFINITY;
+        }
+        java.nio.ByteBuffer low = lower.get(field.fieldId());
+        java.nio.ByteBuffer high = upper.get(field.fieldId());
+        if (low == null || high == null) {
+          return Double.POSITIVE_INFINITY;
+        }
+        Number min = org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), low);
+        Number max = org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), high);
+        largest = Math.max(largest, Math.max(magnitude(min), magnitude(max)));
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return largest;
   }
 
   private static double magnitude(Number value) {

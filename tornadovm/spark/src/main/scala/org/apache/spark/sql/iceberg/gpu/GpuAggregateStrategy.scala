@@ -53,6 +53,9 @@ case class SumOf(value: Int) extends DeviceAggregate
 case class AverageOf(value: Int) extends DeviceAggregate
 case class CountOf(value: Int) extends DeviceAggregate
 
+/** SUM(COALESCE(value, 0)): the value's sum, NULL only when the group has no row. */
+case class SumAll(value: Int) extends DeviceAggregate
+
 /**
  * Plans a grouped aggregate over an Iceberg table -- SUM, AVG and COUNT of products of double
  * columns and `1 - c` / `1 + c` factors, grouped by up to four integer, date, timestamp or short
@@ -74,6 +77,12 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
    */
   val NullableValues = "spark.iceberg.gpu.aggregate.nullable"
 
+  /**
+   * Star aggregates ([[StarAggregates]]): an aggregate over inner joins of one Iceberg fact table
+   * with small dimension tables, the joins done on the device. Off by default until measured.
+   */
+  val StarEnabled = "spark.iceberg.gpu.aggregate.star"
+
   /** Read options that pick another state of the table than its current one. */
   private val TimeTravel = Set(
     "snapshot-id",
@@ -90,7 +99,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     override def initialValue(): Boolean = false
   }
 
-  private def flag(key: String, default: String): Boolean = {
+  private[gpu] def flag(key: String, default: String): Boolean = {
     val env = Option(SparkEnv.get).map(_.conf)
     SQLConf.get.getConfString(key, env.map(_.get(key, default)).getOrElse(default)).toBoolean
   }
@@ -104,6 +113,15 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       // Whatever planning on the device cannot handle -- even by failing -- plans as Spark would.
       scala.util.Try(deviceSpec(agg)).toEither.left.map(e => s"planning failed: $e").joinRight match {
         case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
+        case Left(reason) if flag(StarEnabled, "false") =>
+          scala.util.Try(StarAggregates.spec(agg)).toEither.left
+            .map(e => s"planning failed: $e")
+            .joinRight match {
+            case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
+            case Left(starReason) =>
+              logInfo(s"GPU aggregate declined: $reason; as a star aggregate: $starReason")
+              Nil
+          }
         case Left(reason) =>
           logInfo(s"GPU aggregate declined: $reason")
           Nil
@@ -122,14 +140,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
           Alias(aliases(a.exprId), a.name)(exprId = a.exprId)
         case named => substitute(named, aliases).asInstanceOf[NamedExpression]
       }
-      table <- relation.relation.table match {
-        case t: SparkTable
-            if t.snapshotId() == null &&
-              (t.branch() == null || t.branch() == "main") &&
-              !relation.relation.options.keySet().asScala.exists(TimeTravel.contains) =>
-          Right(t.table())
-        case other => Left(s"not the current state of an Iceberg table: $other")
-      }
+      table <- currentTable(relation)
       filter <- icebergFilter(conditions)
       bucket <- groupExpressions match {
         case Seq(BucketOf(buckets, a)) =>
@@ -152,7 +163,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
         .distinct
       translated <- {
         val values = scala.collection.mutable.ArrayBuffer[DeviceValue]()
-        traverse(aggregates)(ae => deviceAggregate(table, ae, values).map(ae -> _))
+        traverse(aggregates)(ae => deviceAggregate(table, ae, values, nullable = false).map(ae -> _))
           .map(pairs => (pairs, values.toList))
       }
       (pairs, values) = translated
@@ -180,6 +191,18 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       resultExpressions)
   }
 
+  /** The table a scan reads, if the scan reads its current state. */
+  private[gpu] def currentTable(
+      relation: DataSourceV2ScanRelation): Either[String, org.apache.iceberg.Table] =
+    relation.relation.table match {
+      case t: SparkTable
+          if t.snapshotId() == null &&
+            (t.branch() == null || t.branch() == "main") &&
+            !relation.relation.options.keySet().asScala.exists(TimeTravel.contains) =>
+        Right(t.table())
+      case other => Left(s"not the current state of an Iceberg table: $other")
+    }
+
   /** `bucket(n, column)`, Iceberg's bucket transform of a bigint column, as Spark calls it. */
   private object BucketOf {
     def unapply(e: Expression): Option[(Int, AttributeReference)] = e match {
@@ -202,7 +225,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
    * Projections and filters down to an Iceberg scan: the filter's conditions, and what each
    * projected alias stands for, in terms of the scan's columns.
    */
-  private def scanOf(plan: LogicalPlan)
+  private[gpu] def scanOf(plan: LogicalPlan)
       : Either[String, (Seq[Expression], Map[ExprId, Expression], DataSourceV2ScanRelation)] =
     plan match {
       case Project(list, child) if list.forall(e => e.deterministic) =>
@@ -222,12 +245,12 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       case other => Left(s"not a filtered scan: ${other.nodeName}")
     }
 
-  private def substitute(e: Expression, aliases: Map[ExprId, Expression]): Expression =
+  private[gpu] def substitute(e: Expression, aliases: Map[ExprId, Expression]): Expression =
     if (aliases.isEmpty) e
     else e.transformUp { case a: AttributeReference if aliases.contains(a.exprId) => aliases(a.exprId) }
 
   /** Every condition as an Iceberg expression, or a refusal: the device must apply all. */
-  private def icebergFilter(conditions: Seq[Expression]): Either[String, IcebergExpression] =
+  private[gpu] def icebergFilter(conditions: Seq[Expression]): Either[String, IcebergExpression] =
     traverse(conditions) { condition =>
       DataSourceV2Strategy
         .translateFilterV2(condition)
@@ -235,10 +258,10 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
         .toRight(s"filter not translatable: $condition")
     }.map(_.foldLeft(Expressions.alwaysTrue(): IcebergExpression)(Expressions.and))
 
-  private def field(table: org.apache.iceberg.Table, a: Attribute) =
+  private[gpu] def field(table: org.apache.iceberg.Table, a: Attribute) =
     Option(table.schema().findField(a.name)).toRight(s"not a table column: ${a.name}")
 
-  private def groupColumn(table: org.apache.iceberg.Table, a: Attribute): Either[String, String] =
+  private[gpu] def groupColumn(table: org.apache.iceberg.Table, a: Attribute): Either[String, String] =
     field(table, a).flatMap { f =>
       f.`type`().typeId() match {
         case TypeID.INTEGER | TypeID.LONG | TypeID.DATE | TypeID.TIMESTAMP | TypeID.STRING =>
@@ -249,10 +272,16 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       }
     }
 
-  private def deviceAggregate(
+  /**
+   * {@code nullable}: whether values may hold nulls regardless of [[NullableValues]] -- a star
+   * aggregate's, whose single device scan replaces joins, which pays for the count columns.
+   */
+  private[gpu] def deviceAggregate(
       table: org.apache.iceberg.Table,
       ae: AggregateExpression,
-      values: scala.collection.mutable.ArrayBuffer[DeviceValue]): Either[String, DeviceAggregate] = {
+      values: scala.collection.mutable.ArrayBuffer[DeviceValue],
+      nullable: Boolean): Either[String, DeviceAggregate] = {
+    val nulls = nullable || flag(NullableValues, "false")
     if (ae.isDistinct || ae.filter.isDefined) {
       return Left(s"DISTINCT or FILTER: $ae")
     }
@@ -260,12 +289,20 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       values += value
       values.size - 1
     }
-    def valueIndex(child: Expression): Either[String, Int] = deviceValue(table, child).map(add)
+    def valueIndex(child: Expression): Either[String, Int] =
+      deviceValue(table, child, nulls).map(add)
     ae.aggregateFunction match {
       case Count(Seq(a: AttributeReference))
-          if a.nullable && flag(NullableValues, "false") && nullFree(table, a).isLeft =>
-        // COUNT of a column that may hold nulls: the rows where it is not null.
-        valueIndex(a).map(CountOf)
+          if a.nullable && nulls && nullFree(table, a).isLeft =>
+        // COUNT of a column that may hold nulls: the rows where it is not null. Any numeric
+        // column counts, whatever its sum would be.
+        field(table, a).flatMap { f =>
+          f.`type`().typeId() match {
+            case TypeID.INTEGER | TypeID.LONG | TypeID.DOUBLE | TypeID.DECIMAL =>
+              Right(CountOf(add(DeviceValue.of(f.name()))))
+            case other => Left(s"COUNT of a $other column")
+          }
+        }
       case Count(children) =>
         traverse(children) {
           case l: Literal if l.value != null => Right(())
@@ -274,8 +311,11 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
         }.map(_ => RowCount)
       case s: Sum if s.child.dataType == DoubleType => valueIndex(s.child).map(SumOf)
       case a: Average if a.child.dataType == DoubleType => valueIndex(a.child).map(AverageOf)
-      case s: Sum => exactColumn(table, s.child).map(add).map(SumOf)
-      case a: Average => exactColumn(table, a.child).map(add).map(AverageOf)
+      case Sum(Coalesce(Seq(v, zero: Literal)), _)
+          if zero.value != null && zero.value.toString.toDouble == 0.0 =>
+        exactColumn(table, v, nulls = true).map(add).map(SumAll)
+      case s: Sum => exactColumn(table, s.child, nulls).map(add).map(SumOf)
+      case a: Average => exactColumn(table, a.child, nulls).map(add).map(AverageOf)
       case other => Left(s"aggregate not supported: $other")
     }
   }
@@ -287,18 +327,50 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
    */
   private def exactColumn(
       table: org.apache.iceberg.Table,
-      child: Expression): Either[String, DeviceValue] = child match {
+      child: Expression,
+      nulls: Boolean): Either[String, DeviceValue] = child match {
     // Spark's DecimalAggregates has already turned SUM and AVG of a short decimal into ones of its
     // unscaled value: what the device sums.
-    case UnscaledValue(a: AttributeReference) if exactType(a.dataType) => exactColumn(table, a)
+    case UnscaledValue(a: AttributeReference) if exactType(a.dataType) => exactColumn(table, a, nulls)
+    // A decimal widened at its scale (a CASE's common type, say) keeps its unscaled value.
+    case Cast(a: AttributeReference, to: DecimalType, _, _) if (a.dataType match {
+          case from: DecimalType => from.scale == to.scale && from.precision <= to.precision
+          case _ => false
+        }) =>
+      exactColumn(table, a, nulls)
     case a: AttributeReference if exactType(a.dataType) =>
       for {
         f <- field(table, a)
-        _ <- valueMayBeNull(table, a)
+        _ <- valueMayBeNull(table, a, nulls)
         _ <-
           if (GpuAggregates.exactSum(table, a.name)) Right(())
           else Left(s"sum of ${a.name} may not be exact in doubles")
       } yield DeviceValue.of(f.name())
+    // A product of such columns (an int or bigint cast to a decimal of scale 0 is its value), its
+    // unscaled value the product of theirs: Spark multiplies decimals exactly too.
+    case m: Multiply =>
+      def factors(e: Expression): Either[String, Seq[AttributeReference]] = e match {
+        case Multiply(l, r, _) => for (a <- factors(l); b <- factors(r)) yield a ++ b
+        case Cast(a: AttributeReference, d: DecimalType, _, _)
+            if d.scale == 0 && (a.dataType == IntegerType || a.dataType == LongType) =>
+          Right(Seq(a))
+        case Cast(a: AttributeReference, to: DecimalType, _, _) if (a.dataType match {
+              case from: DecimalType => from.scale == to.scale && from.precision <= to.precision
+              case _ => false
+            }) =>
+          Right(Seq(a))
+        case a: AttributeReference if exactType(a.dataType) => Right(Seq(a))
+        case other => Left(s"factor $other")
+      }
+      for {
+        columns <- factors(m)
+        _ <- if (columns.size <= DeviceValue.MAX_FACTORS) Right(()) else Left(s"factors of $m")
+        names <- traverse(columns)(a => field(table, a).map(_.name()))
+        _ <- traverse(columns)(a => valueMayBeNull(table, a, nulls))
+        _ <-
+          if (GpuAggregates.exactProduct(table, names.asJava)) Right(())
+          else Left(s"sum of $m may not be exact in doubles")
+      } yield names.tail.foldLeft(DeviceValue.of(names.head))(_ times _)
     case other => Left(s"aggregate of $other")
   }
 
@@ -320,7 +392,8 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
    */
   private def deviceValue(
       table: org.apache.iceberg.Table,
-      expr: Expression): Either[String, DeviceValue] = {
+      expr: Expression,
+      nulls: Boolean): Either[String, DeviceValue] = {
     def column(e: Expression): Either[String, String] = e match {
       case a: AttributeReference if a.dataType == DoubleType => numeric(a)
       case Cast(a: AttributeReference, DoubleType, _, _)
@@ -331,7 +404,8 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     def numeric(a: AttributeReference): Either[String, String] =
       field(table, a).flatMap { f =>
         f.`type`().typeId() match {
-          case TypeID.DOUBLE | TypeID.INTEGER | TypeID.LONG => valueMayBeNull(table, a).map(_ => f.name())
+          case TypeID.DOUBLE | TypeID.INTEGER | TypeID.LONG =>
+            valueMayBeNull(table, a, nulls).map(_ => f.name())
           case other => Left(s"not a device value column: $other")
         }
       }
@@ -361,15 +435,18 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     }
   }
 
-  /** A value column: null-free, or nullable values switched on ([[NullableValues]]). */
-  private def valueMayBeNull(table: org.apache.iceberg.Table, a: Attribute): Either[String, Unit] =
-    if (flag(NullableValues, "false")) Right(()) else nullFree(table, a)
+  /** A value column: null-free, or nullable values allowed. */
+  private def valueMayBeNull(
+      table: org.apache.iceberg.Table,
+      a: Attribute,
+      nulls: Boolean): Either[String, Unit] =
+    if (nulls) Right(()) else nullFree(table, a)
 
   private def nullFree(table: org.apache.iceberg.Table, a: Attribute): Either[String, Unit] =
     if (!a.nullable || GpuAggregates.nullFree(table, a.name)) Right(())
     else Left(s"${a.name} may hold nulls")
 
-  private def traverse[A, B](items: Seq[A])(f: A => Either[String, B]): Either[String, Seq[B]] =
+  private[gpu] def traverse[A, B](items: Seq[A])(f: A => Either[String, B]): Either[String, Seq[B]] =
     items.foldLeft(Right(Vector.empty): Either[String, Vector[B]]) { (acc, item) =>
       for (done <- acc; next <- f(item)) yield done :+ next
     }

@@ -31,7 +31,7 @@ set -euo pipefail
 : "${SPARK_HOME:?set SPARK_HOME to a Spark 3.5 distribution}"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CP=$(ls "$HERE"/jars/*.jar | paste -sd: -)
-GPU_JVM="--enable-preview @$HERE/tornado-argfile -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${GPU_JAVA_OPTS:-}"
+GPU_JVM="--enable-preview @$HERE/tornado-argfile --enable-native-access=ALL-UNNAMED -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${GPU_JAVA_OPTS:-}"
 MASTER="${SPARK_MASTER:-local[*]}"
 EXECUTORS=()
 if [[ "$MASTER" != local\[* && "$MASTER" != local ]]; then
