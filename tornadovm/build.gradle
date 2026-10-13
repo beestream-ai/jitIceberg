@@ -78,7 +78,7 @@ test {
   // With assertions on, Graal checks that every plugin the CUDA backend registers resolves, and one
   // (TileContext.view over a ByteArray) does not in this TornadoVM build. Iceberg's own assertions
   // stay on.
-  jvmArgs '-da:tornado...', '-da:uk.ac.manchester.tornado...'
+  jvmArgs '-da:tornado...', '-da:uk.ac.manchester.tornado...', '--enable-native-access=ALL-UNNAMED'
   maxParallelForks = 1
 }
 

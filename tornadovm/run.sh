@@ -69,7 +69,7 @@ case "$mode" in
         # plan released stay counted against it until reused by the same access type.
         # The heap stays under 32 GB: TornadoVM serializes object arguments (the path holders)
         # assuming compressed oops, which a larger heap turns off.
-        exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" -Xmx"${GPU_HEAP:-24g}" \
+        exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" --enable-native-access=ALL-UNNAMED -Xmx"${GPU_HEAP:-24g}" \
             -Dtornado.device.memory="${TORNADO_DEVICE_MEMORY:-20GB}" --add-opens=java.base/java.nio=ALL-UNNAMED \
             -da:tornado... -da:uk.ac.manchester.tornado... -cp "$CP" \
             ${MAIN:-org.apache.iceberg.tornadovm.bench.MorBench} $( [ -n "${MAIN:-}" ] && echo "$@" || echo "$1 gpu ${*:2}" )
@@ -122,7 +122,7 @@ case "$mode" in
         SPARK_GPU_CP="${SPARK_GPU_CP:-$(ls "$BUNDLE"/jars/*.jar 2>/dev/null | paste -sd: -)}"
         SPARK_GPU_ARGFILE="${SPARK_GPU_ARGFILE:-$BUNDLE/tornado-argfile}"
         : "${SPARK_GPU_CP:?run :iceberg-tornadovm-spark:sparkGpuBundle or set SPARK_GPU_CP}"
-        GPU_JVM="--enable-preview @$SPARK_GPU_ARGFILE -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}"
+        GPU_JVM="--enable-preview @$SPARK_GPU_ARGFILE --enable-native-access=ALL-UNNAMED -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}"
         MASTER="${SPARK_MASTER:-local[${THREADS:-$(nproc)}]}"
         EXECUTORS=()
         if [[ "$MASTER" != local\[* && "$MASTER" != local ]]; then

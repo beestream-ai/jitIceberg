@@ -114,6 +114,172 @@ public class TestDeviceMergeOnRead {
     assertThat(late).hasSize(1);
   }
 
+  /**
+   * Star aggregates: inner joins with dimensions given as masks and codes over a key range, grouped
+   * by an attribute and a fact column, on one scan whose dimensions change between runs -- a mask
+   * over part of the keys, then a range starting below the keys, with other codes.
+   */
+  @Test
+  public void testStarAggregate() throws IOException {
+    Table table = MorTables.create(temp.resolve("star").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 3000, 4000);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(3000, 5), randomPositions(4000, 0.2, 3)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(1L, 2L, 1_000_003L));
+    table.refresh();
+
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(table, org.apache.iceberg.expressions.Expressions.alwaysTrue())) {
+      // k is 0..6. First: keys 0..6 with 1, 2, 4, 5 kept, parity as the attribute; and a second
+      // dimension on k over keys 2..5 only, which drops k = 1 and 6 by range.
+      boolean[] keep = {false, true, true, false, true, true, false};
+      int[] parity = {0, 1, 0, 1, 0, 1, 0};
+      assertStarMatches(
+          table,
+          device,
+          ImmutableList.of(
+              DeviceDimension.of("k", 0, keep).withAttribute(parity),
+              DeviceDimension.of("k", 2, new boolean[] {true, true, true, true})),
+          k -> k >= 2 && k <= 5 && keep[k],
+          k -> parity[k],
+          true);
+      // An attribute alone: grouped densely on the device, not by cuDF.
+      assertStarMatches(
+          table,
+          device,
+          ImmutableList.of(DeviceDimension.of("k", 0, keep).withAttribute(parity)),
+          k -> keep[k],
+          k -> parity[k],
+          false);
+      // Then: keys from -3, every one kept, k / 3 + 1 as the attribute.
+      boolean[] all = new boolean[10];
+      Arrays.fill(all, true);
+      int[] third = new int[10];
+      for (int key = -3; key < 7; key++) {
+        third[key + 3] = Math.floorDiv(key, 3) + 1;
+      }
+      assertStarMatches(
+          table,
+          device,
+          ImmutableList.of(DeviceDimension.of("k", -3, all).withAttribute(third)),
+          k -> true,
+          k -> k / 3 + 1,
+          true);
+    }
+  }
+
+  /**
+   * A star aggregate joined with a small build table ({@link DeviceProbe}): the key a fact column
+   * plus a dimension attribute's code, build keys repeated or absent, and a comparison of a fact
+   * column with each build row's value; each row counts once a build row it joins.
+   */
+  @Test
+  public void testStarAggregateWithProbe() throws IOException {
+    Table table = MorTables.create(temp.resolve("probe").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 2000, 3000);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(2000, 7), randomPositions(3000, 0.1, 5)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(3L, 1_000_004L));
+    table.refresh();
+
+    int[] parity = {0, 1, 0, 1, 0, 1, 0};
+    boolean[] all = new boolean[7];
+    Arrays.fill(all, true);
+    // Build rows keyed parity * 10 + k: k = 1 (twice), 2, 4 (three times), 6 never.
+    long[] keys = {11, 11, 2, 4, 4, 4, 15};
+    long[] values = {10, 1, 5, 0, 7, 9, 2};
+    DeviceProbe probe =
+        DeviceProbe.of(keys, values)
+            .keyAttribute(0, 0, 10)
+            .keyColumn("k", 1)
+            .where("k", DeviceProbe.Comparison.LESS);
+
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        int k = (Integer) record.getField("k");
+        long key = parity[k] * 10L + k;
+        int weight = 0;
+        for (int b = 0; b < keys.length; b++) {
+          if (keys[b] == key && k < values[b]) {
+            weight++;
+          }
+        }
+        if (weight > 0) {
+          double[] totals =
+              expected.computeIfAbsent(
+                  ImmutableList.of((long) parity[k]), ignored -> new double[2]);
+          totals[0] += weight * (Double) record.getField("v1");
+          totals[1] += weight;
+        }
+      }
+    }
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(table, org.apache.iceberg.expressions.Expressions.alwaysTrue())) {
+      for (int repeat = 0; repeat < 2; repeat++) {
+        Map<List<Object>, double[]> actual =
+            device
+                .starAggregate(
+                    ImmutableList.of(DeviceDimension.of("k", 0, all).withAttribute(parity)),
+                    ImmutableList.of(DeviceDimension.Key.attribute(0, 0)),
+                    ImmutableList.of(DeviceValue.of("v1")),
+                    probe)
+                .groups();
+        assertThat(actual.keySet()).isEqualTo(expected.keySet());
+        for (Map.Entry<List<Object>, double[]> entry : expected.entrySet()) {
+          double[] got = actual.get(entry.getKey());
+          assertThat(got[0])
+              .as("%s sum", entry.getKey())
+              .isCloseTo(entry.getValue()[0], org.assertj.core.data.Offset.offset(1e-6));
+          assertThat(got[1]).as("%s rows", entry.getKey()).isEqualTo(entry.getValue()[1]);
+        }
+      }
+    }
+  }
+
+  private static void assertStarMatches(
+      Table table,
+      DeviceMergeOnReadScan device,
+      List<DeviceDimension> dimensions,
+      java.util.function.IntPredicate joins,
+      java.util.function.IntUnaryOperator attribute,
+      boolean factKey)
+      throws IOException {
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        int k = (Integer) record.getField("k");
+        if (joins.test(k)) {
+          List<Object> key =
+              factKey
+                  ? ImmutableList.of((long) attribute.applyAsInt(k), (long) k)
+                  : ImmutableList.of((long) attribute.applyAsInt(k));
+          double[] totals = expected.computeIfAbsent(key, ignored -> new double[2]);
+          totals[0] += (Double) record.getField("v1");
+          totals[1] += 1;
+        }
+      }
+    }
+    Map<List<Object>, double[]> actual =
+        device
+            .starAggregate(
+                dimensions,
+                factKey
+                    ? ImmutableList.of(
+                        DeviceDimension.Key.attribute(0, 0), DeviceDimension.Key.column("k"))
+                    : ImmutableList.of(DeviceDimension.Key.attribute(0, 0)),
+                ImmutableList.of(DeviceValue.of("v1")))
+            .groups();
+    assertThat(actual.keySet()).isEqualTo(expected.keySet());
+    for (Map.Entry<List<Object>, double[]> entry : expected.entrySet()) {
+      double[] got = actual.get(entry.getKey());
+      assertThat(got[0])
+          .as("%s sum", entry.getKey())
+          .isCloseTo(entry.getValue()[0], org.assertj.core.data.Offset.offset(1e-6));
+      assertThat(got[1]).as("%s rows", entry.getKey()).isEqualTo(entry.getValue()[1]);
+    }
+  }
+
   /** Deletion vectors and equality deletes: v3. */
   @Test
   public void testDeletionVectorsV3() throws IOException {
