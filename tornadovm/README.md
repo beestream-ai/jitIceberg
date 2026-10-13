@@ -76,6 +76,11 @@ Supported:
 Anything else (object stores, strings, multi-column equality deletes, split files, schema evolution
 that adds columns) is refused with `UnsupportedOperationException` rather than answered wrongly.
 
+Joins sit beside the scan, not in it. Package `org.apache.iceberg.tornadovm.join` adds star
+aggregates and probe joins (`StarAggregation.run(scan, dimensions, keys, values[, probe, sums])`)
+as a `GroupedStage`, the scan's one extension point into its grouped pipeline; see
+[DEVICE-JOINS.md](DEVICE-JOINS.md).
+
 `CpuMergeOnReadScan` is the same algorithm on all cores. It reads with Iceberg's vectorized
 `ArrowReader`, which on its own refuses any file with deletes (#2487), so it is handed each file
 without its deletes and applies them itself, with the same delete preparation as the GPU path.
@@ -93,6 +98,8 @@ merge-on-read reader. It covers:
 - many row groups;
 - `bucket(16, id)` against `Transforms.bucket`;
 - each device scan run twice, reusing its plans.
+
+`join.TestStarAggregation` checks star aggregates and probe joins the same way.
 
 On the benchmark tables every engine returns the same row count and checksum.
 

@@ -39,31 +39,12 @@ public final class DeviceValue implements java.io.Serializable {
       implements java.io.Serializable {}
 
   private final List<Factor> factors;
-  // A probe's build column summed over the build rows a fact row joins, or -1.
-  private final int probeColumn;
 
   private DeviceValue(List<Factor> factors) {
-    this(factors, -1);
-  }
-
-  private DeviceValue(List<Factor> factors, int probeColumn) {
     if (factors.size() > MAX_FACTORS) {
       throw new IllegalArgumentException("At most " + MAX_FACTORS + " factors: " + factors);
     }
     this.factors = factors;
-    this.probeColumn = probeColumn;
-  }
-
-  /**
-   * Build column {@code column} of a star aggregate's {@link DeviceProbe}: per fact row, the sum of
-   * its values over the build rows the row joins (nulls skipped, and counted apart).
-   */
-  public static DeviceValue probe(int column) {
-    return new DeviceValue(ImmutableList.of(), column);
-  }
-
-  int probeColumn() {
-    return probeColumn;
   }
 
   /** The column itself. */
@@ -99,7 +80,7 @@ public final class DeviceValue implements java.io.Serializable {
     for (Factor f : factors) {
       negated.add(new Factor(f.column(), f.offset(), f.scale(), -f.coefficient()));
     }
-    return new DeviceValue(negated.build(), probeColumn);
+    return new DeviceValue(negated.build());
   }
 
   /** This value minus {@code other}. */
@@ -108,9 +89,6 @@ public final class DeviceValue implements java.io.Serializable {
   }
 
   private DeviceValue sum(DeviceValue other, double sign) {
-    if (probeColumn >= 0 || other.probeColumn >= 0) {
-      throw new IllegalArgumentException("A probe value is not a term");
-    }
     ImmutableList.Builder<Factor> terms = ImmutableList.<Factor>builder().addAll(factors);
     for (Factor f : other.factors) {
       terms.add(
@@ -131,9 +109,6 @@ public final class DeviceValue implements java.io.Serializable {
 
   @Override
   public String toString() {
-    if (probeColumn >= 0) {
-      return "probe[" + probeColumn + "]";
-    }
     StringBuilder text = new StringBuilder();
     for (Factor factor : factors) {
       if (text.length() > 0) {

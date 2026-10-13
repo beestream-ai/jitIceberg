@@ -35,7 +35,11 @@ public final class GroupedAggregate {
     this.values = values;
   }
 
-  synchronized void add(List<Object> key, double[] sums, double rows, double[] nonNull) {
+  /**
+   * Merges a group's partial sums, row count and per-value non-null counts: what a {@link
+   * GroupedStage} that groups rows itself reports for each of its groups.
+   */
+  public synchronized void add(List<Object> key, double[] sums, double rows, double[] nonNull) {
     double[] totals = groups.computeIfAbsent(key, ignored -> new double[2 * values + 1]);
     for (int v = 0; v < values; v++) {
       totals[v] += sums[v];

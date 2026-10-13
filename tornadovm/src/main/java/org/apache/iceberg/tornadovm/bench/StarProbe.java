@@ -24,9 +24,10 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.relocated.com.google.common.base.Splitter;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.tornadovm.DeviceDimension;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
+import org.apache.iceberg.tornadovm.join.DeviceDimension;
+import org.apache.iceberg.tornadovm.join.StarAggregation;
 
 /**
  * Device time of a star aggregate by the shape of its joins: {@code StarProbe <table> <runs>
@@ -65,7 +66,7 @@ public final class StarProbe {
       for (int run = 0; run < runs; run++) {
         long start = System.nanoTime();
         int size =
-            scan.starAggregate(dimensions, keys, ImmutableList.of(DeviceValue.of(args[2])))
+            StarAggregation.run(scan, dimensions, keys, ImmutableList.of(DeviceValue.of(args[2])))
                 .groups()
                 .size();
         System.out.printf(

@@ -33,10 +33,11 @@ import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
-import org.apache.iceberg.tornadovm.DeviceDimension;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
+import org.apache.iceberg.tornadovm.join.DeviceDimension;
+import org.apache.iceberg.tornadovm.join.StarAggregation;
 
 /**
  * Device-join prototype (DEVICE-JOINS.md, phase 1 step 1): TPC-DS q22 as a star aggregate. The
@@ -124,7 +125,8 @@ public final class StarQ22 {
       try {
         groups =
             star
-                ? scan.starAggregate(
+                ? StarAggregation.run(
+                    scan,
                     dimensions,
                     ImmutableList.of(DeviceDimension.Key.column("inv_item_sk")),
                     ImmutableList.of(DeviceValue.of("inv_quantity_on_hand")))

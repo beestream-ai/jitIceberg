@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.tornadovm;
+package org.apache.iceberg.tornadovm.join;
 
 import java.util.Arrays;
 import java.util.List;
@@ -61,6 +61,7 @@ public final class DeviceProbe {
   private final String column;
   private final Comparison comparison;
   private final List<double[]> sums;
+  private final boolean outer;
 
   private DeviceProbe(
       long[] keys,
@@ -68,13 +69,15 @@ public final class DeviceProbe {
       List<Part> parts,
       String column,
       Comparison comparison,
-      List<double[]> sums) {
+      List<double[]> sums,
+      boolean outer) {
     this.keys = keys;
     this.values = values;
     this.parts = parts;
     this.column = column;
     this.comparison = comparison;
     this.sums = sums;
+    this.outer = outer;
   }
 
   /** The build rows: a key and a value each, in any order. */
@@ -84,7 +87,7 @@ public final class DeviceProbe {
 
   /**
    * The build rows, with build-side columns ({@code NaN} for null) that {@link
-   * DeviceValue#probe(int)} sums over each fact row's joined rows, in the order given.
+   * StarAggregation.ProbeSum} sums over each fact row's joined rows, in the order given.
    */
   public static DeviceProbe of(long[] keys, long[] values, List<double[]> columns) {
     for (double[] column : columns) {
@@ -112,7 +115,7 @@ public final class DeviceProbe {
       }
     }
     return new DeviceProbe(
-        sortedKeys, sortedValues, ImmutableList.of(), null, Comparison.ANY, sortedSums);
+        sortedKeys, sortedValues, ImmutableList.of(), null, Comparison.ANY, sortedSums, false);
   }
 
   /** Adds {@code column * multiplier} of the fact row to its key. */
@@ -141,7 +144,15 @@ public final class DeviceProbe {
 
   /** Joins only build rows whose value passes {@code factColumn comparison value}. */
   public DeviceProbe where(String factColumn, Comparison how) {
-    return new DeviceProbe(keys, values, parts, factColumn, how, sums);
+    return new DeviceProbe(keys, values, parts, factColumn, how, sums, outer);
+  }
+
+  /**
+   * A left outer join: a fact row that joins no build row still counts, once, its build-side sums 0
+   * (SQL's {@code COALESCE(b, 0)} over the join).
+   */
+  public DeviceProbe leftOuter() {
+    return new DeviceProbe(keys, values, parts, column, comparison, sums, true);
   }
 
   private DeviceProbe with(Part part) {
@@ -151,7 +162,8 @@ public final class DeviceProbe {
         ImmutableList.<Part>builder().addAll(parts).add(part).build(),
         column,
         comparison,
-        sums);
+        sums,
+        outer);
   }
 
   long[] keys() {
@@ -172,6 +184,10 @@ public final class DeviceProbe {
 
   Comparison comparison() {
     return comparison;
+  }
+
+  boolean outer() {
+    return outer;
   }
 
   List<double[]> sums() {

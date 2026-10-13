@@ -121,12 +121,6 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * 1, 2 and 5 files a read cost 435, 233 and 137 ms of decompression a scan, so the default fits
    * five such files.
    */
-  // Most ints of masks and codes a star aggregate's dimensions take on the device (1 GiB).
-  private static final long MAX_DIMENSION_INTS = 1L << 28;
-
-  // Most groups a star aggregate of dimension codes alone aggregates densely, not through cuDF.
-  private static final long MAX_DENSE_GROUPS = 1L << 20;
-
   private static final long BATCH_ROWS = Long.getLong("iceberg.tornadovm.batch-rows", 8_000_000L);
 
   /**
@@ -272,93 +266,24 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * (Cudf.groupAggregateLongs); only the groups come back to the host.
    */
   public GroupedAggregate aggregate(List<String> groupColumns, List<DeviceValue> values) {
-    return grouped(groupColumns, values, List.of(), List.of());
+    return aggregate(groupColumns, values, null);
   }
 
   /**
-   * The aggregate of a star join: the fact rows that join every dimension (inner joins on dense
-   * integer keys, {@link DeviceDimension}), grouped by fact columns and dimension attributes, with
-   * the sums and counts of {@link #aggregate}. An attribute's group key is its code. The dimensions
-   * are inputs of the run, not of the scan: one scan of a fact table serves every star query on it,
-   * its device buffers allocated once.
+   * {@link #aggregate(List, List)} with a {@link GroupedStage} (or null) running its kernels among
+   * the aggregate's: the results hold the aggregate's values, then the stage's. The scan's device
+   * buffers are kept per aggregate and stage shape, so later runs of a shape reuse them.
    */
-  public GroupedAggregate starAggregate(
-      List<DeviceDimension> dimensions, List<DeviceDimension.Key> keys, List<DeviceValue> values) {
-    return starAggregate(dimensions, keys, values, null);
-  }
-
-  /**
-   * {@link #starAggregate(List, List, List)}, with the fact rows also joined to a small table
-   * ({@link DeviceProbe}, or null): each row's sums and counts taken once a build row it joins.
-   */
-  public GroupedAggregate starAggregate(
-      List<DeviceDimension> dimensions,
-      List<DeviceDimension.Key> keys,
-      List<DeviceValue> values,
-      DeviceProbe probe) {
-    if (dimensions.isEmpty()) {
-      throw new IllegalArgumentException("A star aggregate joins at least one dimension");
-    }
-    List<String> groupColumns = Lists.newArrayList();
-    for (DeviceDimension.Key key : keys) {
-      groupColumns.add(
-          key.isAttribute() ? dimensions.get(key.dimension()).factColumn() : key.column());
-    }
-    for (DeviceDimension dimension : dimensions) {
-      switch (column(dimension.factColumn()).type().typeId()) {
-        case INTEGER, LONG -> {}
-        default ->
-            throw new UnsupportedOperationException(
-                "Not an integer join key: " + column(dimension.factColumn()));
-      }
-    }
-    if (probe != null) {
-      for (DeviceProbe.Part part : probe.parts()) {
-        String column =
-            part.isAttribute() ? dimensions.get(part.dimension()).factColumn() : part.column();
-        switch (column(column).type().typeId()) {
-          case INTEGER, LONG -> {}
-          default -> throw new UnsupportedOperationException("Not an integer probe key: " + column);
-        }
-      }
-    }
-    return grouped(groupColumns, values, dimensions, keys, probe);
-  }
-
-  private GroupedAggregate grouped(
-      List<String> groupColumns,
-      List<DeviceValue> values,
-      List<DeviceDimension> dimensions,
-      List<DeviceDimension.Key> starKeys) {
-    return grouped(groupColumns, values, dimensions, starKeys, null);
-  }
-
-  private GroupedAggregate grouped(
-      List<String> groupColumns,
-      List<DeviceValue> values,
-      List<DeviceDimension> dimensions,
-      List<DeviceDimension.Key> starKeys,
-      DeviceProbe probe) {
-    if (groupColumns.size() > 4 || values.isEmpty()) {
+  public GroupedAggregate aggregate(
+      List<String> groupColumns, List<DeviceValue> values, GroupedStage stage) {
+    if (groupColumns.size() > 4 || (values.isEmpty() && (stage == null || stage.values() == 0))) {
       throw new IllegalArgumentException("Up to 4 group columns and at least one value");
     }
     metrics = new ScanMetrics();
     long start = System.nanoTime();
     List<String> projection = Lists.newArrayList(groupColumns);
-    for (DeviceDimension dimension : dimensions) {
-      if (!projection.contains(dimension.factColumn())) {
-        projection.add(dimension.factColumn());
-      }
-    }
-    if (probe != null) {
-      for (DeviceProbe.Part part : probe.parts()) {
-        if (!part.isAttribute() && !projection.contains(part.column())) {
-          projection.add(part.column());
-        }
-      }
-      if (probe.column() != null && !projection.contains(probe.column())) {
-        projection.add(probe.column());
-      }
+    if (stage != null) {
+      stage.columns().stream().filter(c -> !projection.contains(c)).forEach(projection::add);
     }
     for (String column : groupColumns) {
       org.apache.iceberg.types.Type.TypeID type = column(column).type().typeId();
@@ -383,18 +308,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
     }
     Planned planned = new Planned(null, projection);
-    Star star = dimensions.isEmpty() ? null : new Star(dimensions, starKeys, probe);
-    String key =
-        GROUPED + groupColumns + ":" + values + (star == null ? "" : ":star" + star.shape());
+    String key = GROUPED + groupColumns + ":" + values + (stage == null ? "" : ":" + stage.shape());
     List<Region> streams =
-        reuse(key, planned, () -> new GroupedRegion(planned, groupColumns, values, star));
-    if (star != null) {
-      for (Region region : streams) {
-        ((GroupedRegion) region).dimensions(star);
-      }
+        reuse(key, planned, () -> new GroupedRegion(planned, groupColumns, values, stage));
+    if (stage != null) {
+      streams.forEach(region -> ((GroupedRegion) region).bind(stage));
     }
     metrics.plan((System.nanoTime() - start) / 1e6);
-    GroupedAggregate result = new GroupedAggregate(values.size());
+    GroupedAggregate result =
+        new GroupedAggregate(values.size() + (stage == null ? 0 : stage.values()));
     // Another scan's aggregate, on another thread, must not evict these regions while they run.
     busy(streams, true);
     try {
@@ -407,6 +329,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
     metrics.total((System.nanoTime() - start) / 1e6);
     return result;
+  }
+
+  /** The table's current schema. */
+  public org.apache.iceberg.Schema schema() {
+    return table.schema();
   }
 
   private Types.NestedField column(String name) {
@@ -1735,18 +1662,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         "gatherDoubles",
         "gatherValid",
         "groupKeys",
-        "starFilter",
-        "starKeys",
-        "denseClear",
-        "denseAggregate",
-        "probeWeights",
-        "applyWeights",
-        "probeValues",
         "values",
         "zorder",
         "lineage"
       };
       for (String task : perRow) {
+        scheduler.addWorkerGrid("mor." + task, grid(capacity));
+      }
+      for (String task : extraTasks()) {
         scheduler.addWorkerGrid("mor." + task, grid(capacity));
       }
       scheduler.addWorkerGrid("mor.deletePositions", grid(positionCapacity));
@@ -1762,6 +1685,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     /** What this shape adds after the live-row kernel. */
     abstract void consumer(TaskGraph graph);
+
+    /** The names of kernels a shape adds beyond the scan's own, each run over the batch's rows. */
+    List<String> extraTasks() {
+      return List.of();
+    }
 
     TornadoExecutionPlan plan() {
       if (plan == null) {
@@ -2473,217 +2401,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /**
-   * A star aggregate's dimensions as the device takes them. Its shape -- the joins, the gathered
-   * keys and the room their arrays need, rounded up to a power of two -- picks the regions, so
-   * queries with other dimension contents (filters, attributes) reuse the same device buffers.
+   * Sums of expressions per group of several columns -- the TPC-H Q1 and Q6 shape -- with an
+   * optional {@link GroupedStage}'s kernels among the aggregate's.
    */
-  private final class Star {
-    private final List<DeviceDimension> dimensions;
-    private final List<DeviceDimension.Key> keys;
-    private final long capacity;
-    // Per key, how many codes it has and its weight in a dense group's index; the groups, and the
-    // dense array's room (0 when cuDF groups).
-    private final int[] cardinalities;
-    private final int[] multipliers;
-    private final int denseGroups;
-    private final int denseCapacity;
-
-    private final DeviceProbe probe;
-    private final int probeCapacity;
-
-    Star(List<DeviceDimension> dimensions, List<DeviceDimension.Key> keys, DeviceProbe probe) {
-      this.dimensions = dimensions;
-      this.keys = keys;
-      this.probe = probe;
-      this.probeCapacity =
-          probe == null ? 0 : (int) Long.highestOneBit(Math.max(1, probe.rows() - 1)) << 1;
-      this.cardinalities = new int[keys.size()];
-      this.multipliers = new int[keys.size()];
-      long groups = keys.isEmpty() ? 0 : 1;
-      for (int k = keys.size() - 1; k >= 0; k--) {
-        DeviceDimension.Key key = keys.get(k);
-        if (!key.isAttribute()) {
-          groups = 0;
-          break;
-        }
-        int[] codes = dimensions.get(key.dimension()).attributes().get(key.attribute());
-        cardinalities[k] = 1 + java.util.Arrays.stream(codes).max().orElse(0);
-        multipliers[k] = (int) Math.min(groups, Integer.MAX_VALUE);
-        groups *= cardinalities[k];
-        if (groups > MAX_DENSE_GROUPS) {
-          groups = 0;
-          break;
-        }
-      }
-      this.denseGroups = (int) groups;
-      this.denseCapacity = groups == 0 ? 0 : (int) Long.highestOneBit(Math.max(1, groups - 1)) << 1;
-      long ints = dimensions.stream().mapToLong(DeviceDimension::ints).sum();
-      if (ints > MAX_DIMENSION_INTS) {
-        throw new UnsupportedOperationException(
-            "Dimensions of " + ints + " ints; the device takes up to " + MAX_DIMENSION_INTS);
-      }
-      this.capacity = Long.highestOneBit(Math.max(1, ints - 1)) << 1;
-    }
-
-    int joins() {
-      return dimensions.size();
-    }
-
-    int gathers() {
-      return (int) keys.stream().filter(DeviceDimension.Key::isAttribute).count();
-    }
-
-    long capacity() {
-      return capacity;
-    }
-
-    boolean dense() {
-      return denseCapacity > 0;
-    }
-
-    String shape() {
-      StringBuilder shape = new StringBuilder("[");
-      dimensions.forEach(d -> shape.append(d.factColumn()).append(','));
-      shape.append(keys).append(capacity).append('/').append(denseCapacity);
-      if (probe != null) {
-        shape
-            .append(" probe ")
-            .append(probe.parts())
-            .append(probe.column())
-            .append(probeCapacity)
-            .append(" sums ")
-            .append(probe.sums().size());
-      }
-      return shape.append(']').toString();
-    }
-
-    /** Writes the specs and the arrays: per dimension its mask, then its attributes' codes. */
-    void fill(
-        ScanLayout layout,
-        IntArray joinSpec,
-        IntArray gatherSpec,
-        IntArray data,
-        IntArray denseSpec,
-        IntArray probeSpec,
-        LongArray buildKeys,
-        LongArray buildValues,
-        DoubleArray buildSums) {
-      for (int k = 0; k < keys.size() && dense(); k++) {
-        denseSpec.set(k, multipliers[k]);
-      }
-      int offset = 0;
-      List<int[]> offsets = Lists.newArrayList();
-      for (int d = 0; d < dimensions.size(); d++) {
-        DeviceDimension dimension = dimensions.get(d);
-        Types.NestedField field = column(dimension.factColumn());
-        int base = d * DeviceKernels.JOIN_SPEC_INTS;
-        joinSpec.set(base, layout.type(field.fieldId()) == CudfType.INT32 ? 0 : 1);
-        joinSpec.set(base + 1, layout.slot(field.fieldId()));
-        joinSpec.set(base + 2, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
-        joinSpec.set(base + 3, dimension.firstKey());
-        joinSpec.set(base + 4, dimension.keys());
-        joinSpec.set(base + 5, offset);
-        MemorySegment.copy(
-            MemorySegment.ofArray(dimension.keep()),
-            0,
-            data.getSegment(),
-            (long) offset * Integer.BYTES,
-            (long) dimension.keys() * Integer.BYTES);
-        offset += dimension.keys();
-        int[] attributeOffsets = new int[dimension.attributes().size()];
-        for (int a = 0; a < attributeOffsets.length; a++) {
-          attributeOffsets[a] = offset;
-          MemorySegment.copy(
-              MemorySegment.ofArray(dimension.attributes().get(a)),
-              0,
-              data.getSegment(),
-              (long) offset * Integer.BYTES,
-              (long) dimension.keys() * Integer.BYTES);
-          offset += dimension.keys();
-        }
-        offsets.add(attributeOffsets);
-      }
-      int g = 0;
-      for (int k = 0; k < keys.size(); k++) {
-        DeviceDimension.Key key = keys.get(k);
-        if (key.isAttribute()) {
-          DeviceDimension dimension = dimensions.get(key.dimension());
-          int base = g * DeviceKernels.GATHER_SPEC_INTS;
-          gatherSpec.set(base, k);
-          gatherSpec.set(base + 1, dimension.firstKey());
-          gatherSpec.set(base + 2, dimension.keys());
-          gatherSpec.set(base + 3, offsets.get(key.dimension())[key.attribute()]);
-          g++;
-        }
-      }
-      if (probe != null) {
-        fillProbe(layout, offsets, probeSpec, buildKeys, buildValues, buildSums);
-      }
-    }
-
-    private void fillProbe(
-        ScanLayout layout,
-        List<int[]> offsets,
-        IntArray probeSpec,
-        LongArray buildKeys,
-        LongArray buildValues,
-        DoubleArray buildSums) {
-      probeSpec.set(0, probe.parts().size());
-      probeSpec.set(1, probe.rows());
-      probeSpec.set(2, probe.comparison().ordinal());
-      probeSpec.set(6, probe.sums().size());
-      probeSpec.set(7, probeCapacity);
-      for (int k = 0; k < probe.sums().size(); k++) {
-        MemorySegment.copy(
-            MemorySegment.ofArray(probe.sums().get(k)),
-            0,
-            buildSums.getSegment(),
-            (long) k * probeCapacity * Double.BYTES,
-            (long) probe.rows() * Double.BYTES);
-      }
-      if (probe.column() != null) {
-        Types.NestedField field = column(probe.column());
-        probeSpec.set(3, layout.type(field.fieldId()) == CudfType.INT32 ? 0 : 1);
-        probeSpec.set(4, layout.slot(field.fieldId()));
-        probeSpec.set(5, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
-      }
-      for (int p = 0; p < probe.parts().size(); p++) {
-        DeviceProbe.Part part = probe.parts().get(p);
-        int base = DeviceKernels.PROBE_HEADER_INTS + p * DeviceKernels.PROBE_PART_INTS;
-        String factColumn =
-            part.isAttribute() ? dimensions.get(part.dimension()).factColumn() : part.column();
-        Types.NestedField field = column(factColumn);
-        probeSpec.set(base, part.isAttribute() ? 1 : 0);
-        probeSpec.set(base + 1, layout.type(field.fieldId()) == CudfType.INT32 ? 0 : 1);
-        probeSpec.set(base + 2, layout.slot(field.fieldId()));
-        if (part.isAttribute()) {
-          probeSpec.set(base + 3, dimensions.get(part.dimension()).firstKey());
-          probeSpec.set(base + 4, offsets.get(part.dimension())[part.attribute()]);
-        }
-        probeSpec.set(base + 5, (int) part.multiplier());
-        probeSpec.set(base + 6, part.offset());
-        probeSpec.set(base + 7, part.range());
-        probeSpec.set(base + 8, (int) (part.multiplier() >>> 32));
-      }
-      MemorySegment.copy(
-          MemorySegment.ofArray(probe.keys()),
-          0,
-          buildKeys.getSegment(),
-          0,
-          (long) probe.rows() * Long.BYTES);
-      MemorySegment.copy(
-          MemorySegment.ofArray(probe.values()),
-          0,
-          buildValues.getSegment(),
-          0,
-          (long) probe.rows() * Long.BYTES);
-    }
-  }
-
-  /** Sums of expressions per group of several columns: the TPC-H Q1 and Q6 shape. */
   private final class GroupedRegion extends Region {
     private final int keys;
     private final int groupKeyColumns;
+    // The aggregate's values, then the stage's.
     private final int values;
     // A value's non-null count column after the row count, or -1 when it cannot be null.
     private final int[] countColumn;
@@ -2699,65 +2423,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final DoubleArray outSums;
     private final IntArray outGroups = hostInts(1);
     private final int[] size;
+    private final GroupedStage.Instance stage;
 
-    // A star aggregate's joins: the specs and the dimensions' masks and codes, uploaded when a run
-    // brings other dimensions; null for a plain aggregate.
-    private final Star star;
-    private final IntArray joinSpec;
-    private final IntArray gatherSpec;
-    private final IntArray dimensionData;
-    private boolean dimensionsChanged;
-    // A dense star aggregate's group weights and groups, and its run's star for decoding them.
-    private final IntArray denseSpec;
-    private final DoubleArray denseOut;
-    // A star's probe join: its spec, build keys and values, and each row's weight.
-    private final boolean probing;
-    private final IntArray probeSpec;
-    private final LongArray buildKeys;
-    private final LongArray buildValues;
-    private final DoubleArray weights;
-    // A probe's build-side value columns, each row's sums and counts of them, and the value
-    // columns they fill: (value column, build column, count column or -1) each.
-    private final DoubleArray buildSums;
-    private final DoubleArray rowSums;
-    private final IntArray probeValueSpec;
-    private final int probeValues;
-    private final int denseCapacity;
-    private Star current;
-
-    GroupedRegion(Planned planned, List<String> groupColumns, List<DeviceValue> sums, Star star) {
+    GroupedRegion(
+        Planned planned, List<String> groupColumns, List<DeviceValue> sums, GroupedStage stage) {
       super(planned);
-      this.star = star;
-      this.joinSpec =
-          hostInts(star == null ? 1 : (long) star.joins() * DeviceKernels.JOIN_SPEC_INTS);
-      this.gatherSpec =
-          hostInts(
-              star == null
-                  ? 1
-                  : Math.max(1L, (long) star.gathers() * DeviceKernels.GATHER_SPEC_INTS));
-      this.dimensionData = hostInts(star == null ? 1 : star.capacity());
-      this.denseCapacity = star == null ? 0 : star.denseCapacity;
-      this.denseSpec = hostInts(Math.max(1, groupColumns.size()));
-      this.probing = star != null && star.probe != null;
-      this.probeSpec =
-          hostInts(
-              probing
-                  ? DeviceKernels.PROBE_HEADER_INTS
-                      + (long) star.probe.parts().size() * DeviceKernels.PROBE_PART_INTS
-                  : 1);
-      this.buildKeys = hostLongs(probing ? star.probeCapacity : 1);
-      this.buildValues = hostLongs(probing ? star.probeCapacity : 1);
-      this.weights = hostDoubles(probing ? capacity : 1);
-      int buildColumns = probing ? star.probe.sums().size() : 0;
-      this.buildSums =
-          hostDoubles(Math.max(1L, (long) buildColumns * (probing ? star.probeCapacity : 0)));
-      this.rowSums = hostDoubles(Math.max(1L, 2L * buildColumns * capacity));
-      int fromProbe = (int) sums.stream().filter(v -> v.probeColumn() >= 0).count();
-      this.probeValues = fromProbe;
-      this.probeValueSpec = hostInts(Math.max(1, 3 * fromProbe));
       this.keys = groupColumns.size();
       this.groupKeyColumns = Math.max(1, keys);
-      this.values = sums.size();
+      this.values = sums.size() + (stage == null ? 0 : stage.values());
       this.stringKey = new boolean[keys];
       this.nullableKey = new boolean[keys];
       this.groupSpec = hostInts(Math.max(1, 3 * keys));
@@ -2775,12 +2448,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.countColumn = new int[values];
       int nullable = 0;
       for (int v = 0; v < values; v++) {
-        List<DeviceValue.Factor> factors = sums.get(v).factors();
+        // A stage's value has no factors here (its kernels fill it) and always a count column.
+        List<DeviceValue.Factor> factors = v < sums.size() ? sums.get(v).factors() : List.of();
         int base = v * DeviceKernels.VALUE_SPEC_INTS;
         valueSpec.set(base, factors.size());
         boolean canBeNull =
-            sums.get(v).probeColumn() >= 0
-                || factors.stream().anyMatch(f -> column(f.column()).isOptional());
+            v >= sums.size() || factors.stream().anyMatch(f -> column(f.column()).isOptional());
         countColumn[v] = canBeNull ? nullable++ : -1;
         valueSpec.set(base + DeviceKernels.VALUE_SPEC_INTS - 1, countColumn[v]);
         for (int f = 0; f < factors.size(); f++) {
@@ -2799,58 +2472,117 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
       }
       this.counts = nullable;
-      int filled = 0;
-      for (int v = 0; v < values; v++) {
-        int column = sums.get(v).probeColumn();
-        if (column >= 0) {
-          if (star == null || star.probe == null || column >= star.probe.sums().size()) {
-            throw new IllegalArgumentException("No probe build column " + column);
-          }
-          probeValueSpec.set(3 * filled, v);
-          probeValueSpec.set(3 * filled + 1, column);
-          probeValueSpec.set(3 * filled + 2, countColumn[v]);
-          filled++;
-        }
-      }
       this.keyColumnsData = hostLongs((long) groupKeyColumns * capacity);
       this.valueData = hostDoubles((long) (values + 1 + counts) * capacity);
       this.outKeys = hostLongs((long) groupKeyColumns * capacity);
       this.outSums = hostDoubles((long) (values + 1 + counts) * capacity);
       this.size = new int[] {capacity, groupKeyColumns, values + 1 + counts};
-      this.denseOut = hostDoubles(Math.max(1L, (long) denseCapacity * (values + 1 + counts)));
+      this.stage = stage == null ? null : stage.open(new StageContext());
     }
 
-    /** Points this region at a run's dimensions; they reach the device with its next batch. */
-    void dimensions(Star run) {
-      if (run.capacity() > dimensionData.getSize()) {
-        throw new IllegalStateException("Dimensions outgrew the region; its shape should differ");
+    /** What the stage sees of this region. */
+    private final class StageContext implements GroupedStage.Context {
+      @Override
+      public KernelContext kernel() {
+        return context;
       }
-      if (probing && run.probe.rows() > buildKeys.getSize()) {
-        throw new IllegalStateException("The probe outgrew the region; its shape should differ");
+
+      @Override
+      public int capacity() {
+        return capacity;
       }
-      run.fill(
-          layout,
-          joinSpec,
-          gatherSpec,
-          dimensionData,
-          denseSpec,
-          probeSpec,
-          buildKeys,
-          buildValues,
-          buildSums);
-      current = run;
-      dimensionsChanged = true;
+
+      @Override
+      public IntArray ints(long elements) {
+        return hostInts(elements);
+      }
+
+      @Override
+      public LongArray longs(long elements) {
+        return hostLongs(elements);
+      }
+
+      @Override
+      public DoubleArray doubles(long elements) {
+        return hostDoubles(elements);
+      }
+
+      @Override
+      public ByteArray live() {
+        return live;
+      }
+
+      @Override
+      public IntArray intColumns() {
+        return ints;
+      }
+
+      @Override
+      public LongArray longColumns() {
+        return longs;
+      }
+
+      @Override
+      public DoubleArray doubleColumns() {
+        return doubles;
+      }
+
+      @Override
+      public ByteArray validity() {
+        return valid;
+      }
+
+      @Override
+      public LongArray keys() {
+        return keyColumnsData;
+      }
+
+      @Override
+      public DoubleArray values() {
+        return valueData;
+      }
+
+      @Override
+      public int groupKeys() {
+        return keys;
+      }
+
+      @Override
+      public int valueCount() {
+        return values;
+      }
+
+      @Override
+      public int countColumn(int value) {
+        return countColumn[value];
+      }
+
+      @Override
+      public GroupedStage.Column column(String name) {
+        Types.NestedField field = DeviceMergeOnReadScan.this.column(name);
+        CudfType type = layout.type(field.fieldId());
+        return new GroupedStage.Column(
+            type == CudfType.INT32 ? 0 : type == CudfType.INT64 ? 1 : 2,
+            layout.slot(field.fieldId()),
+            field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
+      }
+    }
+
+    /** Takes a run's stage data, for the next batch. */
+    void bind(GroupedStage run) {
+      stage.bind(run);
+    }
+
+    @Override
+    List<String> extraTasks() {
+      return stage == null ? List.of() : stage.tasks();
     }
 
     @Override
     void stage(TornadoExecutionPlan executionPlan, HostDeletes.FilePrep prep, boolean keyNullable) {
       super.stage(executionPlan, prep, keyNullable);
-      if (star != null && dimensionsChanged) {
-        executionPlan.transferToDevice(joinSpec, gatherSpec, dimensionData, denseSpec);
-        if (probing) {
-          executionPlan.transferToDevice(probeSpec, buildKeys, buildValues, buildSums);
-        }
-        dimensionsChanged = false;
+      if (stage != null) {
+        stage.stage(executionPlan);
       }
     }
 
@@ -2858,48 +2590,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     void consumer(TaskGraph graph) {
       graph.transferToDevice(
           DataTransferMode.FIRST_EXECUTION, groupSpec, valueSpec, valueConstants);
-      if (star != null) {
-        graph
-            .transferToDevice(
-                DataTransferMode.FIRST_EXECUTION, joinSpec, gatherSpec, dimensionData, denseSpec)
-            .task(
-                "starFilter",
-                DeviceKernels::starFilter,
-                context,
-                joinSpec,
-                star.joins(),
-                dimensionData,
-                ints,
-                longs,
-                valid,
-                capacity,
-                live);
-      }
-      if (probing) {
-        graph
-            .transferToDevice(
-                DataTransferMode.FIRST_EXECUTION,
-                probeSpec,
-                buildKeys,
-                buildValues,
-                buildSums,
-                probeValueSpec)
-            .task(
-                "probeWeights",
-                DeviceKernels::probeWeights,
-                context,
-                probeSpec,
-                dimensionData,
-                buildKeys,
-                buildValues,
-                ints,
-                longs,
-                valid,
-                capacity,
-                live,
-                weights,
-                buildSums,
-                rowSums);
+      if (stage != null) {
+        stage.afterFilter(graph);
       }
       graph.task(
           "groupKeys",
@@ -2913,17 +2605,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           valid,
           capacity,
           keyColumnsData);
-      if (star != null && star.gathers() > 0) {
-        graph.task(
-            "starKeys",
-            DeviceKernels::starKeys,
-            context,
-            gatherSpec,
-            star.gathers(),
-            dimensionData,
-            live,
-            capacity,
-            keyColumnsData);
+      if (stage != null) {
+        stage.afterKeys(graph);
       }
       graph.task(
           "values",
@@ -2939,53 +2622,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           valid,
           capacity,
           valueData);
-      if (probing) {
-        graph.task(
-            "applyWeights",
-            DeviceKernels::applyWeights,
-            context,
-            weights,
-            values + 1 + counts,
-            capacity,
-            valueData);
-        if (probeValues > 0) {
-          graph.task(
-              "probeValues",
-              DeviceKernels::probeValues,
-              context,
-              probeValueSpec,
-              probeValues,
-              rowSums,
-              values,
-              capacity,
-              valueData);
+      if (stage != null) {
+        stage.afterValues(graph);
+        if (stage.groups()) {
+          return;
         }
-      }
-      if (denseCapacity > 0) {
-        int columns = values + 1 + counts;
-        graph
-            .task(
-                "denseClear",
-                DeviceKernels::denseClear,
-                context,
-                columns * denseCapacity,
-                capacity,
-                denseOut)
-            .task(
-                "denseAggregate",
-                DeviceKernels::denseAggregate,
-                context,
-                denseSpec,
-                keys,
-                live,
-                keyColumnsData,
-                valueData,
-                columns,
-                capacity,
-                denseCapacity,
-                denseOut)
-            .transferToHost(DataTransferMode.UNDER_DEMAND, denseOut);
-        return;
       }
       graph
           .libraryTask(
@@ -3002,40 +2643,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           .transferToHost(DataTransferMode.UNDER_DEMAND, outKeys, outSums, outGroups);
     }
 
-    /** A dense star aggregate's batch: every group with rows, its key the codes its index holds. */
-    private long collectDense(TornadoExecutionResult executed, GroupedAggregate result) {
-      int columns = values + 1 + counts;
-      executed.transferToHost(
-          new DataRange(denseOut).withOffset(0).withSize((long) columns * denseCapacity));
-      long liveRows = 0;
-      double[] sums = new double[values];
-      double[] nonNull = new double[values];
-      for (int g = 0; g < current.denseGroups; g++) {
-        double rows = denseOut.get((long) values * denseCapacity + g);
-        if (rows == 0) {
-          continue;
-        }
-        List<Object> key = Lists.newArrayListWithCapacity(keys);
-        for (int k = 0; k < keys; k++) {
-          key.add((long) ((g / current.multipliers[k]) % current.cardinalities[k]));
-        }
-        for (int v = 0; v < values; v++) {
-          sums[v] = denseOut.get((long) v * denseCapacity + g);
-          nonNull[v] =
-              countColumn[v] < 0
-                  ? rows
-                  : denseOut.get((long) (values + 1 + countColumn[v]) * denseCapacity + g);
-        }
-        result.add(key, sums, rows, nonNull);
-        liveRows += (long) rows;
-      }
-      return liveRows;
-    }
-
     /** Copies back one batch's groups and merges them; returns the batch's live rows. */
     long collect(TornadoExecutionResult executed, GroupedAggregate result) {
-      if (denseCapacity > 0) {
-        return collectDense(executed, result);
+      if (stage != null && stage.groups()) {
+        return stage.collect(executed, result);
       }
       executed.transferToHost(outGroups);
       int groups = outGroups.get(0);

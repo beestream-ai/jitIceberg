@@ -34,11 +34,12 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
-import org.apache.iceberg.tornadovm.DeviceDimension;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
-import org.apache.iceberg.tornadovm.DeviceProbe;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
+import org.apache.iceberg.tornadovm.join.DeviceDimension;
+import org.apache.iceberg.tornadovm.join.DeviceProbe;
+import org.apache.iceberg.tornadovm.join.StarAggregation;
 
 /**
  * TPC-DS q72 through the Java API, the joins on the device: catalog sales filtered by their
@@ -102,7 +103,8 @@ public final class StarQ72 {
 
         // Sales: d1 in 1999, the demographics, a ship date; grouped by the row's own columns.
         GroupedAggregate sold =
-            salesScan.starAggregate(
+            StarAggregation.run(
+                salesScan,
                 ImmutableList.of(
                     keep(
                         "cs_sold_date_sk",
@@ -183,7 +185,8 @@ public final class StarQ72 {
         List<String> names = new ArrayList<>();
         int[] nameCodes = dictionary(warehouses, "w_warehouse_name", names);
         GroupedAggregate counts =
-            inventoryScan.starAggregate(
+            StarAggregation.run(
+                inventoryScan,
                 ImmutableList.of(
                     d2.withAttribute(weekCodes),
                     keep("inv_warehouse_sk", warehouses, r -> true).withAttribute(nameCodes),
@@ -196,7 +199,8 @@ public final class StarQ72 {
                 DeviceProbe.of(keys, values)
                     .keyColumn("inv_item_sk", WEEK_BITS)
                     .keyAttribute(0, 0, 1)
-                    .where("inv_quantity_on_hand", DeviceProbe.Comparison.LESS));
+                    .where("inv_quantity_on_hand", DeviceProbe.Comparison.LESS),
+                ImmutableList.of());
         long t4 = System.nanoTime();
 
         List<Object[]> result = new ArrayList<>();

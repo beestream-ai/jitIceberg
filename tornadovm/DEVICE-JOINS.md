@@ -133,7 +133,8 @@ short star queries on Spark unless they too win.
 2. The kernels and the plan in `iceberg-tornadovm` (engine-neutral, like the scan).
 
    **Done (2026-10-13):** `DeviceDimension` (a mask and attribute codes over a dense key range),
-   `DeviceMergeOnReadScan.starAggregate(dimensions, keys, values)` with `DeviceDimension.Key` a
+   `StarAggregation.run(scan, dimensions, keys, values)` (first `DeviceMergeOnReadScan.starAggregate`;
+   see "Code layout") with `DeviceDimension.Key` a
    fact column or a dimension attribute, and two kernels in the grouped pipeline: `starFilter`
    (after the delete and filter kernels: `live &= mask[fk - first]`, null and out-of-range keys
    dropped) and `starKeys` (after `groupKeys`: a gathered key's foreign key becomes the
@@ -281,7 +282,7 @@ by its aggregate's canonical plan, column names and snapshots (the build plan's 
 every planning).
 
 **Build rows with values (2026-10-13):** a probe's build rows can carry value columns
-(`DeviceValue.probe(k)`): each fact row adds the values of the build rows it joins, nulls skipped
+(`StarAggregation.ProbeSum`): each fact row adds the values of the build rows it joins, nulls skipped
 and counted apart, next to its own sums taken once a joined row. The planner turns SUM and AVG of
 build-only expressions into such columns (a decimal as its unscaled value, checked exact on the
 collected rows), and a table joined to the fact by more than one equality (store_returns: customer,
@@ -344,11 +345,36 @@ quantity) under the d1/household/customer filters (~200 ms), the host applies
 `ship > sold + 5` and maps sold dates to weeks (~20 ms), then inventory grouped by item
 description, warehouse and week with the probe (~300 ms): 40,749 groups, as Spark's. The rest
 is reading the dimensions on the host (~400 ms, mostly `customer_demographics`' 1.9M rows), which
-Spark would do in the planned version. `TestDeviceMergeOnRead.testStarAggregateWithProbe`
+Spark would do in the planned version. `TestStarAggregation.testStarAggregateWithProbe`
 checks the probe against IcebergGenerics (an attribute and a column in the key, repeated and
 absent build keys, the comparison). Promotion and returns, q72's left outer joins, match at
 most one row each (their keys are primary keys) and count rows that are never null, so they
 do not change the answer; a planned version must check that, or join them.
+
+## Code layout
+
+The scan stays join-agnostic. `org.apache.iceberg.tornadovm` knows grouped aggregation (filter,
+group keys, value columns, cuDF or a stage's own grouping) and nothing of dimensions or probes;
+joins live in `org.apache.iceberg.tornadovm.join` and plug into the grouped pipeline through one
+SPI:
+
+- `GroupedStage` (core): the columns a stage reads, how many values it adds after the scan's,
+  a shape for region reuse, and an `Instance` per region with hooks after the filter, the group
+  keys and the values; it may group the rows itself (`groups()` / `collect`) and uploads its
+  buffers once a run (`stage`). `DeviceMergeOnReadScan.aggregate(groupColumns, values, stage)`
+  runs it; `GroupedStage.Context` hands it the region's buffers and column slots.
+- `join.StarStage` implements it: the star filter and keys, the probe, the probe's sums, the dense
+  aggregation. `join.JoinKernels` holds those kernels, `join.DeviceDimension` and
+  `join.DeviceProbe` the host-built sides, `join.StarAggregation` the entry point (it checks the
+  join keys against the scan's schema). `DeviceValue` is plain column arithmetic again; a probe's
+  build-side sum is a `StarAggregation.ProbeSum`, its result after the scan's values.
+- A `ProbeSum` can be `maskedBy` a fact value: it then sums only where that value is non-null,
+  as SQL's `a - COALESCE(b, 0)` is null where `a` is (q80's profit was wrong without it).
+- Spark keeps the same split: `StarAggregates`/`ProbeAggregates` translate probe sums to
+  placeholder slots and remap them after the fact's values (`DeviceAggregate.remap`).
+
+Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
+(stars, probes, key ranges, build sums, left outer).
 
 ## Risks
 
