@@ -941,7 +941,10 @@ final class DeviceKernels {
       int alive = live.get(i);
       for (int v = 0; v < values; v++) {
         int base = v * VALUE_SPEC_INTS;
-        double product = 1.0;
+        // A sum of terms, each a product of factors: a factor with a non-zero coefficient starts a
+        // new term, the coefficient its sign and weight.
+        double total = 0.0;
+        double product = 0.0;
         int isNull = 0;
         for (int f = 0; f < spec.get(base); f++) {
           int kind = spec.get(base + 1 + 3 * f);
@@ -958,10 +961,16 @@ final class DeviceKernels {
           } else {
             x = doubles.get((long) slot * stride + i);
           }
-          int c = 2 * (v * DeviceValue.MAX_FACTORS + f);
+          int c = 3 * (v * DeviceValue.MAX_FACTORS + f);
+          double coefficient = constants.get(c + 2);
+          if (coefficient != 0.0) {
+            total += product;
+            product = coefficient;
+          }
           product = product * (constants.get(c) + constants.get(c + 1) * x);
         }
-        out.set((long) v * stride + i, alive == 1 && isNull == 0 ? product : 0.0);
+        total += product;
+        out.set((long) v * stride + i, alive == 1 && isNull == 0 ? total : 0.0);
         int countColumn = spec.get(base + VALUE_SPEC_INTS - 1);
         if (countColumn >= 0) {
           out.set(

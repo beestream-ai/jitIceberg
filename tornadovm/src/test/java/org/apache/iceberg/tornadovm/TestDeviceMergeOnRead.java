@@ -355,6 +355,47 @@ public class TestDeviceMergeOnRead {
     }
   }
 
+  /** A value that is a sum of terms: v1 - v2 + v3 * v4, per group of k, under deletes. */
+  @Test
+  public void testSumOfTerms() throws IOException {
+    Table table = MorTables.create(temp.resolve("terms").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 3000);
+    MorTables.deletePositions(table, files, ImmutableList.of(everyNth(3000, 4)));
+    table.refresh();
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record r : records) {
+        double value =
+            (Double) r.getField("v1")
+                - (Double) r.getField("v2")
+                + (Double) r.getField("v3") * (Double) r.getField("v4");
+        double[] t =
+            expected.computeIfAbsent(
+                ImmutableList.of((long) (Integer) r.getField("k")), ignored -> new double[2]);
+        t[0] += value;
+        t[1] += 1;
+      }
+    }
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(table, org.apache.iceberg.expressions.Expressions.alwaysTrue())) {
+      Map<List<Object>, double[]> actual =
+          device
+              .aggregate(
+                  ImmutableList.of("k"),
+                  ImmutableList.of(
+                      DeviceValue.of("v1")
+                          .minus(DeviceValue.of("v2"))
+                          .plus(DeviceValue.of("v3").times("v4"))))
+              .groups();
+      assertThat(actual.keySet()).isEqualTo(expected.keySet());
+      for (Map.Entry<List<Object>, double[]> e : expected.entrySet()) {
+        assertThat(actual.get(e.getKey())[0])
+            .isCloseTo(e.getValue()[0], org.assertj.core.data.Offset.offset(1e-6));
+        assertThat(actual.get(e.getKey())[1]).isEqualTo(e.getValue()[1]);
+      }
+    }
+  }
+
   private static void assertStarMatches(
       Table table,
       DeviceMergeOnReadScan device,

@@ -31,7 +31,12 @@ public final class DeviceValue implements java.io.Serializable {
   /** Most factors in one value. */
   public static final int MAX_FACTORS = 4;
 
-  record Factor(String column, double offset, double scale) implements java.io.Serializable {}
+  /**
+   * {@code offset + scale * column}; a non-zero {@code coefficient} starts a new term of the sum,
+   * which it multiplies.
+   */
+  record Factor(String column, double offset, double scale, double coefficient)
+      implements java.io.Serializable {}
 
   private final List<Factor> factors;
   // A probe's build column summed over the build rows a fact row joins, or -1.
@@ -63,21 +68,57 @@ public final class DeviceValue implements java.io.Serializable {
 
   /** The column itself. */
   public static DeviceValue of(String column) {
-    return new DeviceValue(ImmutableList.of(new Factor(column, 0, 1)));
+    return new DeviceValue(ImmutableList.of(new Factor(column, 0, 1, 1)));
   }
 
   public DeviceValue times(String column) {
-    return with(new Factor(column, 0, 1));
+    return with(new Factor(column, 0, 1, 0));
   }
 
   /** Times {@code 1 - column}. */
   public DeviceValue timesOneMinus(String column) {
-    return with(new Factor(column, 1, -1));
+    return with(new Factor(column, 1, -1, 0));
   }
 
   /** Times {@code 1 + column}. */
   public DeviceValue timesOnePlus(String column) {
-    return with(new Factor(column, 1, 1));
+    return with(new Factor(column, 1, 1, 0));
+  }
+
+  /**
+   * This value plus {@code other}: a sum of terms, each a product. A row where any term's column is
+   * null contributes nothing, as SQL's {@code a + b} is null when either is.
+   */
+  public DeviceValue plus(DeviceValue other) {
+    return sum(other, 1);
+  }
+
+  /** Minus this value. */
+  public DeviceValue negate() {
+    ImmutableList.Builder<Factor> negated = ImmutableList.builder();
+    for (Factor f : factors) {
+      negated.add(new Factor(f.column(), f.offset(), f.scale(), -f.coefficient()));
+    }
+    return new DeviceValue(negated.build(), probeColumn);
+  }
+
+  /** This value minus {@code other}. */
+  public DeviceValue minus(DeviceValue other) {
+    return sum(other, -1);
+  }
+
+  private DeviceValue sum(DeviceValue other, double sign) {
+    if (probeColumn >= 0 || other.probeColumn >= 0) {
+      throw new IllegalArgumentException("A probe value is not a term");
+    }
+    ImmutableList.Builder<Factor> terms = ImmutableList.<Factor>builder().addAll(factors);
+    for (Factor f : other.factors) {
+      terms.add(
+          f.coefficient() == 0
+              ? f
+              : new Factor(f.column(), f.offset(), f.scale(), sign * f.coefficient()));
+    }
+    return new DeviceValue(terms.build());
   }
 
   List<Factor> factors() {
@@ -96,7 +137,7 @@ public final class DeviceValue implements java.io.Serializable {
     StringBuilder text = new StringBuilder();
     for (Factor factor : factors) {
       if (text.length() > 0) {
-        text.append(" * ");
+        text.append(factor.coefficient() == 0 ? " * " : factor.coefficient() < 0 ? " - " : " + ");
       }
       text.append(
           factor.offset() == 0

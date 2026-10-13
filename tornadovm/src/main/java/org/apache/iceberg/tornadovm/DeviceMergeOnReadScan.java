@@ -2771,7 +2771,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         groupSpec.set(3 * k + 2, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
       }
       this.valueSpec = hostInts((long) values * DeviceKernels.VALUE_SPEC_INTS);
-      this.valueConstants = hostDoubles(2L * values * DeviceValue.MAX_FACTORS);
+      this.valueConstants = hostDoubles(3L * values * DeviceValue.MAX_FACTORS);
       this.countColumn = new int[values];
       int nullable = 0;
       for (int v = 0; v < values; v++) {
@@ -2792,9 +2792,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           valueSpec.set(base + 2 + 3 * f, layout.slot(field.fieldId()));
           valueSpec.set(
               base + 3 + 3 * f, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
-          int c = 2 * (v * DeviceValue.MAX_FACTORS + f);
+          int c = 3 * (v * DeviceValue.MAX_FACTORS + f);
           valueConstants.set(c, factor.offset());
           valueConstants.set(c + 1, factor.scale());
+          valueConstants.set(c + 2, factor.coefficient());
         }
       }
       this.counts = nullable;
