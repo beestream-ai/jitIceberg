@@ -62,6 +62,14 @@ case class SumAll(value: Int) extends DeviceAggregate
  */
 case class Moment(value: Int, squares: Int) extends DeviceAggregate
 
+/**
+ * SUM and AVG of {@code e / k} with each row's quotient exact (TPC-DS q4's `(...)/2`): the device
+ * sums {@code e}'s unscaled value (value {@code value}); the result's unscaled sum is that times
+ * {@code multiplier} = 10^(result scale - e's scale) / k.
+ */
+case class ScaledSum(value: Int, multiplier: Long) extends DeviceAggregate
+case class ScaledAverage(value: Int, multiplier: Long) extends DeviceAggregate
+
 /** COUNT of a probe's build-side column: the sum of its 0/1 non-null indicator (value {@code value}). */
 case class CountSum(value: Int) extends DeviceAggregate
 
@@ -342,6 +350,10 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
             } yield Moment(add(DeviceValue.of(f.name())), add(DeviceValue.of(f.name()).times(f.name())))
           case None => Left(s"moment of $m")
         }
+      case Sum(ExactQuotient(e, multiplier), _) =>
+        exactColumn(table, UnscaledValue(e), nulls).map(add).map(ScaledSum(_, multiplier))
+      case Average(ExactQuotient(e, multiplier), _) =>
+        exactColumn(table, UnscaledValue(e), nulls).map(add).map(ScaledAverage(_, multiplier))
       case s: Sum if s.child.dataType == DoubleType => valueIndex(s.child).map(SumOf)
       case a: Average if a.child.dataType == DoubleType => valueIndex(a.child).map(AverageOf)
       case Sum(Coalesce(Seq(v, zero: Literal)), _)
@@ -367,6 +379,11 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     case UnscaledValue(a: AttributeReference) if exactType(a.dataType) => exactColumn(table, a, nulls)
     // A sum or difference of decimals of the result's scale (TPC-DS q11's ext_list_price -
     // ext_discount_amt): the unscaled values add up the same way.
+    case UnscaledValue(Cast(a: AttributeReference, to: DecimalType, _, _)) if (a.dataType match {
+          case from: DecimalType => from.scale == to.scale && from.precision <= to.precision
+          case _ => false
+        }) =>
+      exactColumn(table, a, nulls)
     case UnscaledValue(e @ (_: Add | _: Subtract)) =>
       val scale = e.dataType.asInstanceOf[DecimalType].scale
       exactTerms(table, e, nulls, {
@@ -421,6 +438,27 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
           else Left(s"sum of $m may not be exact in doubles")
       } yield names.tail.foldLeft(DeviceValue.of(names.head))(_ times _)
     case other => Left(s"aggregate of $other")
+  }
+
+  /**
+   * {@code e / k}, a decimal over a positive integer literal, where every row's quotient is exact
+   * at the result's scale (10^(its scale - e's scale) divisible by k): the dividend and the
+   * multiplier from its unscaled sum to the quotients' unscaled sum.
+   */
+  private object ExactQuotient {
+    def unapply(e: Expression): Option[(Expression, Long)] = e match {
+      case Divide(dividend, Literal(k, _), _) =>
+        (dividend.dataType, e.dataType, Option(k).map(v => new java.math.BigDecimal(v.toString))) match {
+          case (from: DecimalType, to: DecimalType, Some(divisor))
+              if divisor.signum > 0 && divisor.stripTrailingZeros.scale <= 0 &&
+                to.scale >= from.scale && to.scale - from.scale <= 12 =>
+            val shift = java.math.BigInteger.TEN.pow(to.scale - from.scale)
+            val qr = shift.divideAndRemainder(divisor.toBigInteger)
+            if (qr(1).signum == 0) Some((dividend, qr(0).longValueExact())) else None
+          case _ => None
+        }
+      case _ => None
+    }
   }
 
   /** Variance and standard deviation, sample or population: the second central moment. */

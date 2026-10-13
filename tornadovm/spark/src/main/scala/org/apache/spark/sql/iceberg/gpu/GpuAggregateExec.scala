@@ -120,7 +120,7 @@ class DeviceResults(
 
   private val finishes: Vector[Finish] = ordered.map { ae =>
     aggregates(ae) match {
-      case SumOf(_) | AverageOf(_) | SumAll(_) | Moment(_, _) =>
+      case SumOf(_) | AverageOf(_) | SumAll(_) | Moment(_, _) | ScaledSum(_, _) | ScaledAverage(_, _) =>
         val buffer = ae.aggregateFunction.asInstanceOf[DeclarativeAggregate]
         val attributes = buffer.aggBufferAttributes
         val scale = ae.aggregateFunction.children.head.dataType match {
@@ -159,6 +159,10 @@ class DeviceResults(
         case SumAll(v) => finish(finishes(a), totals(v), rows)
         case AverageOf(v) => finish(finishes(a), totals(v), nonNull(v))
         case Moment(v, w) => moment(finishes(a), totals(v), totals(w), nonNull(v))
+        case ScaledSum(v, _) if nonNull(v) == 0 => null
+        case ScaledAverage(v, _) if nonNull(v) == 0 => null
+        case ScaledSum(v, m) => finish(finishes(a), totals(v), nonNull(v), m)
+        case ScaledAverage(v, m) => finish(finishes(a), totals(v), nonNull(v), m)
         case CountSum(v) => if (totals == null) 0L else Math.round(totals(v))
       }
       a += 1
@@ -191,12 +195,15 @@ class DeviceResults(
     f.evaluate.eval(new GenericInternalRow(buffer.toArray[Any]))
   }
 
-  private def finish(f: Finish, sum: Double, rows: Long): Any = {
+  private def finish(f: Finish, sum: Double, rows: Long, multiplier: Long = 1L): Any = {
     val sumValue: Any = f.sumType match {
       case DoubleType => sum
       case LongType => Math.round(sum)
       case d: DecimalType =>
-        Decimal(java.math.BigDecimal.valueOf(Math.round(sum), f.scale), d.precision, d.scale)
+        // The device's exact unscaled sum, times the quotient's multiplier, at the child's scale.
+        val unscaled =
+          java.math.BigInteger.valueOf(Math.round(sum)).multiply(java.math.BigInteger.valueOf(multiplier))
+        Decimal(new java.math.BigDecimal(unscaled, f.scale), d.precision, d.scale)
       case other => throw new IllegalStateException(s"sum buffer of $other")
     }
     val buffer = f.fields.map {

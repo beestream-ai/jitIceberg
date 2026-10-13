@@ -312,6 +312,12 @@ large groups having been run-time failures and rebuilt dimensions, both gone. Wh
 to 103.9 s, 1.21x geomean, 102/102 equal**; q11 2.00x, q31 1.72x, q74 1.60x, q23a/b 1.3x. q4 stays
 on Spark (`sum((... - ...)/2)` divides decimals per row).
 
+**Exact quotients (2026-10-13):** SUM and AVG of `e / k` -- q4's `(... - ... + ...) / 2` over
+decimals -- where every row's quotient is exact at the result's scale (10^(its scale - e's scale)
+divisible by k): the device sums e's unscaled value, and the result's unscaled sum is that times
+10^(scale difference) / k, applied exactly on the host. **q4: 5.76 to 2.02 s** (RAPIDS 3.33 s);
+the whole suite **127.0 to 101.6 s, 1.20x geomean, 102/102 equal**.
+
 **Sales with their returns (measured 2026-10-13, `metrics.py`):** q50, q17, q25, q29 and q93 (1.3
 to 2.5 s each, ~10.6 s together) all sort-merge join `store_sales` (28.2M rows) with
 `store_returns` (2.8M) on (customer, item, ticket) for ~1.9M matches -- the 28M-row sort

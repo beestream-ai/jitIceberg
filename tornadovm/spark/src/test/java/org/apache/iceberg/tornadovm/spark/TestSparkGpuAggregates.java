@@ -405,6 +405,9 @@ public class TestSparkGpuAggregates {
             // q11's: sums of differences and sums of columns (a null in either skips the row).
             "SELECT s_state, sum(qty - store_sk), sum(store_sk + qty), avg(qty - store_sk)"
                 + " FROM store_sales, store WHERE store_sk = s_store_sk GROUP BY s_state",
+            // q4's: sums and averages of a decimal expression halved, each row's half exact.
+            "SELECT s_state, sum((price + price) / 2), avg((price - price) / 2), sum(price / 2)"
+                + " FROM store_sales, store WHERE store_sk = s_store_sk GROUP BY s_state",
             // q17's: variances and standard deviations of an int column (nulls skipped).
             "SELECT s_state, stddev_samp(qty), var_pop(qty), stddev_pop(qty), count(qty)"
                 + " FROM store_sales, store WHERE store_sk = s_store_sk GROUP BY s_state",
