@@ -396,7 +396,11 @@ q14b 3.27 to 1.33 s, the same answers (RAPIDS 2.44 / - / 2.59 s). Left anti and 
 a star, a probe, a scan, whichever planner takes it (`GpuAggregateStrategy.planDevice`, now one
 chain of planners) -- and adds the branches' partial SUMs and COUNTs on the driver
 (`UnionAggregates`, Spark only). q23a 4.18 to 0.59 s, the same answer (RAPIDS 2.13 s). AVG and
-group keys over a union (q14a's ROLLUP, q5) stay on Spark.
+an Expand over a union (q14a's, q5's ROLLUP) stay on Spark. Group keys work
+the same way (each branch grouped by the keys over its own columns, partials merged by group),
+but no TPC-DS union has device branches yet: theirs sit under a window, read an adaptive query
+stage as a join input, or are not joins. `spark.iceberg.gpu.aggregate.union` (default true)
+turns the planner off; with 7-run medians on and off, q33/q71/q75/q76 are the same.
 
 Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
 (stars, probes, key ranges, build sums, left outer).

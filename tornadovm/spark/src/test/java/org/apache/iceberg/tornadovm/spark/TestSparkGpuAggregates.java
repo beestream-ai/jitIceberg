@@ -448,6 +448,10 @@ public class TestSparkGpuAggregates {
             "SELECT sum(v), count(*), sum(q) FROM (SELECT amount v, qty q FROM store_sales, store"
                 + " WHERE store_sk = s_store_sk AND s_state = 'TN' UNION ALL SELECT amount, qty"
                 + " FROM store_sales, date_dim WHERE date_sk = d_date_sk AND d_moy = 3) u",
+            // q33's, q56's: grouped by a key of both branches.
+            "SELECT k, sum(v), count(*) FROM (SELECT s_state k, amount v FROM store_sales, store"
+                + " WHERE store_sk = s_store_sk UNION ALL SELECT i_brand, amount"
+                + " FROM store_sales, item WHERE item_sk = i_item_sk) u GROUP BY k",
             // q67's value: a decimal product, nulls counted as 0.
             "SELECT i_category, i_class, sum(coalesce(price * qty, 0)) sumsales, sum(price * qty)"
                 + " FROM store_sales, item WHERE item_sk = i_item_sk"

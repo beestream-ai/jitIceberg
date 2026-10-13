@@ -172,7 +172,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
         (if (flag(ProbeAggregates.Enabled, "false")) Seq("as a probe aggregate: " -> (ProbeAggregates.spec _))
          else Nil)
     val unions =
-      if (joins.isEmpty) Nil
+      if (joins.isEmpty || !flag(UnionAggregates.Enabled, "true")) Nil
       else Seq("as a union aggregate: " -> ((a: Aggregate) => UnionAggregates.spec(a, planDevice)))
     val planners: Seq[(String, Aggregate => Either[String, DeviceAggregateSpec])] =
       Seq("" -> (deviceSpec _)) ++ joins ++ unions
