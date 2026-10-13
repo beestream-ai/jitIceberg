@@ -32,6 +32,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.tornadovm.DeviceDimension;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
+import org.apache.iceberg.tornadovm.DeviceProbe;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
 import org.apache.iceberg.types.Types;
@@ -187,12 +188,23 @@ public final class GpuAggregates {
       List<DeviceDimension> dimensions,
       List<DeviceDimension.Key> keys,
       List<DeviceValue> values) {
+    return starGroups(table, filter, dimensions, keys, values, null);
+  }
+
+  /** {@link #starGroups(Table, Expression, List, List, List)} joined with a probe (or null). */
+  public static Map<List<Object>, double[]> starGroups(
+      Table table,
+      Expression filter,
+      List<DeviceDimension> dimensions,
+      List<DeviceDimension.Key> keys,
+      List<DeviceValue> values,
+      DeviceProbe probe) {
     return withScan(
         table,
         filter,
         scan -> {
           Map<List<Object>, double[]> groups =
-              scan.starAggregate(dimensions, keys, values).groups();
+              scan.starAggregate(dimensions, keys, values, probe).groups();
           lastStarMetrics = String.valueOf(scan.metrics());
           return groups;
         });

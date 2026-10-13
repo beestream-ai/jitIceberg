@@ -38,6 +38,8 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.iceberg.gpu.GpuAggregateStrategy;
+import org.apache.spark.sql.iceberg.gpu.ProbeAggregates;
+import org.apache.spark.sql.iceberg.gpu.StarAggregates;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -87,6 +89,7 @@ public class TestSparkGpuAggregates {
     // Aggregates of nullable columns are opt-in; these tests cover them.
     SparkEnv.get().conf().set(GpuAggregateStrategy.NullableValues(), Boolean.toString(on));
     SparkEnv.get().conf().set(GpuAggregateStrategy.StarEnabled(), Boolean.toString(on));
+    SparkEnv.get().conf().set(ProbeAggregates.Enabled(), Boolean.toString(on));
   }
 
   /** A small Iceberg table of the given rows, as a temporary view. */
@@ -446,6 +449,143 @@ public class TestSparkGpuAggregates {
     for (int q = 0; q < onCpu.size() - 1; q++) {
       assertThat(device.get(onDevice.size() + q).onDevice()).as(onCpu.get(q)).isFalse();
     }
+  }
+
+  /**
+   * Probe aggregates, TPC-DS q72's shape: stock rows (the largest table) joined with sales on the
+   * item and on the week -- a date dimension's attribute on each side -- where the stock on hand is
+   * below the quantity sold; the sales side with its own dimension filter, a condition across its
+   * two dates and a left outer join to promotions. Grouped by the item's description, the
+   * warehouse's name and the week, counting rows: the same answer on the device as on Spark.
+   */
+  @Test
+  public void testProbeAggregates() {
+    Schema stock =
+        new Schema(
+            Types.NestedField.required(1, "inv_date_sk", Types.LongType.get()),
+            Types.NestedField.required(2, "inv_item_sk", Types.LongType.get()),
+            Types.NestedField.required(3, "inv_wh_sk", Types.LongType.get()),
+            Types.NestedField.optional(4, "inv_qoh", Types.IntegerType.get()));
+    view(
+        "stock",
+        stock,
+        2,
+        40_000,
+        id -> {
+          GenericRecord r = GenericRecord.create(stock);
+          r.setField("inv_date_sk", 1000L + 7 * ((id / 400) % 30)); // one row a week
+          r.setField("inv_item_sk", 1 + (id % 100));
+          r.setField("inv_wh_sk", 1 + (id / 100) % 4);
+          r.setField("inv_qoh", id % 17 == 0 ? null : (int) ((id * 7) % 50));
+          return r;
+        });
+    Schema sales =
+        new Schema(
+            Types.NestedField.required(1, "cs_sold_date_sk", Types.LongType.get()),
+            Types.NestedField.required(2, "cs_ship_date_sk", Types.LongType.get()),
+            Types.NestedField.required(3, "cs_item_sk", Types.LongType.get()),
+            Types.NestedField.required(4, "cs_qty", Types.LongType.get()),
+            Types.NestedField.optional(5, "cs_promo_sk", Types.LongType.get()));
+    view(
+        "sales",
+        sales,
+        1,
+        3_000,
+        id -> {
+          GenericRecord r = GenericRecord.create(sales);
+          long sold = 1000 + (id * 13) % 210;
+          r.setField("cs_sold_date_sk", sold);
+          r.setField("cs_ship_date_sk", sold + (id % 9));
+          r.setField("cs_item_sk", 1 + (id * 31) % 120); // items 101..120 have no stock
+          r.setField("cs_qty", 1 + (id % 60));
+          r.setField("cs_promo_sk", id % 5 == 0 ? null : 1 + id % 7);
+          return r;
+        });
+    Schema dates =
+        new Schema(
+            Types.NestedField.required(1, "dd_sk", Types.LongType.get()),
+            Types.NestedField.optional(2, "dd_week", Types.LongType.get()),
+            Types.NestedField.optional(3, "dd_year", Types.LongType.get()),
+            Types.NestedField.optional(4, "dd_day", Types.IntegerType.get()));
+    view(
+        "dd",
+        dates,
+        1,
+        400,
+        k -> {
+          GenericRecord r = GenericRecord.create(dates);
+          r.setField("dd_sk", 1000 + k);
+          r.setField("dd_week", 5000 + k / 7);
+          r.setField("dd_year", 2000 + k / 100);
+          r.setField("dd_day", (int) k);
+          return r;
+        });
+    Schema items =
+        new Schema(
+            Types.NestedField.required(1, "it_sk", Types.LongType.get()),
+            Types.NestedField.optional(2, "it_desc", Types.StringType.get()));
+    view(
+        "it",
+        items,
+        1,
+        100,
+        k -> {
+          GenericRecord r = GenericRecord.create(items);
+          r.setField("it_sk", 1 + k);
+          r.setField("it_desc", "item description " + (k % 37));
+          return r;
+        });
+    Schema warehouses =
+        new Schema(
+            Types.NestedField.required(1, "wh_sk", Types.LongType.get()),
+            Types.NestedField.optional(2, "wh_name", Types.StringType.get()));
+    view(
+        "wh",
+        warehouses,
+        1,
+        4,
+        k -> {
+          GenericRecord r = GenericRecord.create(warehouses);
+          r.setField("wh_sk", 1 + k);
+          r.setField("wh_name", "warehouse " + k);
+          return r;
+        });
+    Schema promotions = new Schema(Types.NestedField.required(1, "p_sk", Types.LongType.get()));
+    view(
+        "promo",
+        promotions,
+        1,
+        6,
+        k -> {
+          GenericRecord r = GenericRecord.create(promotions);
+          r.setField("p_sk", 1 + k);
+          return r;
+        });
+
+    String sql =
+        "SELECT it_desc, wh_name, d1.dd_week, count(CASE WHEN p_sk IS NULL THEN 1 ELSE 0 END) np,"
+            + " count(*) total FROM sales JOIN stock ON cs_item_sk = inv_item_sk"
+            + " JOIN wh ON wh_sk = inv_wh_sk JOIN it ON it_sk = cs_item_sk"
+            + " JOIN dd d1 ON cs_sold_date_sk = d1.dd_sk JOIN dd d2 ON inv_date_sk = d2.dd_sk"
+            + " JOIN dd d3 ON cs_ship_date_sk = d3.dd_sk"
+            + " LEFT OUTER JOIN promo ON cs_promo_sk = p_sk"
+            + " WHERE d1.dd_week = d2.dd_week AND inv_qoh < cs_qty AND d3.dd_day > d1.dd_day + 2"
+            + " AND d1.dd_year = 2000 GROUP BY it_desc, wh_name, d1.dd_week";
+    Answer cpu = run(sql);
+    gpu(true);
+    // These tables are small: a table over 1,000 rows is a fact, as sales is.
+    SparkEnv.get().conf().set(StarAggregates.MaxDimensionRows(), "1000");
+    Answer device;
+    try {
+      device = run(sql);
+    } finally {
+      gpu(false);
+      SparkEnv.get().conf().remove(StarAggregates.MaxDimensionRows());
+    }
+    assertThat(cpu.onDevice()).isFalse();
+    assertThat(cpu.rows()).isNotEmpty();
+    assertThat(device.onDevice()).as(sql).isTrue();
+    assertSameAnswer(device.rows(), cpu.rows());
   }
 
   /**

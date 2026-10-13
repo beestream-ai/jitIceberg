@@ -118,6 +118,17 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
             .map(e => s"planning failed: $e")
             .joinRight match {
             case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
+            case Left(starReason) if flag(ProbeAggregates.Enabled, "false") =>
+              scala.util.Try(ProbeAggregates.spec(agg)).toEither.left
+                .map(e => s"planning failed: $e")
+                .joinRight match {
+                case Right(spec) => Seq(GpuAggregateExec(agg.output, spec, agg))
+                case Left(probeReason) =>
+                  logInfo(
+                    s"GPU aggregate declined: $reason; as a star aggregate: $starReason;" +
+                      s" as a probe aggregate: $probeReason")
+                  Nil
+              }
             case Left(starReason) =>
               logInfo(s"GPU aggregate declined: $reason; as a star aggregate: $starReason")
               Nil

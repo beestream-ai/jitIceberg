@@ -240,7 +240,7 @@ case class GpuAggregateExec(
         case e: RuntimeException =>
           logWarning(s"GPU aggregate failed, aggregating on the CPU: ${e.getMessage}")
           spec match {
-            case star: GpuStarAggregateSpec => StarAggregates.remember(star)
+            case _: GpuStarAggregateSpec => StarAggregates.remember(logical)
             case _ =>
           }
           None

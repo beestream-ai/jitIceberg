@@ -20,6 +20,7 @@ package org.apache.spark.sql.iceberg.gpu
 
 import org.apache.iceberg.expressions.{Expression => IcebergExpression}
 import org.apache.iceberg.tornadovm.DeviceDimension
+import org.apache.iceberg.tornadovm.DeviceProbe
 import org.apache.iceberg.tornadovm.DeviceValue
 import org.apache.iceberg.tornadovm.spark.GpuAggregates
 import org.apache.iceberg.types.Type.TypeID
@@ -43,7 +44,23 @@ case class StarDimension(
     plan: LogicalPlan,
     factColumn: String,
     key: Attribute,
-    attributes: Seq[Attribute])
+    attributes: Seq[Attribute],
+    probeAttributes: Seq[Attribute] = Nil)
+
+/** A probe key part on the fact side: a fact column, or a dimension's probe attribute. */
+sealed trait ProbePart
+case class FactPart(column: String) extends ProbePart
+case class AttributePart(dimension: Int, attribute: Int) extends ProbePart
+
+/**
+ * The other side of a probe join ([[ProbeAggregates]]): a plan Spark runs and collects, whose
+ * columns are each key part's value, then the compared value when there is a comparison; the
+ * fact side's parts; and how the fact's column compares with the build's value.
+ */
+case class StarProbe(
+    build: LogicalPlan,
+    parts: Seq[ProbePart],
+    comparison: Option[(String, DeviceProbe.Comparison)])
 
 /**
  * An aggregate of `CASE WHEN predicate THEN value [ELSE 0 | NULL] END` whose predicate reads
@@ -78,9 +95,13 @@ case class GpuStarAggregateSpec(
     aggregates: Map[AggregateExpression, DeviceAggregate],
     expand: Option[(Seq[Seq[Expression]], Seq[Attribute])],
     groupExpressions: Seq[Expression],
-    resultExpressions: Seq[NamedExpression])
+    resultExpressions: Seq[NamedExpression],
+    probe: Option[StarProbe] = None)
     extends DeviceAggregateSpec
     with org.apache.spark.internal.Logging {
+
+  // The probe's collected build rows, for this run.
+  @transient private var buildSide: Option[ProbeAggregates.BuildRows] = None
 
   /** The attributes of a finest group, in order: each dimension's, then the fact's keys. */
   private def finest: Seq[Attribute] = dimensions.flatMap(_.attributes) ++ factKeys.map(_._1)
@@ -93,14 +114,23 @@ case class GpuStarAggregateSpec(
       import scala.concurrent.{Await, Future}
       import scala.concurrent.ExecutionContext.Implicits.global
       val jobs = dimensions.map(d => Future(StarAggregates.build(session, d)))
-      jobs.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
+      val buildRows = probe.map(p => Future(ProbeAggregates.collect(session, p)))
+      val dims = jobs.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
+      buildSide = buildRows.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
+      dims
+    }
+    val (deviceDimensions, deviceProbe) = probe match {
+      case Some(p) => ProbeAggregates.prepare(p, buildSide.get, dimensions, built)
+      case None => (built.map(_._1), null)
     }
     val dimensionsBuilt = System.nanoTime()
     // Without fact keys the finest groups are at most the product of the dimensions' tuples. Past
     // a few million the device's per-batch groups and the driver's merge cost more than Spark's own
     // aggregate (q67: 4.8M groups, 52 s against 5.4 s), so Spark runs it.
     val most = built.filter(_._2.nonEmpty).map(_._2.length.toDouble).product
-    if (factKeys.isEmpty && most > StarAggregates.maxGroups) {
+    // A probe's groups are bounded by its build side, not by the dimensions' tuples (q72: 41K
+    // groups of an item x warehouse x week product of billions).
+    if (factKeys.isEmpty && probe.isEmpty && most > StarAggregates.maxGroups) {
       throw new UnsupportedOperationException(
         f"up to $most%.0f finest groups, over ${StarAggregates.maxGroups}%.0f")
     }
@@ -111,9 +141,10 @@ case class GpuStarAggregateSpec(
     val groups = GpuAggregates.starGroups(
       table,
       filter,
-      built.map(_._1).asJava,
+      deviceDimensions.asJava,
       keys.asJava,
-      values.asJava)
+      values.asJava,
+      deviceProbe)
     val device = System.nanoTime()
 
     val input = finest
@@ -170,16 +201,6 @@ case class GpuStarAggregateSpec(
         s"; scan: ${GpuAggregates.lastStarMetrics()}")
     result
   }
-
-  /** The star's identity across plannings: the fact table's snapshot and filter, and the joins. */
-  private[gpu] lazy val signature: String =
-    s"${table.location()}@${Option(table.currentSnapshot()).map(_.snapshotId()).orNull}|$filter|" +
-      dimensions
-        .map { d =>
-          val columns = d.plan.collect { case r: DataSourceV2ScanRelation => r.output.map(_.name) }
-          s"${d.factColumn}=$columns${d.attributes.map(_.name)}${d.plan.canonicalized}"
-        }
-        .mkString(";")
 
   /** Device values, then one slot a conditional aggregate. */
   private def slots: Int = values.size + conditionals.size
@@ -261,12 +282,25 @@ object StarAggregates extends PredicateHelper {
         size() > 1024
     }))
 
-  private[gpu] def remember(spec: GpuStarAggregateSpec): Unit = failed.add(spec.signature)
+  /**
+   * An aggregate's identity across plannings: its canonical plan, with the column names and table
+   * snapshots a canonical plan leaves out (it names every attribute "none").
+   */
+  private[gpu] def identity(agg: LogicalPlan): String = {
+    val relations = agg.collect { case r: DataSourceV2ScanRelation => r }
+    relations.map { r =>
+      val snapshot = GpuAggregateStrategy.currentTable(r).toOption
+        .map(t => s"${t.location()}@${Option(t.currentSnapshot()).map(_.snapshotId()).orNull}")
+      s"$snapshot${r.output.map(_.name)}"
+    }.mkString(";") + agg.canonicalized.toString
+  }
+
+  private[gpu] def remember(agg: LogicalPlan): Unit = failed.add(identity(agg))
+
+  private[gpu] def failedBefore(agg: LogicalPlan): Boolean = failed.contains(identity(agg))
 
   def spec(agg: Aggregate): Either[String, GpuStarAggregateSpec] =
-    plan(agg).flatMap { spec =>
-      if (failed.contains(spec.signature)) Left("failed on the device before") else Right(spec)
-    }
+    if (failedBefore(agg)) Left("failed on the device before") else plan(agg)
 
   private def plan(agg: Aggregate): Either[String, GpuStarAggregateSpec] = {
     val (expand, below) = agg.child match {
@@ -484,7 +518,7 @@ object StarAggregates extends PredicateHelper {
   /** A condition on one dimension: a filter, or (with the fact attribute and key) its join. */
   private type DimensionPart = (Int, Option[(Attribute, Attribute)], Expression)
 
-  private def dimensionRowLimit: Long = {
+  private[gpu] def dimensionRowLimit: Long = {
     val key = MaxDimensionRows
     val env = Option(org.apache.spark.SparkEnv.get).map(_.conf)
     org.apache.spark.sql.internal.SQLConf.get
@@ -492,7 +526,7 @@ object StarAggregates extends PredicateHelper {
       .toLong
   }
 
-  private def denseByStatistics(leaf: LogicalPlan, key: Attribute): Either[String, Unit] = {
+  private[gpu] def denseByStatistics(leaf: LogicalPlan, key: Attribute): Either[String, Unit] = {
     val column = leaf.collectFirst {
       case r: DataSourceV2ScanRelation if r.outputSet.contains(key) => r
     }
@@ -506,7 +540,7 @@ object StarAggregates extends PredicateHelper {
     }
   }
 
-  private def rowCount(table: org.apache.iceberg.Table): Long =
+  private[gpu] def rowCount(table: org.apache.iceberg.Table): Long =
     Option(table.currentSnapshot())
       .flatMap(s => Option(s.summary().get("total-records")))
       .map(_.toLong)
@@ -564,7 +598,7 @@ object StarAggregates extends PredicateHelper {
   }
 
   /** Projections and filters above the joins: their conditions and aliases. */
-  private def aboveJoins(plan: LogicalPlan)
+  private[gpu] def aboveJoins(plan: LogicalPlan)
       : Either[String, (Seq[Expression], Map[ExprId, Expression], LogicalPlan)] = plan match {
     case Project(list, child) if list.forall(_.deterministic) =>
       aboveJoins(child).flatMap { case (conditions, aliases, joins) =>
@@ -583,7 +617,7 @@ object StarAggregates extends PredicateHelper {
   }
 
   /** The leaves of a tree of inner joins (what holds no join) and every condition in it. */
-  private def joinTree(plan: LogicalPlan): Either[String, (Seq[LogicalPlan], Seq[Expression])] =
+  private[gpu] def joinTree(plan: LogicalPlan): Either[String, (Seq[LogicalPlan], Seq[Expression])] =
     plan match {
       case Join(left, right, Inner, condition, _) =>
         for (l <- joinTree(left); r <- joinTree(right))
@@ -607,10 +641,12 @@ object StarAggregates extends PredicateHelper {
    * (TPC-DS's `date_dim` of a year, say) recurs across queries and runs, and building it is a
    * Spark job and a pass over its rows.
    */
+  /** A built dimension: the device's, its attribute tuples by code, and each probe attribute's raw values by key. */
+  type Built = (DeviceDimension, Array[Array[Any]], Seq[Array[Long]])
+
   private val built = java.util.Collections.synchronizedMap(
-    new java.util.LinkedHashMap[String, (DeviceDimension, Array[Array[Any]])](64, 0.75f, true) {
-      override def removeEldestEntry(
-          eldest: java.util.Map.Entry[String, (DeviceDimension, Array[Array[Any]])]): Boolean =
+    new java.util.LinkedHashMap[String, Built](64, 0.75f, true) {
+      override def removeEldestEntry(eldest: java.util.Map.Entry[String, Built]): Boolean =
         size() > 32
     })
 
@@ -629,10 +665,11 @@ object StarAggregates extends PredicateHelper {
       Some(
         snapshots.flatten.mkString(",") + "|" + d.factColumn + "|" + columns.mkString(";") + "|" +
           (d.key +: d.attributes).map(_.name).mkString(",") + "|" +
-          Project(d.key +: d.attributes, d.plan).canonicalized.toString)
+          d.probeAttributes.map(_.name).mkString(",") + "|" +
+          Project((d.key +: d.attributes) ++ d.probeAttributes, d.plan).canonicalized.toString)
   }
 
-  private[gpu] def build(session: SparkSession, d: StarDimension): (DeviceDimension, Array[Array[Any]]) =
+  private[gpu] def build(session: SparkSession, d: StarDimension): Built =
     dimensionKey(d) match {
       case Some(key) =>
         Option(built.get(key)).getOrElse {
@@ -643,9 +680,9 @@ object StarAggregates extends PredicateHelper {
       case None => buildNow(session, d)
     }
 
-  private def buildNow(session: SparkSession, d: StarDimension): (DeviceDimension, Array[Array[Any]]) = {
+  private def buildNow(session: SparkSession, d: StarDimension): Built = {
     val rows = Dataset
-      .ofRows(session, Project(d.key +: d.attributes, d.plan))
+      .ofRows(session, Project((d.key +: d.attributes) ++ d.probeAttributes, d.plan))
       .queryExecution
       .executedPlan
       .executeCollect()
@@ -662,6 +699,9 @@ object StarAggregates extends PredicateHelper {
     }
     val keep = new Array[Boolean](range.toInt)
     val codes = new Array[Int](range.toInt)
+    // A probe attribute's integer value a key (Long.MinValue: absent or null, joins nothing).
+    val raw = d.probeAttributes.map(_ => Array.fill(range.toInt)(Long.MinValue))
+    val rawAt = 1 + d.attributes.size
     val dictionary = mutable.HashMap[Seq[Any], Int]()
     val tuples = mutable.ArrayBuffer[Array[Any]]()
     live.foreach { row =>
@@ -670,12 +710,19 @@ object StarAggregates extends PredicateHelper {
         throw new UnsupportedOperationException(s"Dimension ${d.key.name}: key ${key(row)} repeats")
       }
       keep(at) = true
+      d.probeAttributes.indices.foreach { j =>
+        if (!row.isNullAt(rawAt + j)) {
+          raw(j)(at) =
+            if (d.probeAttributes(j).dataType == IntegerType) row.getInt(rawAt + j).toLong
+            else row.getLong(rawAt + j)
+        }
+      }
       if (d.attributes.nonEmpty) {
         val tuple = d.attributes.indices.map(i => row.get(i + 1, d.attributes(i).dataType))
         codes(at) = dictionary.getOrElseUpdate(tuple, { tuples += tuple.toArray; tuples.size - 1 })
       }
     }
     val dimension = DeviceDimension.of(d.factColumn, first.toInt, keep)
-    (if (d.attributes.isEmpty) dimension else dimension.withAttribute(codes), tuples.toArray)
+    (if (d.attributes.isEmpty) dimension else dimension.withAttribute(codes), tuples.toArray, raw)
   }
 }
