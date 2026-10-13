@@ -162,12 +162,19 @@ case class GpuStarAggregateSpec(
           groupExpressions.map(e => BindReferences.bindReference(e, output)))
       case None => (Seq.empty, groupExpressions.map(e => BindReferences.bindReference(e, input)))
     }
+    // Finest groups are distinct (a dimension's codes are distinct tuples): group keys that are
+    // the finest attributes, each once, leave each its own output group, with nothing to merge.
+    val direct = bound.isEmpty && expanded.forall(_.isInstanceOf[BoundReference]) &&
+      expanded.map(_.asInstanceOf[BoundReference].ordinal).sorted == input.indices
     val merged = mutable.LinkedHashMap[Seq[Any], Array[Double]]()
+    val distinct = mutable.ArrayBuffer[(Seq[Any], Array[Double])]()
     def add(key: Seq[Any], totals: Array[Double]): Unit =
-      merged.get(key) match {
-        case Some(sum) => for (i <- sum.indices) sum(i) += totals(i)
-        case None => merged(key) = totals.clone()
-      }
+      if (direct) distinct += key -> totals
+      else
+        merged.get(key) match {
+          case Some(sum) => for (i <- sum.indices) sum(i) += totals(i)
+          case None => merged(key) = totals.clone()
+        }
     groups.asScala.foreach { case (key, totals) =>
       val codes = key.asScala
       val row = new Array[Any](input.size)
@@ -193,17 +200,17 @@ case class GpuStarAggregateSpec(
       }
     }
     val result =
-      if (merged.isEmpty && groupExpressions.isEmpty) {
+      if (merged.isEmpty && distinct.isEmpty && groupExpressions.isEmpty) {
         Seq(new DeviceResults(Nil, slots, aggregates, resultExpressions).row(Nil, null))
       } else {
         val results = new DeviceResults(groupExpressions, slots, aggregates, resultExpressions)
-        merged.toSeq.map { case (key, totals) => results.row(key, totals) }
+        (if (direct) distinct.toSeq else merged.toSeq).map { case (key, totals) => results.row(key, totals) }
       }
     val end = System.nanoTime()
     logInfo(
       f"star aggregate ${table.name()}: dimensions ${(dimensionsBuilt - start) / 1e6}%.1f ms" +
         f" (${built.map(_._2.length).mkString("/")} tuples), device ${(device - dimensionsBuilt) / 1e6}%.1f ms" +
-        f" (${groups.size()} groups), driver ${(end - device) / 1e6}%.1f ms (${merged.size} groups out)" +
+        f" (${groups.size()} groups), driver ${(end - device) / 1e6}%.1f ms (${merged.size + distinct.size} groups out)" +
         s"; scan: ${GpuAggregates.lastStarMetrics()}")
     result
   }
