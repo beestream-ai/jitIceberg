@@ -402,6 +402,18 @@ but no TPC-DS union has device branches yet: theirs sit under a window, read an 
 stage as a join input, or are not joins. `spark.iceberg.gpu.aggregate.union` (default true)
 turns the planner off; with 7-run medians on and off, q33/q71/q75/q76 are the same.
 
+**What q64, q93 and the anti joins need (2026-10-13, measured, not built):** q64's `cs_ui`
+(catalog sales joined to catalog returns by item and order, grouped by item) gets past the
+probe planner once (1) a build table joined by a composite key counts as a fact whatever its size
+(catalog_returns has 1.4M rows, under the dimension limit) and (2) build-side decimal sums of
+precision <= 18 sum as unscaled longs. It then stops at (3) a fact column as a group key
+(`cs_item_sk`): the probe's cuDF grouping counts fact rows, not their weights, so grouped probes
+need the weight as the row count first. q93's value multiplies a fact and a build column per
+joined row, which build sums cannot express. q10/q35/q69's existence joins sit on `customer` in
+queries whose largest table is `customer_demographics` and whose aggregates read dimension
+columns (MIN/MAX), not a star. q16/q94's NOT EXISTS carry a non-equality (`<>` warehouse).
+Each change on its own moved no query, so none is committed.
+
 Tests follow the packages: `TestDeviceMergeOnRead` (the scan), `join.TestStarAggregation`
 (stars, probes, key ranges, build sums, left outer).
 
