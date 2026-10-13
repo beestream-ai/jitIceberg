@@ -215,6 +215,55 @@ public class TestStarAggregation {
   }
 
   /**
+   * A probe grouped by a fact column, which cuDF groups: build keys that repeat weigh each fact row
+   * by their count, in its sums and its row count alike (k = 2 joins two build rows, k = 4 three).
+   * No dimension: the fact joins the build side alone (q64's sales with their returns).
+   */
+  @Test
+  public void testGroupedProbeWeights() throws IOException {
+    Table table = MorTables.create(temp.resolve("weights").toString(), MorTables.SCHEMA, 2);
+    writeFiles(table, 0, 1500);
+    table.refresh();
+    boolean[] all = new boolean[7];
+    Arrays.fill(all, true);
+    long[] keys = {2, 2, 4, 4, 4};
+    DeviceProbe probe = DeviceProbe.of(keys, new long[keys.length]).keyColumn("k", 1, 0, 7);
+    Map<List<Object>, double[]> expected = Maps.newHashMap();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        int k = (Integer) record.getField("k");
+        int weight = k == 2 ? 2 : k == 4 ? 3 : 0;
+        if (weight > 0) {
+          double[] totals =
+              expected.computeIfAbsent(ImmutableList.of((long) k), ignored -> new double[2]);
+          totals[0] += weight * (Double) record.getField("v1");
+          totals[1] += weight;
+        }
+      }
+    }
+    try (DeviceMergeOnReadScan device =
+        DeviceMergeOnReadScan.of(table, org.apache.iceberg.expressions.Expressions.alwaysTrue())) {
+      Map<List<Object>, double[]> actual =
+          StarAggregation.run(
+                  device,
+                  ImmutableList.of(),
+                  ImmutableList.of(DeviceDimension.Key.column("k")),
+                  ImmutableList.of(DeviceValue.of("v1")),
+                  probe,
+                  ImmutableList.of())
+              .groups();
+      assertThat(actual.keySet()).isEqualTo(expected.keySet());
+      for (Map.Entry<List<Object>, double[]> entry : expected.entrySet()) {
+        double[] got = actual.get(entry.getKey());
+        assertThat(got[1]).as("%s rows", entry.getKey()).isEqualTo(entry.getValue()[1]);
+        assertThat(got[0])
+            .as("%s sum", entry.getKey())
+            .isCloseTo(entry.getValue()[0], org.assertj.core.data.Offset.offset(1e-6));
+      }
+    }
+  }
+
+  /**
    * A probe key part with an offset and a range: a fact value outside the range joins nothing, even
    * when its offset value would equal a build key (k = 5 against keys 0..2 of k - 2 with a range of
    * 3, where 5 - 2 = 3 is one past the range and a second part would make it alias).
@@ -266,7 +315,7 @@ public class TestStarAggregation {
   }
 
   /**
-   * A probe whose build rows carry a value column ({@link DeviceValue#probe(int)}): each fact row
+   * A probe whose build rows carry a value column ({@link StarAggregation.ProbeSum}): each fact row
    * adds the values of the build rows it joins (one is null, skipped and not counted), next to its
    * own weighted sum and row count.
    */

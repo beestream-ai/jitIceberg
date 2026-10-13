@@ -242,7 +242,8 @@ final class StarStage implements GroupedStage {
     Stream(Context context) {
       this.context = context;
       int rows = context.capacity();
-      this.joinSpec = context.ints((long) dimensions.size() * JoinKernels.JOIN_SPEC_INTS);
+      this.joinSpec =
+          context.ints(Math.max(1L, (long) dimensions.size() * JoinKernels.JOIN_SPEC_INTS));
       this.gatherSpec = context.ints(Math.max(1L, (long) gathers() * JoinKernels.GATHER_SPEC_INTS));
       this.dimensionData = context.ints(capacity);
       this.denseSpec = context.ints(Math.max(1, keys.size()));

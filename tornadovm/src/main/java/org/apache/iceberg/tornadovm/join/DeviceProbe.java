@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.tornadovm.join;
 
-import java.util.Arrays;
 import java.util.List;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 
@@ -98,11 +97,7 @@ public final class DeviceProbe {
     if (keys.length != values.length) {
       throw new IllegalArgumentException(keys.length + " keys for " + values.length + " values");
     }
-    Integer[] order = new Integer[keys.length];
-    for (int i = 0; i < order.length; i++) {
-      order[i] = i;
-    }
-    Arrays.sort(order, (a, b) -> Long.compare(keys[a], keys[b]));
+    int[] order = sortedOrder(keys);
     long[] sortedKeys = new long[keys.length];
     long[] sortedValues = new long[keys.length];
     List<double[]> sortedSums = new java.util.ArrayList<>();
@@ -116,6 +111,38 @@ public final class DeviceProbe {
     }
     return new DeviceProbe(
         sortedKeys, sortedValues, ImmutableList.of(), null, Comparison.ANY, sortedSums, false);
+  }
+
+  /**
+   * The row indices in key order: a stable merge sort of primitive indices (a build side has
+   * millions of rows, and boxed indices sorted by a comparator cost ~0.5 s a million).
+   */
+  private static int[] sortedOrder(long[] keys) {
+    int n = keys.length;
+    int[] order = new int[n];
+    int[] other = new int[n];
+    for (int i = 0; i < n; i++) {
+      order[i] = i;
+    }
+    for (int width = 1; width < n; width *= 2) {
+      for (int low = 0; low < n; low += 2 * width) {
+        int mid = Math.min(low + width, n);
+        int high = Math.min(low + 2 * width, n);
+        int left = low;
+        int right = mid;
+        for (int at = low; at < high; at++) {
+          if (left < mid && (right >= high || keys[order[left]] <= keys[order[right]])) {
+            other[at] = order[left++];
+          } else {
+            other[at] = order[right++];
+          }
+        }
+      }
+      int[] swap = order;
+      order = other;
+      other = swap;
+    }
+    return order;
   }
 
   /** Adds {@code column * multiplier} of the fact row to its key. */

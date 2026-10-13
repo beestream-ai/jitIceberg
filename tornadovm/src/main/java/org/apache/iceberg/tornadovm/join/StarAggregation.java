@@ -75,8 +75,8 @@ public final class StarAggregation {
       List<DeviceValue> values,
       DeviceProbe probe,
       List<ProbeSum> probeSums) {
-    if (dimensions.isEmpty()) {
-      throw new IllegalArgumentException("A star aggregate joins at least one dimension");
+    if (dimensions.isEmpty() && probe == null) {
+      throw new IllegalArgumentException("A star aggregate joins a dimension or a probe");
     }
     for (DeviceDimension dimension : dimensions) {
       requireInteger(scan, dimension.factColumn(), "join key");
