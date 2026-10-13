@@ -24,6 +24,8 @@
 #   run.sh cpu      <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, all cores (THREADS=n)
 #   run.sh generics <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, IcebergGenerics, 1 thread
 #   run.sh spark    <warehouse> <q1|q2|q3|q4> <runs> <table>...     Spark local[*] + iceberg-spark-runtime
+#   BENCH_SCRIPT=tpcds_bench.py run.sh spark|rapids|spark-gpu <warehouse>/<namespace> <query dir> <runs> [q...]
+#                                   TPC-DS (tables from tpcds_setup.py) instead of spark_bench.py
 #
 # Needs: TORNADOVM_HOME (a TornadoVM SDK with the cuDF shim), JAVA_HOME (JDK 21), libcudf on
 # LD_LIBRARY_PATH; for spark, SPARK_HOME and ICEBERG_SPARK_JAR.
@@ -86,7 +88,7 @@ case "$mode" in
             --conf spark.sql.catalog.local.type=hadoop \
             --conf spark.sql.catalog.local.warehouse="$(dirname "$1")" \
             --conf spark.ui.enabled=false \
-            "$HERE/spark_bench.py" "$@"
+            "$HERE/${BENCH_SCRIPT:-spark_bench.py}" "$@"
         ;;
     rapids)
         # Spark with the RAPIDS Accelerator on the same GPU, with the newest Iceberg runtime RAPIDS
@@ -106,7 +108,7 @@ case "$mode" in
             --conf spark.sql.catalog.local.type=hadoop \
             --conf spark.sql.catalog.local.warehouse="$(dirname "$1")" \
             --conf spark.ui.enabled=false \
-            "$HERE/spark_bench.py" "$@"
+            "$HERE/${BENCH_SCRIPT:-spark_bench.py}" "$@"
         ;;
     spark-gpu)
         # Spark with Iceberg's reader on the GPU (module iceberg-tornadovm-spark): Iceberg's unshaded
@@ -127,7 +129,7 @@ case "$mode" in
             --conf spark.sql.catalog.local.type=hadoop \
             --conf spark.sql.catalog.local.warehouse="$(dirname "$1")" \
             --conf spark.ui.enabled=false \
-            "$HERE/spark_bench.py" "$@"
+            "$HERE/${BENCH_SCRIPT:-spark_bench.py}" "$@"
         ;;
     *)
         echo "unknown mode $mode" >&2; exit 2 ;;
