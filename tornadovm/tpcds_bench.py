@@ -21,7 +21,7 @@
 # <runs> timed runs a query, the median printed with a checksum of the result -- its rows,
 # doubles and decimals rounded to 1e-6 relative, sorted -- for comparing engines.
 #
-#   run.sh spark|rapids|spark-gpu <warehouse>/<namespace> <query dir> <runs> [query...]
+#   [SPLIT_SIZE=bytes] run.sh spark|rapids|spark-gpu <warehouse>/<namespace> <query dir> <runs> [query...]
 import hashlib
 import os
 import statistics
@@ -38,6 +38,9 @@ engine = os.environ.get("ENGINE", "spark")
 spark = SparkSession.builder.appName(f"tpcds-{engine}").getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
 spark.sql(f"USE local.{os.path.basename(warehouse.rstrip('/'))}")
+if os.environ.get("SPLIT_SIZE"):
+    # Iceberg's read split size for this engine's run: bigger splits, fewer and larger tasks.
+    spark.conf.set("spark.sql.iceberg.read.split-size", os.environ["SPLIT_SIZE"])
 
 
 def canonical(value):
