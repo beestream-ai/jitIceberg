@@ -130,6 +130,54 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
         });
   }
 
+  /**
+   * A visitor of the live rows of one data file, on the scan thread that reads it: the CPU
+   * counterpart of a {@link GroupedStage}, so that a technique can run on both processors over the
+   * same deletes and filters. Rows arrive in file order with every delete already applied.
+   */
+  public interface RowVisitor {
+    void accept(ColumnarBatch batch, int row);
+  }
+
+  /**
+   * Visits every live row of the scan: {@code perFile} makes a visitor for each data file, on the
+   * thread that reads it, given each projected column's index in the batches; {@code finish} sees
+   * every visitor once all files have been read. Returns the live row count.
+   */
+  public <V extends RowVisitor> long visit(
+      List<String> columns,
+      java.util.function.Function<Map<String, Integer>, V> perFile,
+      Consumer<List<V>> finish) {
+    return run(
+        columns,
+        (file, columnIndex) -> new VisitorSink<>(perFile.apply(columnIndex)),
+        sinks -> {
+          List<V> visitors = Lists.newArrayList();
+          sinks.forEach(sink -> visitors.add(sink.visitor));
+          finish.accept(visitors);
+        });
+  }
+
+  private static final class VisitorSink<V extends RowVisitor> implements Sink {
+    private final V visitor;
+    private int rows = 0;
+
+    VisitorSink(V visitor) {
+      this.visitor = visitor;
+    }
+
+    @Override
+    public void accept(ColumnarBatch batch, int row) {
+      visitor.accept(batch, row);
+      rows++;
+    }
+
+    @Override
+    public int rows() {
+      return rows;
+    }
+  }
+
   /** What one thread accumulates over the live rows of one data file. */
   private interface Sink {
     void accept(ColumnarBatch batch, int row);

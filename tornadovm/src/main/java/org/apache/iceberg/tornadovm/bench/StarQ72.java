@@ -34,9 +34,11 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
+import org.apache.iceberg.tornadovm.join.CpuStarAggregation;
 import org.apache.iceberg.tornadovm.join.DeviceDimension;
 import org.apache.iceberg.tornadovm.join.DeviceProbe;
 import org.apache.iceberg.tornadovm.join.StarAggregation;
@@ -53,6 +55,26 @@ public final class StarQ72 {
   private StarQ72() {}
 
   private static final int WEEK_BITS = 64;
+
+  // -Dstar.cpu=true runs both star aggregates on the CPU (CpuStarAggregation, star.threads threads,
+  // every core by default): the same dimensions, probe and grouping as the device.
+  private static final boolean CPU = Boolean.getBoolean("star.cpu");
+  private static final int THREADS =
+      Integer.getInteger("star.threads", Runtime.getRuntime().availableProcessors());
+
+  private static GroupedAggregate star(
+      DeviceMergeOnReadScan device,
+      Table table,
+      List<DeviceDimension> dimensions,
+      List<DeviceDimension.Key> keys,
+      List<DeviceValue> values,
+      DeviceProbe probe,
+      List<StarAggregation.ProbeSum> sums) {
+    return CPU
+        ? CpuStarAggregation.run(
+            CpuMergeOnReadScan.of(table, THREADS), dimensions, keys, values, probe, sums)
+        : StarAggregation.run(device, dimensions, keys, values, probe, sums);
+  }
 
   /** A dimension's rows as maps of key to the named columns. */
   private static Map<Long, Record> rows(String warehouse, String table, String... columns)
@@ -103,8 +125,9 @@ public final class StarQ72 {
 
         // Sales: d1 in 1999, the demographics, a ship date; grouped by the row's own columns.
         GroupedAggregate sold =
-            StarAggregation.run(
+            star(
                 salesScan,
+                sales,
                 ImmutableList.of(
                     keep(
                         "cs_sold_date_sk",
@@ -124,7 +147,9 @@ public final class StarQ72 {
                     DeviceDimension.Key.column("cs_sold_date_sk"),
                     DeviceDimension.Key.column("cs_ship_date_sk"),
                     DeviceDimension.Key.column("cs_quantity")),
-                ImmutableList.of(DeviceValue.of("cs_quantity")));
+                ImmutableList.of(DeviceValue.of("cs_quantity")),
+                null,
+                ImmutableList.of());
         long t2 = System.nanoTime();
 
         // Build rows: (item, week) and the quantity, once a sale shipped more than 5 days after.
@@ -185,8 +210,9 @@ public final class StarQ72 {
         List<String> names = new ArrayList<>();
         int[] nameCodes = dictionary(warehouses, "w_warehouse_name", names);
         GroupedAggregate counts =
-            StarAggregation.run(
+            star(
                 inventoryScan,
+                inventory,
                 ImmutableList.of(
                     d2.withAttribute(weekCodes),
                     keep("inv_warehouse_sk", warehouses, r -> true).withAttribute(nameCodes),

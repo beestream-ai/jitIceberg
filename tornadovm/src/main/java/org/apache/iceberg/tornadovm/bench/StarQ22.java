@@ -56,7 +56,7 @@ public final class StarQ22 {
     int runs = Integer.parseInt(args[1]);
     // -Dstarq22.reuse=true keeps one device scan across runs (its regions stay allocated).
     boolean reuse = Boolean.getBoolean("starq22.reuse");
-    // -Dstarq22.star=true joins on the device (DeviceMergeOnReadScan.starAggregate): the dimensions
+    // -Dstarq22.star=true joins on the device (StarAggregation.run): the dimensions
     // become masks indexed by key, and one unfiltered scan of inventory serves every run.
     boolean star = Boolean.getBoolean("starq22.star");
     DeviceMergeOnReadScan kept = null;
@@ -124,15 +124,25 @@ public final class StarQ22 {
                   star ? Expressions.alwaysTrue() : filter);
       try {
         groups =
-            star
-                ? StarAggregation.run(
-                    scan,
+            star && Boolean.getBoolean("star.cpu")
+                // The same star on the CPU (CpuStarAggregation), every core: what the GPU adds.
+                ? org.apache.iceberg.tornadovm.join.CpuStarAggregation.run(
+                    org.apache.iceberg.tornadovm.CpuMergeOnReadScan.of(
+                        MorTables.load(warehouse + "/inventory"),
+                        Integer.getInteger(
+                            "star.threads", Runtime.getRuntime().availableProcessors())),
                     dimensions,
                     ImmutableList.of(DeviceDimension.Key.column("inv_item_sk")),
                     ImmutableList.of(DeviceValue.of("inv_quantity_on_hand")))
-                : scan.aggregate(
-                    ImmutableList.of("inv_item_sk"),
-                    ImmutableList.of(DeviceValue.of("inv_quantity_on_hand")));
+                : star
+                    ? StarAggregation.run(
+                        scan,
+                        dimensions,
+                        ImmutableList.of(DeviceDimension.Key.column("inv_item_sk")),
+                        ImmutableList.of(DeviceValue.of("inv_quantity_on_hand")))
+                    : scan.aggregate(
+                        ImmutableList.of("inv_item_sk"),
+                        ImmutableList.of(DeviceValue.of("inv_quantity_on_hand")));
         System.out.println("scan: " + scan.metrics());
       } catch (Exception e) {
         throw new IllegalStateException(e);
