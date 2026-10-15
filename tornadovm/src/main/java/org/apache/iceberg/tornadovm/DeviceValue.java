@@ -60,6 +60,19 @@ public final class DeviceValue implements java.io.Serializable {
     return with(new Factor(column, 0, 1, 0));
   }
 
+  /** {@code offset + scale * column} alone: an affine factor starting the value. */
+  public static DeviceValue ofAffine(String column, double offset, double scale) {
+    return new DeviceValue(ImmutableList.of(new Factor(column, offset, scale, 1)));
+  }
+
+  /**
+   * Times {@code offset + scale * column}: for a decimal of scale {@code s} in its unscaled values,
+   * {@code 1 - d} is {@code 10^s - d} (offset {@code 10^s}, scale -1), exact in integers.
+   */
+  public DeviceValue timesAffine(String column, double offset, double scale) {
+    return with(new Factor(column, offset, scale, 0));
+  }
+
   /** Times {@code 1 - column}. */
   public DeviceValue timesOneMinus(String column) {
     return with(new Factor(column, 1, -1, 0));

@@ -449,28 +449,54 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     // A product of such columns (an int or bigint cast to a decimal of scale 0 is its value), its
     // unscaled value the product of theirs: Spark multiplies decimals exactly too.
     case m: Multiply =>
-      def factors(e: Expression): Either[String, Seq[AttributeReference]] = e match {
+      // A factor: a column, or 1 plus or minus a decimal column (TPC-H's price * (1 - discount)),
+      // which in unscaled integers is 10^scale +- the column: offset and scale of the factor.
+      def isOne(e: Expression): Boolean = e.foldable && (e.eval() match {
+        case d: org.apache.spark.sql.types.Decimal => d.compare(org.apache.spark.sql.types.Decimal(1)) == 0
+        case i: java.lang.Integer => i == 1
+        case l: java.lang.Long => l == 1L
+        case _ => false
+      })
+      def affine(a: AttributeReference, sign: Double): Either[String, Seq[(AttributeReference, Double, Double)]] =
+        a.dataType match {
+          case d: DecimalType => Right(Seq((a, math.pow(10, d.scale), sign)))
+          case IntegerType | LongType => Right(Seq((a, 1.0, sign)))
+          case other => Left(s"factor 1 +- $other")
+        }
+      def factors(e: Expression): Either[String, Seq[(AttributeReference, Double, Double)]] = e match {
         case Multiply(l, r, _) => for (a <- factors(l); b <- factors(r)) yield a ++ b
         case Cast(a: AttributeReference, d: DecimalType, _, _)
             if d.scale == 0 && (a.dataType == IntegerType || a.dataType == LongType) =>
-          Right(Seq(a))
+          Right(Seq((a, 0.0, 1.0)))
         case Cast(a: AttributeReference, to: DecimalType, _, _) if (a.dataType match {
               case from: DecimalType => from.scale == to.scale && from.precision <= to.precision
               case _ => false
             }) =>
-          Right(Seq(a))
-        case a: AttributeReference if exactType(a.dataType) => Right(Seq(a))
+          Right(Seq((a, 0.0, 1.0)))
+        case a: AttributeReference if exactType(a.dataType) => Right(Seq((a, 0.0, 1.0)))
+        case Subtract(one, a: AttributeReference, _) if isOne(one) && exactType(a.dataType) => affine(a, -1)
+        case Add(one, a: AttributeReference, _) if isOne(one) && exactType(a.dataType) => affine(a, 1)
+        case Add(a: AttributeReference, one, _) if isOne(one) && exactType(a.dataType) => affine(a, 1)
         case other => Left(s"factor $other")
       }
       for {
         columns <- factors(m)
         _ <- if (columns.size <= DeviceValue.MAX_FACTORS) Right(()) else Left(s"factors of $m")
-        names <- traverse(columns)(a => field(table, a).map(_.name()))
-        _ <- traverse(columns)(a => valueMayBeNull(table, a, nulls))
+        names <- traverse(columns)(c => field(table, c._1).map(_.name()))
+        _ <- traverse(columns)(c => valueMayBeNull(table, c._1, nulls))
+        value = names.zip(columns).tail.foldLeft(
+          if (columns.head._2 == 0) DeviceValue.of(names.head)
+          else DeviceValue.ofAffine(names.head, columns.head._2, columns.head._3)) {
+          case (v, (n, (_, 0.0, _))) => v.times(n)
+          case (v, (n, (_, offset, scale))) => v.timesAffine(n, offset, scale)
+        }
         _ <-
-          if (GpuAggregates.exactProduct(table, names.asJava)) Right(())
+          if (columns.forall(_._2 == 0)) {
+            if (GpuAggregates.exactProduct(table, names.asJava)) Right(())
+            else Left(s"sum of $m may not be exact in doubles")
+          } else if (GpuAggregates.exactOverJoin(table, java.util.List.of(value), 1L)) Right(())
           else Left(s"sum of $m may not be exact in doubles")
-      } yield names.tail.foldLeft(DeviceValue.of(names.head))(_ times _)
+      } yield value
     case other => Left(s"aggregate of $other")
   }
 
