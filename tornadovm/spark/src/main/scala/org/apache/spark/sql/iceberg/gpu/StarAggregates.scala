@@ -725,6 +725,7 @@ object StarAggregates extends PredicateHelper {
   }
 
   private[gpu] def denseByStatistics(leaf: LogicalPlan, key: Attribute): Either[String, Unit] = {
+    if (org.apache.iceberg.tornadovm.Ablation.off("density")) return Right(())
     val column = leaf.collectFirst {
       case r: DataSourceV2ScanRelation if r.outputSet.contains(key) => r
     }

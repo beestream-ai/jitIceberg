@@ -423,7 +423,7 @@ public final class GpuAggregates {
 
   private static double computeLargest(Table table, String column) {
     Types.NestedField field = table.schema().findField(column);
-    if (field == null) {
+    if (field == null || org.apache.iceberg.tornadovm.Ablation.off("bounds")) {
       return Double.POSITIVE_INFINITY;
     }
     double largest = 0;
@@ -472,6 +472,9 @@ public final class GpuAggregates {
     }
     if (field.isRequired()) {
       return true;
+    }
+    if (org.apache.iceberg.tornadovm.Ablation.off("nullcounts")) {
+      return false;
     }
     try (CloseableIterable<FileScanTask> tasks = table.newScan().includeColumnStats().planFiles()) {
       for (FileScanTask task : tasks) {

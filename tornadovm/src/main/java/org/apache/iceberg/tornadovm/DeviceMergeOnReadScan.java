@@ -1039,7 +1039,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           break;
         }
       }
-      free[c] = field.isRequired() || none;
+      free[c] = field.isRequired() || (none && !Ablation.off("nullcounts"));
     }
     return free;
   }
@@ -1345,7 +1345,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 + task.residual()
                 + "|"
                 + host.columnLayout(task)
-                + (rewrite ? "|" + task.spec().specId() + "/" + task.file().partition() : "");
+                + (rewrite ? "|" + task.spec().specId() + "/" + task.file().partition() : "")
+                + (Ablation.off("batching") ? "|" + task.file().location() : "");
         if (!current.isEmpty() && (currentRows + rows > batchRows || !set.equals(currentSet))) {
           batches.add(current);
           current = Lists.newArrayList();
@@ -2923,6 +2924,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 outLongs());
       }
       settings[0] = codec();
+      // Rows a row group: libcudf's default unless set (-Diceberg.tornadovm.write-row-group-rows),
+      // e.g. one row group a file for a layout the GPU reads in fewer, larger pieces.
+      settings[1] = Long.getLong("iceberg.tornadovm.write-row-group-rows", 0L);
       settings[2] = stringStride;
       graph.libraryTask(
           "write",
