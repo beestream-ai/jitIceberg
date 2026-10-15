@@ -366,11 +366,21 @@ object StarAggregates extends PredicateHelper {
       sized <- traverse(leaves) { leaf =>
         leaf.collect { case r: DataSourceV2ScanRelation => r } match {
           case Seq(relation) =>
-            GpuAggregateStrategy.currentTable(relation).map(t => (leaf, relation, rowCount(t)))
-          case _ => Left(s"a join input that is not one Iceberg scan: ${leaf.nodeName}")
+            GpuAggregateStrategy.currentTable(relation).map(t => (leaf, Option(relation), rowCount(t)))
+          case _ =>
+            // A join input adaptive execution has already computed (a broadcast dimension, a
+            // subquery's result): Spark's own rows, which is what a dimension is built from. It can
+            // be a dimension, never the fact; its exact row count comes from the stage's statistics.
+            stageRows(leaf) match {
+              case Some(rows) => Right((leaf, Option.empty[DataSourceV2ScanRelation], rows))
+              case None => Left(s"a join input that is not one Iceberg scan: ${leaf.nodeName}")
+            }
         }
       }
-      (factLeaf, factRelation, _) = sized.maxBy(_._3)
+      scans = sized.filter(_._2.isDefined)
+      _ <- if (scans.nonEmpty) Right(()) else Left("no Iceberg scan to be the fact")
+      (factLeaf, factRelationOption, _) = scans.maxBy(_._3)
+      factRelation = factRelationOption.get
       dimensionLeaves = sized.filter(_._1 ne factLeaf).map(_._1)
       maxRows = sized.filter(_._1 ne factLeaf).map(_._3).foldLeft(0L)(math.max)
       _ <-
@@ -737,6 +747,19 @@ object StarAggregates extends PredicateHelper {
         }
       case None => Right(())
     }
+  }
+
+  /**
+   * The rows of a join input that is a query stage of adaptive execution (alone, or under the
+   * projections and filters above it), by the stage's runtime statistics; none if it has not run.
+   */
+  private[gpu] def stageRows(leaf: LogicalPlan): Option[Long] = leaf match {
+    case s: org.apache.spark.sql.execution.adaptive.LogicalQueryStage =>
+      s.computeStats().rowCount.map(_.toLong)
+    case Project(_, child) => stageRows(child)
+    case Filter(_, child) => stageRows(child)
+    case SubqueryAlias(_, child) => stageRows(child)
+    case _ => None
   }
 
   private[gpu] def rowCount(table: org.apache.iceberg.Table): Long =
