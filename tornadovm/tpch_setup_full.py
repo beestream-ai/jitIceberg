@@ -20,8 +20,9 @@
 # decimals), then maintained by ten refresh pairs in the style of TPC-H's RF1 and RF2. Refresh p
 # (0..9): RF2 deletes the orders with o_orderkey % 1000 = p and their line items (SF x 1500 orders,
 # as the specification's RF2), and RF1 inserts as many new orders with their line items: copies of the
-# orders with o_orderkey % 1000 = 500 + p, keyed o_orderkey + 8, which TPC-H's sparse key space leaves
-# unused (dbgen assigns 8 of every 32 keys), so keys stay as dense as dbgen's.
+# orders with o_orderkey % 1000 = 600 + p, keyed o_orderkey + 8 (so % 1000 = 608 + p), which TPC-H's
+# sparse key space leaves unused (dbgen assigns 8 of every 32 keys), so keys stay as dense as dbgen's.
+# The RF1 rows are written to Parquet once, before any refresh, so every refresh inserts exactly its own.
 #
 #   BENCH_SCRIPT=tpch_setup_full.py run.sh spark <warehouse>/<namespace> <parquet dir> pos
 #       the refreshes with Spark's merge-on-read DELETE (position deletes) and INSERT
@@ -48,12 +49,14 @@ REFRESHES = range(10)
 
 
 def inserts():
-    """The RF1 rows of every refresh: copies of orders % 1000 in 500..509, keyed + 8."""
-    orders = spark.table(T("orders")).where(F.col("o_orderkey") % 1000 >= 500) \
-        .where(F.col("o_orderkey") % 1000 < 510).withColumn("o_orderkey", F.col("o_orderkey") + 8)
-    lineitem = spark.table(T("lineitem")).where(F.col("l_orderkey") % 1000 >= 500) \
-        .where(F.col("l_orderkey") % 1000 < 510).withColumn("l_orderkey", F.col("l_orderkey") + 8)
-    return orders, lineitem
+    """The RF1 rows of every refresh (copies of orders % 1000 in 600..609, keyed + 8), written once to
+    <warehouse>/_rf1 and read back: deterministic whatever the refreshes do to the tables after."""
+    rf1 = os.path.join(warehouse, "_rf1")
+    spark.table(T("orders")).where((F.col("o_orderkey") % 1000 >= 600) & (F.col("o_orderkey") % 1000 < 610)) \
+        .withColumn("o_orderkey", F.col("o_orderkey") + 8).write.mode("overwrite").parquet(os.path.join(rf1, "orders"))
+    spark.table(T("lineitem")).where((F.col("l_orderkey") % 1000 >= 600) & (F.col("l_orderkey") % 1000 < 610)) \
+        .withColumn("l_orderkey", F.col("l_orderkey") + 8).write.mode("overwrite").parquet(os.path.join(rf1, "lineitem"))
+    return spark.read.parquet(os.path.join(rf1, "orders")), spark.read.parquet(os.path.join(rf1, "lineitem"))
 
 
 if mode in ("pos", "eq-load"):
@@ -63,14 +66,12 @@ if mode in ("pos", "eq-load"):
         spark.sql(f"DROP TABLE IF EXISTS {T(table)}")
         spark.sql(f"CREATE TABLE {T(table)} USING iceberg TBLPROPERTIES ({props}) AS SELECT * FROM src ORDER BY {order}")
     orders, lineitem = inserts()
-    # Materialize the RF1 rows before any refresh deletes their sources.
-    orders.cache().count(); lineitem.cache().count()
     if mode == "pos":
         for p in REFRESHES:
             spark.sql(f"DELETE FROM {T('lineitem')} WHERE l_orderkey % 1000 = {p}")
             spark.sql(f"DELETE FROM {T('orders')} WHERE o_orderkey % 1000 = {p}")
-            o = orders.where(F.col("o_orderkey") % 1000 == 508 + p)
-            l = lineitem.where(F.col("l_orderkey") % 1000 == 508 + p)
+            o = orders.where(F.col("o_orderkey") % 1000 == 608 + p)
+            l = lineitem.where(F.col("l_orderkey") % 1000 == 608 + p)
             o.writeTo(T("orders")).append()
             l.writeTo(T("lineitem")).append()
     else:
@@ -81,8 +82,6 @@ if mode in ("pos", "eq-load"):
         for name in ("orders", "lineitem"):
             with open(os.path.join(keys, f"{name}.txt"), "w") as f:
                 f.write("\n".join(str(k) for k in deleted))
-        orders.write.mode("overwrite").parquet(os.path.join(warehouse, "_rf1", "orders"))
-        lineitem.write.mode("overwrite").parquet(os.path.join(warehouse, "_rf1", "lineitem"))
         print(f"TPCH {namespace}: {len(deleted)} orders to delete by equality", flush=True)
 elif mode == "eq-append":
     spark.read.parquet(os.path.join(warehouse, "_rf1", "orders")).writeTo(T("orders")).append()
