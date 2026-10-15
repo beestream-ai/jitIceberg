@@ -43,7 +43,8 @@ final class ScanLog {
   /** The Spark configuration key naming the directory of the scan logs. */
   static final String DIR = "spark.iceberg.gpu.scanLog";
 
-  static final String HEADER = "table,engine,files,rows,columns,bytes,deleteFiles,batches,ms";
+  static final String HEADER =
+      "table,engine,files,rows,columns,bytes,deleteFiles,batches,ms,eqDeleteFiles,eqDeleteRecords";
 
   private static final Object LOCK = new Object();
 
@@ -64,11 +65,25 @@ final class ScanLog {
     long rows = 0;
     long bytes = 0;
     long deletes = 0;
+    // The equality-delete files the group applies (each once, however many of its files it covers)
+    // and their records: the size of the key set the CPU reader probes every row against.
+    java.util.Map<String, Long> equality = new java.util.HashMap<>();
     for (FileScanTask task : group.tasks()) {
       rows += task.file().recordCount();
       bytes += task.length();
       deletes += task.deletes().size();
+      for (org.apache.iceberg.DeleteFile delete : task.deletes()) {
+        if (delete.content() == org.apache.iceberg.FileContent.EQUALITY_DELETES) {
+          equality.put(delete.location(), delete.recordCount());
+        }
+      }
     }
+    String suffix =
+        String.format(
+            Locale.ROOT,
+            "%d,%d",
+            equality.size(),
+            equality.values().stream().mapToLong(Long::longValue).sum());
     String prefix =
         String.format(
             Locale.ROOT,
@@ -80,20 +95,22 @@ final class ScanLog {
             schema.columns().size(),
             bytes,
             deletes);
-    return new Timed(reader, Paths.get(dir), prefix);
+    return new Timed(reader, Paths.get(dir), prefix, suffix);
   }
 
   private static final class Timed implements PartitionReader<ColumnarBatch> {
     private final PartitionReader<ColumnarBatch> reader;
     private final Path dir;
     private final String prefix;
+    private final String suffix;
     private long nanos;
     private long batches;
 
-    Timed(PartitionReader<ColumnarBatch> reader, Path dir, String prefix) {
+    Timed(PartitionReader<ColumnarBatch> reader, Path dir, String prefix, String suffix) {
       this.reader = reader;
       this.dir = dir;
       this.prefix = prefix;
+      this.suffix = suffix;
     }
 
     @Override
@@ -121,7 +138,7 @@ final class ScanLog {
     @Override
     public void close() throws IOException {
       reader.close();
-      append(String.format(Locale.ROOT, "%s,%d,%.3f", prefix, batches, nanos / 1e6));
+      append(String.format(Locale.ROOT, "%s,%d,%.3f,%s", prefix, batches, nanos / 1e6, suffix));
     }
 
     private void append(String line) {
