@@ -122,7 +122,9 @@ case "$mode" in
         SPARK_GPU_CP="${SPARK_GPU_CP:-$(ls "$BUNDLE"/jars/*.jar 2>/dev/null | paste -sd: -)}"
         SPARK_GPU_ARGFILE="${SPARK_GPU_ARGFILE:-$BUNDLE/tornado-argfile}"
         : "${SPARK_GPU_CP:?run :iceberg-tornadovm-spark:sparkGpuBundle or set SPARK_GPU_CP}"
-        GPU_JVM="--enable-preview @$SPARK_GPU_ARGFILE --enable-native-access=ALL-UNNAMED -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}"
+        # TornadoVM serializes object arguments assuming compressed oops; with 16-byte object alignment
+        # the JVM keeps them up to a 64 GB heap, so the GPU JVM gets the same heap as plain Spark.
+        GPU_JVM="--enable-preview @$SPARK_GPU_ARGFILE --enable-native-access=ALL-UNNAMED -XX:ObjectAlignmentInBytes=16 -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}"
         MASTER="${SPARK_MASTER:-local[${THREADS:-$(nproc)}]}"
         EXECUTORS=()
         if [[ "$MASTER" != local\[* && "$MASTER" != local ]]; then
@@ -134,7 +136,7 @@ case "$mode" in
                        --conf spark.executor.memory="${GPU_EXECUTOR_MEMORY:-24g}")
         fi
         ENGINE=spark-gpu exec "$SPARK_HOME/bin/spark-submit" --master "$MASTER" "${EXECUTORS[@]}" \
-            --driver-memory "${GPU_HEAP:-24g}" --driver-class-path "$SPARK_GPU_CP" \
+            --driver-memory "${GPU_HEAP:-48g}" --driver-class-path "$SPARK_GPU_CP" \
             --conf spark.driver.extraJavaOptions="$GPU_JVM" \
             --conf spark.iceberg.gpu.enabled=true \
             --conf spark.sql.iceberg.partition-reader-factory-provider=tornadovm \
@@ -147,6 +149,7 @@ case "$mode" in
             --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
             --conf spark.sql.catalog.local.type=hadoop \
             --conf spark.sql.catalog.local.warehouse="$(dirname "$1")" \
+            --conf spark.driver.maxResultSize=0 \
             --conf spark.ui.enabled=false \
             "$HERE/${BENCH_SCRIPT:-spark_bench.py}" "$@"
         ;;

@@ -66,11 +66,13 @@ def rss_mb():
     return -1
 
 
-print("query,engine,median_ms,min_ms,rows,checksum,runs_ms,rss_mb", flush=True)
+print("query,engine,median_ms,min_ms,rows,checksum,runs_ms,rss_mb,first_ms", flush=True)
 for name in names:
     sql = open(f"{query_dir}/{name}.sql").read().strip().rstrip(";")
     try:
-        rows = spark.sql(sql).collect()  # warm-up
+        start = time.perf_counter()
+        rows = spark.sql(sql).collect()  # warm-up: the query's first run, timed apart
+        first = (time.perf_counter() - start) * 1000
         times = []
         for _ in range(runs):
             start = time.perf_counter()
@@ -78,7 +80,7 @@ for name in names:
             times.append((time.perf_counter() - start) * 1000)
         digest, count = checksum(rows)
         print(f"{name},{engine},{statistics.median(times):.1f},{min(times):.1f},{count},{digest},"
-              f"\"{' '.join(f'{t:.1f}' for t in times)}\",{rss_mb()}", flush=True)
+              f"\"{' '.join(f'{t:.1f}' for t in times)}\",{rss_mb()},{first:.1f}", flush=True)
     except Exception as e:  # one failing query costs that query
         java = getattr(e, "java_exception", None)
         reason = java.toString() if java is not None else str(e)
