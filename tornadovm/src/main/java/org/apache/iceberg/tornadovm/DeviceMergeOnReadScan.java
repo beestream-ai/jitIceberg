@@ -377,6 +377,16 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * reads many tables and projections, each a pool of its own; past {@link #MAX_POOLS} the idle
    * ones give their device memory back.
    */
+  /**
+   * Orders freeing execution plans against running them, JVM-wide: a batch runs under the read lock
+   * and a plan is closed under the write lock. An idle pool evicted to make room for another
+   * projection is closed on its own thread while other pools' batches run; TPC-DS with equality
+   * deletes crashed in a host-to-device copy (SIGSEGV at address -1) when the two overlapped.
+   * Closing is rare (eviction, rebuild, out-of-memory release), so batches almost never wait.
+   */
+  private static final java.util.concurrent.locks.ReentrantReadWriteLock DEVICE_PLANS =
+      new java.util.concurrent.locks.ReentrantReadWriteLock();
+
   private static final Map<SharedPool, Boolean> LIVE_POOLS =
       new java.util.LinkedHashMap<>(16, 0.75f, true);
 
@@ -421,7 +431,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   /** Regions that take batches from any caller's request, for one projection. */
   private final class SharedPool {
-    private final java.util.concurrent.LinkedBlockingQueue<Work> queue =
+    // The current regions' queue. Each generation of regions has its own: a stopped region's stop
+    // marker must reach that region, and a new batch must never reach a stopped region (one sharing
+    // a queue with its successors could take a new batch into its freed buffers).
+    private volatile java.util.concurrent.LinkedBlockingQueue<Work> queue =
         new java.util.concurrent.LinkedBlockingQueue<>();
     private final java.util.concurrent.locks.ReentrantReadWriteLock lock =
         new java.util.concurrent.locks.ReentrantReadWriteLock();
@@ -463,11 +476,19 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private long runOnce(
         Planned planned,
         java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch) {
-      ensureFits(planned);
+      // Another request may rebuild the regions between ensureFits and the read lock: check again
+      // under the lock, which keeps them until this request's batches are done.
+      while (true) {
+        ensureFits(planned);
+        lock.readLock().lock();
+        if (regions != null && regions.get(0).fits(planned)) {
+          break;
+        }
+        lock.readLock().unlock();
+      }
       synchronized (LIVE_POOLS) {
         LIVE_POOLS.put(this, Boolean.TRUE);
       }
-      lock.readLock().lock();
       try {
         ScanMetrics batchMetrics = new ScanMetrics();
         List<CompletableFuture<Long>> done = Lists.newArrayList();
@@ -479,16 +500,28 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           done.add(finished);
           queue.add(new Work(planned, i, prep, perBatch, batchMetrics, finished));
         }
+        // Every batch must be done, failed or not, before the read lock goes: a failed request that
+        // returned early would let a rebuild or an out-of-memory release free the regions while its
+        // other batches still run in them (a native crash in a host-to-device copy).
         long rows = 0;
+        RuntimeException failed = null;
         for (CompletableFuture<Long> finished : done) {
-          rows += finished.join();
+          try {
+            rows += finished.join();
+          } catch (java.util.concurrent.CompletionException e) {
+            if (failed == null) {
+              failed =
+                  e.getCause() instanceof RuntimeException runtime
+                      ? runtime
+                      : new IllegalStateException("Device scan failed", e.getCause());
+            }
+          }
+        }
+        if (failed != null) {
+          throw failed;
         }
         metrics = batchMetrics;
         return rows;
-      } catch (java.util.concurrent.CompletionException e) {
-        throw e.getCause() instanceof RuntimeException runtime
-            ? runtime
-            : new IllegalStateException("Device scan failed", e.getCause());
       } finally {
         lock.readLock().unlock();
       }
@@ -513,12 +546,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           stopRegions();
         }
         evictIdle(this, MAX_POOLS - 1);
+        java.util.concurrent.LinkedBlockingQueue<Work> generation =
+            new java.util.concurrent.LinkedBlockingQueue<>();
         List<Region> created = Lists.newArrayList();
         for (int r = 0; r < STREAMS; r++) {
           Region region = new MaterializeRegion(planned);
           created.add(region);
-          region.thread.execute(() -> loop(region));
+          region.thread.execute(() -> loop(region, generation));
         }
+        queue = generation;
         regions = created;
       } finally {
         lock.writeLock().unlock();
@@ -565,7 +601,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
     }
 
-    private void loop(Region region) {
+    private void loop(Region region, java.util.concurrent.LinkedBlockingQueue<Work> queue) {
       TornadoExecutionPlan executionPlan;
       RuntimeException broken = null;
       try {
@@ -1017,6 +1053,22 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       HostDeletes.FilePrep prep,
       java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch,
       ScanMetrics into) {
+    DEVICE_PLANS.readLock().lock();
+    try {
+      return executeBatchLocked(region, executionPlan, planned, i, prep, perBatch, into);
+    } finally {
+      DEVICE_PLANS.readLock().unlock();
+    }
+  }
+
+  private long executeBatchLocked(
+      Region region,
+      TornadoExecutionPlan executionPlan,
+      Planned planned,
+      int i,
+      HostDeletes.FilePrep prep,
+      java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch,
+      ScanMetrics into) {
     into.deleteLoad(prep.hostNanos() / 1e6);
     region.nullFree = nullFree(region.layout, planned.batches.get(i));
     region.stage(executionPlan, prep, planned.keyNullable);
@@ -1058,6 +1110,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     java.util.concurrent.atomic.AtomicInteger next =
         new java.util.concurrent.atomic.AtomicInteger();
     java.util.concurrent.atomic.AtomicLong liveRows = new java.util.concurrent.atomic.AtomicLong();
+    // A failed batch stops the other regions taking new ones; the run returns only once every
+    // region
+    // is done, so that a caller that frees the regions next (an out-of-memory retry) frees idle
+    // ones.
+    java.util.concurrent.atomic.AtomicBoolean stop =
+        new java.util.concurrent.atomic.AtomicBoolean();
     try {
       List<CompletableFuture<HostDeletes.FilePrep>> preps = Lists.newArrayList();
       for (List<FileScanTask> batch : planned.batches) {
@@ -1068,25 +1126,38 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         workers.add(
             region.thread.submit(
                 () -> {
-                  TornadoExecutionPlan executionPlan = region.plan();
-                  for (int i = next.getAndIncrement();
-                      i < preps.size();
-                      i = next.getAndIncrement()) {
-                    long rows =
-                        executeBatch(
-                            region,
-                            executionPlan,
-                            planned,
-                            i,
-                            preps.get(i).join(),
-                            perBatch,
-                            metrics);
-                    liveRows.addAndGet(rows);
+                  try {
+                    TornadoExecutionPlan executionPlan = region.plan();
+                    for (int i = next.getAndIncrement();
+                        i < preps.size() && !stop.get();
+                        i = next.getAndIncrement()) {
+                      long rows =
+                          executeBatch(
+                              region,
+                              executionPlan,
+                              planned,
+                              i,
+                              preps.get(i).join(),
+                              perBatch,
+                              metrics);
+                      liveRows.addAndGet(rows);
+                    }
+                  } catch (RuntimeException | Error failure) {
+                    stop.set(true);
+                    throw failure;
                   }
                 }));
       }
+      java.util.concurrent.ExecutionException first = null;
       for (java.util.concurrent.Future<?> worker : workers) {
-        worker.get();
+        try {
+          worker.get();
+        } catch (java.util.concurrent.ExecutionException e) {
+          first = first == null ? e : first;
+        }
+      }
+      if (first != null) {
+        throw first;
       }
     } catch (java.util.concurrent.ExecutionException e) {
       for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
@@ -2053,10 +2124,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .submit(
                 () -> {
                   if (plan != null) {
+                    DEVICE_PLANS.writeLock().lock();
                     try {
                       plan.close();
                     } catch (TornadoExecutionPlanException e) {
                       throw new IllegalStateException(e);
+                    } finally {
+                      DEVICE_PLANS.writeLock().unlock();
                     }
                     plan = null;
                   }

@@ -31,6 +31,7 @@ import java.util.Random;
 import java.util.TreeMap;
 import java.util.stream.LongStream;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
@@ -112,6 +113,99 @@ public class TestDeviceMergeOnRead {
 
     assertMatchesIceberg(table);
     assertThat(late).hasSize(1);
+  }
+
+  /**
+   * Concurrent readers of one table with more projections than the JVM keeps pools for: pools are
+   * evicted and rebuilt while others read. A stopped region must never take a newer request's batch
+   * into its freed buffers (it crashed the JVM in a native copy before each generation of regions
+   * got its own queue); every read must return the table's live rows.
+   */
+  @Test
+  public void testConcurrentReadersRebuildingPools() throws Exception {
+    Table table = MorTables.create(temp.resolve("pools").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 4000, 3000, 2000, 1000);
+    MorTables.deletePositions(
+        table,
+        files,
+        ImmutableList.of(
+            everyNth(4000, 7), randomPositions(3000, 0.2, 3), new long[0], everyNth(1000, 3)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(11L, 1_000_013L, 2_000_017L, 3_000_019L));
+    table.refresh();
+    long expectedRows = 0;
+    long expectedIds = 0;
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        expectedRows++;
+        expectedIds += (Long) record.getField("id");
+      }
+    }
+    List<FileScanTask> tasks;
+    try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+      tasks = Lists.newArrayList(planned);
+    }
+    // Requests of different sizes on the same projections: a pool's regions are rebuilt bigger,
+    // or freed, while other requests are between sizing them and reading.
+    List<List<FileScanTask>> subsets =
+        ImmutableList.of(tasks, tasks.subList(0, 1), tasks.subList(0, 2), tasks.subList(3, 4));
+    List<List<String>> projections =
+        ImmutableList.of(
+            ImmutableList.of("id"),
+            ImmutableList.of("id", "k", "v1"),
+            ImmutableList.of("id", "v1", "v2", "v3", "v4"));
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      long[][] expected = new long[subsets.size()][];
+      for (int s = 0; s < subsets.size(); s++) {
+        java.util.concurrent.atomic.LongAdder sum = new java.util.concurrent.atomic.LongAdder();
+        long live =
+            device.materialize(
+                subsets.get(s),
+                ImmutableList.of("id"),
+                batch -> {
+                  for (int r = 0; r < batch.rows(); r++) {
+                    sum.add(batch.getLong("id", r));
+                  }
+                });
+        expected[s] = new long[] {live, sum.sum()};
+      }
+      assertThat(expected[0]).containsExactly(expectedRows, expectedIds);
+      java.util.concurrent.ExecutorService readers =
+          java.util.concurrent.Executors.newFixedThreadPool(8);
+      List<java.util.concurrent.Future<?>> futures = Lists.newArrayList();
+      for (int t = 0; t < 8; t++) {
+        int thread = t;
+        futures.add(
+            readers.submit(
+                () -> {
+                  for (int i = 0; i < 24; i++) {
+                    int subset = (thread + i * 3) % subsets.size();
+                    List<String> columns = projections.get((thread * 5 + i) % projections.size());
+                    java.util.concurrent.atomic.LongAdder sum =
+                        new java.util.concurrent.atomic.LongAdder();
+                    long live =
+                        device.materialize(
+                            subsets.get(subset),
+                            columns,
+                            batch -> {
+                              for (int r = 0; r < batch.rows(); r++) {
+                                sum.add(batch.getLong("id", r));
+                              }
+                            });
+                    assertThat(live)
+                        .as("%s of subset %s", columns, subset)
+                        .isEqualTo(expected[subset][0]);
+                    assertThat(sum.sum())
+                        .as("ids of subset %s", subset)
+                        .isEqualTo(expected[subset][1]);
+                  }
+                  return null;
+                }));
+      }
+      for (java.util.concurrent.Future<?> future : futures) {
+        future.get();
+      }
+      readers.shutdown();
+    }
   }
 
   /** A value that is a sum of terms: v1 - v2 + v3 * v4, per group of k, under deletes. */
