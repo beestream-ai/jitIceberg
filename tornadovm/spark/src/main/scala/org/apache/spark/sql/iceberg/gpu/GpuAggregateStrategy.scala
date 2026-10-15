@@ -494,7 +494,7 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
           if (columns.forall(_._2 == 0)) {
             if (GpuAggregates.exactProduct(table, names.asJava)) Right(())
             else Left(s"sum of $m may not be exact in doubles")
-          } else if (GpuAggregates.exactOverJoin(table, java.util.List.of(value), 1L)) Right(())
+          } else if (GpuAggregates.exactOverJoin(table, java.util.Collections.singletonList(value), 1L)) Right(())
           else Left(s"sum of $m may not be exact in doubles")
       } yield value
     case other => Left(s"aggregate of $other")
