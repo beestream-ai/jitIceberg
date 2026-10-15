@@ -60,6 +60,16 @@ final class GpuScans {
 
   private GpuScans() {}
 
+  /**
+   * The device scan that rewrites a table's file groups: one a table location and schema, kept like
+   * the readers' (a new schema writes new columns).
+   */
+  static DeviceMergeOnReadScan rewriteScan(Table table) {
+    return SCANS.computeIfAbsent(
+        "rewrite:" + table.location() + "@" + table.schema().schemaId(),
+        ignored -> DeviceMergeOnReadScan.of(table));
+  }
+
   static DeviceMergeOnReadScan scan(Table table) {
     return SCANS.computeIfAbsent(table.location(), ignored -> DeviceMergeOnReadScan.of(table));
   }
