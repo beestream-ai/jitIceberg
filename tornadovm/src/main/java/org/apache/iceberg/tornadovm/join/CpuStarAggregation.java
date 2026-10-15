@@ -320,7 +320,19 @@ public final class CpuStarAggregation {
           }
         }
         if (!isNull) {
-          row[v] = weight * (value + term);
+          double whole = value + term;
+          int part = plan.values.get(v).part();
+          if (part != DeviceValue.WHOLE) {
+            // As the device: high * 2^40 + middle * 2^20 + low.
+            double high = Math.floor(whole / 0x1p40);
+            double rest = whole - high * 0x1p40;
+            double middle = Math.floor(rest / 0x1p20);
+            whole =
+                part == DeviceValue.HIGH
+                    ? high
+                    : part == DeviceValue.MIDDLE ? middle : rest - middle * 0x1p20;
+          }
+          row[v] = weight * whole;
           row[plan.values.size() + plan.probeSums.size() + 1 + v] = weight;
         }
       }

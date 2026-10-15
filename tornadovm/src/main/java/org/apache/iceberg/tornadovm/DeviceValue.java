@@ -44,11 +44,39 @@ public final class DeviceValue implements java.io.Serializable {
 
   private final List<Factor> factors;
 
+  /**
+   * Which part of each row's value the device emits: {@link #WHOLE}, or one of three parts of an
+   * integer value (exact in a double, below 2^53): {@code v = high * 2^40 + middle * 2^20 + low},
+   * high signed, middle and low in [0, 2^20). Each part's sum stays exact in doubles for up to 2^33
+   * rows, where the whole value's sum would not past 2^53; the host recombines the three sums
+   * exactly. A sum the planner splits is three values over the same factors.
+   */
+  private final int part;
+
+  public static final int WHOLE = 0;
+  public static final int HIGH = 1;
+  public static final int MIDDLE = 2;
+  public static final int LOW = 3;
+
   private DeviceValue(List<Factor> factors) {
+    this(factors, WHOLE);
+  }
+
+  private DeviceValue(List<Factor> factors, int part) {
     if (factors.size() > MAX_FACTORS) {
       throw new IllegalArgumentException("At most " + MAX_FACTORS + " factors: " + factors);
     }
     this.factors = factors;
+    this.part = part;
+  }
+
+  /** This value's part ({@link #HIGH}, {@link #MIDDLE} or {@link #LOW}) instead of the whole. */
+  public DeviceValue part(int which) {
+    return new DeviceValue(factors, which);
+  }
+
+  public int part() {
+    return part;
   }
 
   /** The column itself. */
@@ -136,6 +164,15 @@ public final class DeviceValue implements java.io.Serializable {
    * over terms of the product of each factor's {@code |offset| + |scale| * largest}.
    */
   public double bound(java.util.function.ToDoubleFunction<String> largest) {
+    if (part != WHOLE) {
+      // A part of an integer below 2^53: high below 2^13 in magnitude, middle and low below 2^20.
+      return part == HIGH ? 0x1p13 : 0x1p20;
+    }
+    return rowBound(largest);
+  }
+
+  /** The largest magnitude one row's whole value can have (a part's row value included). */
+  public double rowBound(java.util.function.ToDoubleFunction<String> largest) {
     double bound = 0;
     double term = 0;
     for (Factor f : factors) {
@@ -171,6 +208,6 @@ public final class DeviceValue implements java.io.Serializable {
                   + factor.column()
                   + ")");
     }
-    return text.toString();
+    return part == WHOLE ? text.toString() : "part" + part + "(" + text + ")";
   }
 }

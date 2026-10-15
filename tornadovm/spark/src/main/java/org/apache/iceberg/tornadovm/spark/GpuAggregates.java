@@ -301,17 +301,37 @@ public final class GpuAggregates {
     return exactProduct(table, List.of(column));
   }
 
+  // While set (on the planning thread), the checks below admit a sum that is exact only when split:
+  // every row's value below 2^53 and fewer than 2^33 rows, so that each of the value's three parts
+  // (DeviceValue.part) sums exactly in doubles and the host recombines them.
+  private static final ThreadLocal<Boolean> SPLITTING = ThreadLocal.withInitial(() -> false);
+
+  /** {@code body} with the checks admitting sums that are exact once split into parts. */
+  public static <T> T splitting(java.util.function.Supplier<T> body) {
+    SPLITTING.set(true);
+    try {
+      return body.get();
+    } finally {
+      SPLITTING.set(false);
+    }
+  }
+
+  // The check of a sum over `rows` rows of values up to `rowBound` in magnitude.
+  private static boolean exactOver(double rows, double rowBound) {
+    return SPLITTING.get() ? rowBound < 0x1p53 && rows < 0x1p33 : rows * rowBound < 0x1p53;
+  }
+
   /**
    * Whether the device's doubles hold the sum of the product of these int, bigint or decimal
    * columns (decimals as unscaled values) exactly, by the files' bounds: rows times the product of
    * the columns' largest magnitudes below 2^53.
    */
   public static boolean exactProduct(Table table, List<String> columns) {
-    double bound = rows(table);
+    double bound = 1;
     for (String column : columns) {
       bound *= largest(table, column);
     }
-    return bound < 0x1p53;
+    return exactOver(rows(table), bound);
   }
 
   /**
@@ -374,7 +394,7 @@ public final class GpuAggregates {
       }
       bound += product;
     }
-    return rows(table) * bound < 0x1p53;
+    return exactOver(rows(table), bound);
   }
 
   /**
@@ -394,7 +414,16 @@ public final class GpuAggregates {
                 || type == org.apache.iceberg.types.Type.TypeID.LONG
                 || type == org.apache.iceberg.types.Type.TypeID.DECIMAL;
       }
-      if (integral && rows(table) * multiplicity * value.bound(c -> largest(table, c)) >= 0x1p53) {
+      if (!integral) {
+        continue;
+      }
+      // A part's own bound already holds it below 2^20 a row; its whole value must still be exact.
+      if (value.part() != org.apache.iceberg.tornadovm.DeviceValue.WHOLE) {
+        if (value.rowBound(c -> largest(table, c)) >= 0x1p53
+            || rows(table) * multiplicity * value.bound(c -> largest(table, c)) >= 0x1p53) {
+          return false;
+        }
+      } else if (!exactOver(rows(table) * multiplicity, value.bound(c -> largest(table, c)))) {
         return false;
       }
     }

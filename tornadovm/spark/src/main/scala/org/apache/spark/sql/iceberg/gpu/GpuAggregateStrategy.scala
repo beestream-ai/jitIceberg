@@ -81,6 +81,14 @@ case class LinearSum(terms: Seq[(Long, Int)], nullsFrom: Option[Int]) extends De
 /** COUNT of a probe's build-side column: the sum of its 0/1 non-null indicator (value {@code value}). */
 case class CountSum(value: Int) extends DeviceAggregate
 
+/**
+ * SUM (or, with {@code all}, SUM of COALESCE(v, 0)) and AVG of an integral value whose sum would
+ * pass 2^53: the device sums its three parts (values {@code parts}: high, middle, low, see
+ * DeviceValue.part), each exact in doubles, and the host recombines them exactly.
+ */
+case class SplitSum(parts: Seq[Int], all: Boolean) extends DeviceAggregate
+case class SplitAverage(parts: Seq[Int]) extends DeviceAggregate
+
 object DeviceAggregate {
 
   /** The aggregate with each value index mapped by {@code f}. */
@@ -95,6 +103,8 @@ object DeviceAggregate {
     case ScaledAverage(v, m) => ScaledAverage(f(v), m)
     case LinearSum(terms, nulls) => LinearSum(terms.map(t => (t._1, f(t._2))), nulls.map(f))
     case CountSum(v) => CountSum(f(v))
+    case SplitSum(parts, all) => SplitSum(parts.map(f), all)
+    case SplitAverage(parts) => SplitAverage(parts.map(f))
   }
 }
 
@@ -356,6 +366,21 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
     }
     def valueIndex(child: Expression): Either[String, Int] =
       deviceValue(table, child, nulls).map(add)
+    // An integral sum exact in doubles as it is, or else -- every row's value below 2^53, the sum
+    // past it -- exact once split into three parts (TPC-H q1's revenue over 60M rows).
+    def exactOrSplit(child: Expression, n: Boolean)(
+        whole: Int => DeviceAggregate,
+        split: Seq[Int] => DeviceAggregate): Either[String, DeviceAggregate] =
+      exactColumn(table, child, n) match {
+        case Right(v) => Right(whole(add(v)))
+        case Left(reason) if reason.contains("may not be exact") =>
+          GpuAggregates.splitting(() => exactColumn(table, child, n)) match {
+            case Right(v) if v.part() == DeviceValue.WHOLE =>
+              Right(split(Seq(DeviceValue.HIGH, DeviceValue.MIDDLE, DeviceValue.LOW).map(p => add(v.part(p)))))
+            case _ => Left(reason)
+          }
+        case left => left.map(_ => RowCount)
+      }
     ae.aggregateFunction match {
       case Count(Seq(a: AttributeReference))
           if a.nullable && nulls && nullFree(table, a).isLeft =>
@@ -395,9 +420,9 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
       case a: Average if a.child.dataType == DoubleType => valueIndex(a.child).map(AverageOf)
       case Sum(Coalesce(Seq(v, zero: Literal)), _)
           if zero.value != null && zero.value.toString.toDouble == 0.0 =>
-        exactColumn(table, v, nulls = true).map(add).map(SumAll)
-      case s: Sum => exactColumn(table, s.child, nulls).map(add).map(SumOf)
-      case a: Average => exactColumn(table, a.child, nulls).map(add).map(AverageOf)
+        exactOrSplit(v, true)(SumAll, SplitSum(_, all = true))
+      case s: Sum => exactOrSplit(s.child, nulls)(SumOf, SplitSum(_, all = false))
+      case a: Average => exactOrSplit(a.child, nulls)(AverageOf, SplitAverage)
       case other => Left(s"aggregate not supported: $other")
     }
   }

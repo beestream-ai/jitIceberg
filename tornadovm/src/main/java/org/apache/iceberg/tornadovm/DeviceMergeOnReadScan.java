@@ -2534,6 +2534,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             v >= sums.size() || factors.stream().anyMatch(f -> column(f.column()).isOptional());
         countColumn[v] = canBeNull ? nullable++ : -1;
         valueSpec.set(base + DeviceKernels.VALUE_SPEC_INTS - 1, countColumn[v]);
+        valueSpec.set(
+            base + DeviceKernels.VALUE_SPEC_INTS - 2, v < sums.size() ? sums.get(v).part() : 0);
         for (int f = 0; f < factors.size(); f++) {
           DeviceValue.Factor factor = factors.get(f);
           Types.NestedField field = column(factor.column());

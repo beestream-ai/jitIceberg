@@ -121,7 +121,7 @@ class DeviceResults(
   private val finishes: Vector[Finish] = ordered.map { ae =>
     aggregates(ae) match {
       case SumOf(_) | AverageOf(_) | SumAll(_) | Moment(_, _) | ScaledSum(_, _) | ScaledAverage(_, _) |
-          LinearSum(_, _) =>
+          LinearSum(_, _) | SplitSum(_, _) | SplitAverage(_) =>
         val buffer = ae.aggregateFunction.asInstanceOf[DeclarativeAggregate]
         val attributes = buffer.aggBufferAttributes
         val scale = ae.aggregateFunction.children.head.dataType match {
@@ -168,6 +168,11 @@ class DeviceResults(
         case ScaledSum(v, m) => finish(finishes(a), totals(v), nonNull(v), m)
         case ScaledAverage(v, m) => finish(finishes(a), totals(v), nonNull(v), m)
         case CountSum(v) => if (totals == null) 0L else Math.round(totals(v))
+        case SplitSum(parts, false) if nonNull(parts.head) == 0 => null
+        case SplitSum(_, true) if rows == 0 => null
+        case SplitAverage(parts) if nonNull(parts.head) == 0 => null
+        case SplitSum(parts, all) => finishExact(finishes(a), combine(totals, parts), if (all) rows else nonNull(parts.head))
+        case SplitAverage(parts) => finishExact(finishes(a), combine(totals, parts), nonNull(parts.head))
       }
       a += 1
     }
@@ -194,6 +199,28 @@ class DeviceResults(
       case "n" => n.toDouble
       case "avg" => avg
       case "m2" => m2
+      case other => throw new IllegalStateException(s"buffer attribute $other")
+    }
+    f.evaluate.eval(new GenericInternalRow(buffer.toArray[Any]))
+  }
+
+  /** A split value's exact sum: high * 2^40 + middle * 2^20 + low, each part's sum exact. */
+  private def combine(totals: Array[Double], parts: Seq[Int]): java.math.BigInteger = {
+    def exact(v: Int) = java.math.BigInteger.valueOf(Math.round(totals(v)))
+    exact(parts(0)).shiftLeft(40).add(exact(parts(1)).shiftLeft(20)).add(exact(parts(2)))
+  }
+
+  /** As {@link #finish}, from an exact integer sum (a decimal's unscaled value, or an integer). */
+  private def finishExact(f: Finish, sum: java.math.BigInteger, rows: Long): Any = {
+    val sumValue: Any = f.sumType match {
+      case LongType => sum.longValueExact()
+      case d: DecimalType => Decimal(new java.math.BigDecimal(sum, f.scale), d.precision, d.scale)
+      case other => throw new IllegalStateException(s"split sum buffer of $other")
+    }
+    val buffer = f.fields.map {
+      case "sum" => sumValue
+      case "count" => rows
+      case "isEmpty" => false
       case other => throw new IllegalStateException(s"buffer attribute $other")
     }
     f.evaluate.eval(new GenericInternalRow(buffer.toArray[Any]))

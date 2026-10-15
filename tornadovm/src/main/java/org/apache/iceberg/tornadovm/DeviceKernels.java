@@ -19,6 +19,7 @@
 package org.apache.iceberg.tornadovm;
 
 import uk.ac.manchester.tornado.api.KernelContext;
+import uk.ac.manchester.tornado.api.math.TornadoMath;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -626,7 +627,10 @@ final class DeviceKernels {
    * Ints of {@code spec} a value: its factor count, then kind, slot and validity slot a factor,
    * then the index of its non-null count column ({@code -1} for a value that cannot be null).
    */
-  static final int VALUE_SPEC_INTS = 2 + 3 * DeviceValue.MAX_FACTORS;
+  /**
+   * Per value: factor count, 3 ints a factor, the part (DeviceValue.WHOLE..LOW), the count column.
+   */
+  static final int VALUE_SPEC_INTS = 3 + 3 * DeviceValue.MAX_FACTORS;
 
   /**
    * Each {@link DeviceValue} of every live row, a column at {@code stride}, then a column of 1 a
@@ -681,6 +685,20 @@ final class DeviceKernels {
           product = product * (constants.get(c) + constants.get(c + 1) * x);
         }
         total += product;
+        // A part of the (integer) value: high * 2^40 + middle * 2^20 + low, exact in doubles.
+        int part = spec.get(base + VALUE_SPEC_INTS - 2);
+        if (part != 0) {
+          double high = TornadoMath.floor(total / 1099511627776.0);
+          double rest = total - high * 1099511627776.0;
+          double middle = TornadoMath.floor(rest / 1048576.0);
+          if (part == 1) {
+            total = high;
+          } else if (part == 2) {
+            total = middle;
+          } else {
+            total = rest - middle * 1048576.0;
+          }
+        }
         out.set((long) v * stride + i, alive == 1 && isNull == 0 ? total : 0.0);
         int countColumn = spec.get(base + VALUE_SPEC_INTS - 1);
         if (countColumn >= 0) {

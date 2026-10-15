@@ -755,7 +755,11 @@ object StarAggregates extends PredicateHelper {
    */
   private[gpu] def stageRows(leaf: LogicalPlan): Option[Long] = leaf match {
     case s: org.apache.spark.sql.execution.adaptive.LogicalQueryStage =>
-      s.computeStats().rowCount.map(_.toLong)
+      // A broadcast stage that has not run yet is small by Spark's own decision to broadcast it.
+      s.computeStats().rowCount.map(_.toLong).orElse(s.physicalPlan match {
+        case _: org.apache.spark.sql.execution.adaptive.BroadcastQueryStageExec => Some(0L)
+        case _ => None
+      })
     case Project(_, child) => stageRows(child)
     case Filter(_, child) => stageRows(child)
     case SubqueryAlias(_, child) => stageRows(child)
