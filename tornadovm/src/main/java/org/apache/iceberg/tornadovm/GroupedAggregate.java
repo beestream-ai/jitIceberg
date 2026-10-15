@@ -31,7 +31,7 @@ public final class GroupedAggregate {
   private final int values;
   private final Map<List<Object>, double[]> groups = Maps.newHashMap();
 
-  GroupedAggregate(int values) {
+  public GroupedAggregate(int values) {
     this.values = values;
   }
 

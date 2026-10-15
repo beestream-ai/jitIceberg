@@ -377,6 +377,35 @@ public final class GpuAggregates {
     return rows(table) * bound < 0x1p53;
   }
 
+  /**
+   * Whether the device's sums of these values stay exact when a join counts each fact row up to
+   * {@code multiplicity} times (a probe whose keys repeat in the build side): rows times the
+   * multiplicity times each value's largest magnitude below 2^53. Values over a floating-point
+   * column are not exact on Spark either and are not checked.
+   */
+  public static boolean exactOverJoin(Table table, List<DeviceValue> values, long multiplicity) {
+    for (DeviceValue value : values) {
+      boolean integral = true;
+      for (String column : value.columns()) {
+        Types.NestedField field = table.schema().findField(column);
+        org.apache.iceberg.types.Type.TypeID type = field == null ? null : field.type().typeId();
+        integral &=
+            type == org.apache.iceberg.types.Type.TypeID.INTEGER
+                || type == org.apache.iceberg.types.Type.TypeID.LONG
+                || type == org.apache.iceberg.types.Type.TypeID.DECIMAL;
+      }
+      if (integral && rows(table) * multiplicity * value.bound(c -> largest(table, c)) >= 0x1p53) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** The table's row count in its current snapshot (infinite when unknown). */
+  public static double rowCount(Table table) {
+    return rows(table);
+  }
+
   private static double rows(Table table) {
     Snapshot snapshot = table.currentSnapshot();
     return snapshot == null

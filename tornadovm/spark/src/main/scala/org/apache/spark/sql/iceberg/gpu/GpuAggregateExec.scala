@@ -273,6 +273,9 @@ case class GpuAggregateExec(
           logDebug("GPU aggregate failure", e)
           if (Option(e.getCause).isDefined) {
             logWarning(s"  caused by: ${Iterator.iterate(e.getCause)(_.getCause).takeWhile(_ != null).map(c => s"${c.getClass.getSimpleName}: ${c.getMessage}").mkString(" <- ")}")
+            // Where the deepest cause was thrown: a device failure is a bug to find, not just a fallback.
+            val root = Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null).toSeq.last
+            logWarning(s"  at: ${root.getStackTrace.take(15).mkString(" < ")}")
           }
           spec match {
             case _: GpuStarAggregateSpec => StarAggregates.remember(logical)

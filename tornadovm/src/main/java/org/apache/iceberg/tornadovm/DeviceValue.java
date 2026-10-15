@@ -35,7 +35,11 @@ public final class DeviceValue implements java.io.Serializable {
    * {@code offset + scale * column}; a non-zero {@code coefficient} starts a new term of the sum,
    * which it multiplies.
    */
-  record Factor(String column, double offset, double scale, double coefficient)
+  /**
+   * One factor of a value: {@code offset + scale * column}, starting a new term (multiplied by
+   * {@code coefficient}) when the coefficient is not zero, multiplying the current term otherwise.
+   */
+  public record Factor(String column, double offset, double scale, double coefficient)
       implements java.io.Serializable {}
 
   private final List<Factor> factors;
@@ -99,8 +103,39 @@ public final class DeviceValue implements java.io.Serializable {
     return new DeviceValue(terms.build());
   }
 
-  List<Factor> factors() {
+  public List<Factor> factors() {
     return factors;
+  }
+
+  /** The columns the value reads. */
+  public List<String> columns() {
+    List<String> columns = new java.util.ArrayList<>();
+    for (Factor f : factors) {
+      if (!columns.contains(f.column())) {
+        columns.add(f.column());
+      }
+    }
+    return columns;
+  }
+
+  /**
+   * The largest magnitude one row's value can have, given each column's largest magnitude: the sum
+   * over terms of the product of each factor's {@code |offset| + |scale| * largest}.
+   */
+  public double bound(java.util.function.ToDoubleFunction<String> largest) {
+    double bound = 0;
+    double term = 0;
+    for (Factor f : factors) {
+      double factor =
+          Math.abs(f.offset()) + Math.abs(f.scale()) * largest.applyAsDouble(f.column());
+      if (f.coefficient() != 0) {
+        bound += term;
+        term = Math.abs(f.coefficient()) * factor;
+      } else {
+        term *= factor;
+      }
+    }
+    return bound + term;
   }
 
   private DeviceValue with(Factor factor) {

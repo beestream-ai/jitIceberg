@@ -119,8 +119,8 @@ case class GpuStarAggregateSpec(
     val built = {
       import scala.concurrent.{Await, Future}
       import scala.concurrent.ExecutionContext.Implicits.global
-      val jobs = dimensions.map(d => Future(StarAggregates.build(session, d)))
       val execution = GpuAggregateExec.execution
+      val jobs = dimensions.map(d => Future(StarAggregates.build(session, d, execution)))
       val buildRows = probe.map(p => Future(ProbeAggregates.collect(session, p, execution)))
       val dims = jobs.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
       buildSide = buildRows.map(Await.result(_, scala.concurrent.duration.Duration.Inf))
@@ -130,6 +130,7 @@ case class GpuStarAggregateSpec(
       case Some(p) => ProbeAggregates.prepare(p, buildSide.get, dimensions, built)
       case None => (built.map(_._1), null)
     }
+    probe.foreach(_ => requireExact(deviceProbe.maxMultiplicity()))
     val dimensionsBuilt = System.nanoTime()
     // Without fact keys the finest groups are at most the product of the dimensions' tuples. Past
     // a few million the device's per-batch groups and the driver's merge cost more than Spark's own
@@ -217,6 +218,26 @@ case class GpuStarAggregateSpec(
     result
   }
 
+  /**
+   * The device sums stay exact over the probe's join: a fact row is counted once per build row its
+   * key matches, so the planner's bounds (rows times each value's largest magnitude) grow by the
+   * join's multiplicity, and a build-side value is added once per fact row that joins it, at most
+   * rows times multiplicity times its largest magnitude. Past 2^53 the run fails, and Spark runs
+   * the aggregate.
+   */
+  private def requireExact(multiplicity: Long): Unit = {
+    if (!GpuAggregates.exactOverJoin(table, values.asJava, multiplicity)) {
+      throw new UnsupportedOperationException(s"sums over a join of multiplicity $multiplicity may not be exact")
+    }
+    val joined = GpuAggregates.rowCount(table) * multiplicity
+    val rows = buildSide.get
+    rows.largest.indices.foreach { k =>
+      if (rows.integral(k) && joined * rows.largest(k) >= math.pow(2, 53)) {
+        throw new UnsupportedOperationException(s"build column $k may not sum exactly over the join")
+      }
+    }
+  }
+
   /** The device's values: the fact's, then the probe's sums. */
   private def deviceValues: Int = values.size + probe.map(_.sums.size).getOrElse(0)
 
@@ -281,6 +302,9 @@ object StarAggregates extends PredicateHelper {
   val MaxDimensionRows = "spark.iceberg.gpu.aggregate.star.maxDimensionRows"
 
   val MaxGroups = "spark.iceberg.gpu.aggregate.star.maxGroups"
+
+  /** Whether built dimensions are kept across queries and runs (default true; false for ablations). */
+  val CacheDimensions = "spark.iceberg.gpu.aggregate.star.cacheDimensions"
 
   /** Most finest groups the dimensions' tuples may make before the star runs on Spark. */
   private[gpu] def maxGroups: Double = {
@@ -884,16 +908,77 @@ object StarAggregates extends PredicateHelper {
           plan.output.map(_.name).mkString(",") + "|" + plan.canonicalized.toString)
   }
 
-  private[gpu] def build(session: SparkSession, d: StarDimension): Built =
-    dimensionKey(d) match {
-      case Some(key) =>
-        Option(built.get(key)).getOrElse {
+  /**
+   * A dimension the cache may keep across queries: a filtered projection of one table, which changes
+   * only with the table's snapshot (the same filtered date or item dimension recurs across queries).
+   * A dimension computed by the query -- a semi join's subquery, a join, an aggregate -- is work
+   * Spark would do again in every run, and is not kept past the query run that built it.
+   */
+  private def plainScan(plan: LogicalPlan): Boolean = plan match {
+    case Project(_, child) => plainScan(child)
+    case Filter(_, child) => plainScan(child)
+    case SubqueryAlias(_, child) => plainScan(child)
+    case _: DataSourceV2ScanRelation => true
+    case _ => false
+  }
+
+  // Dimensions built within one query run (one SQL execution), shared by its aggregates; a
+  // dimension the run is still building is waited for, not built twice.
+  private val building = java.util.Collections.synchronizedMap(
+    new java.util.LinkedHashMap[String, java.util.concurrent.CompletableFuture[Built]](64, 0.75f, true) {
+      override def removeEldestEntry(
+          eldest: java.util.Map.Entry[String, java.util.concurrent.CompletableFuture[Built]]): Boolean =
+        size() > 64
+    })
+
+  /**
+   * A dimension's identity within one query run: its plan's canonical form, query stages of adaptive
+   * execution included (within one run a stage's rows cannot change, so no snapshot is needed; q14's
+   * union branches share a semi join's subquery this way instead of each running it).
+   */
+  private def executionKey(d: StarDimension): String =
+    d.factColumn + "|" + (d.key +: d.attributes).map(_.name).mkString(",") + "|" +
+      d.probeAttributes.map(_.name).mkString(",") + "|" + relations(d.plan) + "|" +
+      Project((d.key +: d.attributes) ++ d.probeAttributes, d.plan).canonicalized.toString
+
+  /**
+   * The tables and columns a plan scans: a canonical plan names every attribute "none", so two
+   * plans over different tables or columns must also differ here.
+   */
+  private[gpu] def relations(plan: LogicalPlan): String =
+    plan.collect { case r: DataSourceV2ScanRelation => r.relation.table.name() + r.output.map(_.name).mkString("(", ",", ")") }
+      .mkString(";")
+
+  private[gpu] def build(session: SparkSession, d: StarDimension, execution: Option[String]): Built = {
+    val key = dimensionKey(d)
+    key.orElse(Some(executionKey(d))) match {
+      case Some(k) if key.isDefined && plainScan(d.plan) && GpuAggregateStrategy.flag(CacheDimensions, "true") =>
+        Option(built.get(k)).getOrElse {
           val made = buildNow(session, d)
-          built.put(key, made)
+          built.put(k, made)
           made
         }
-      case None => buildNow(session, d)
+      case Some(k) if execution.isDefined =>
+        val mine = new java.util.concurrent.CompletableFuture[Built]()
+        val running = building.putIfAbsent(s"${execution.get}|$k", mine)
+        if (running != null) {
+          try running.join()
+          catch { case e: java.util.concurrent.CompletionException => throw e.getCause }
+        } else {
+          try {
+            val made = buildNow(session, d)
+            mine.complete(made)
+            made
+          } catch {
+            case e: Throwable =>
+              building.remove(s"${execution.get}|$k", mine)
+              mine.completeExceptionally(e)
+              throw e
+          }
+        }
+      case _ => buildNow(session, d)
     }
+  }
 
   private def buildNow(session: SparkSession, d: StarDimension): Built = {
     val rows = Dataset

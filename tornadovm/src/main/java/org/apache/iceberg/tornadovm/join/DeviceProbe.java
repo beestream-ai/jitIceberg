@@ -145,6 +145,20 @@ public final class DeviceProbe {
     return order;
   }
 
+  /**
+   * The most build rows one key has: how many times a fact row, or each of its values, can be
+   * counted by the join.
+   */
+  public long maxMultiplicity() {
+    long most = keys.length == 0 ? 0 : 1;
+    long run = 1;
+    for (int i = 1; i < keys.length; i++) {
+      run = keys[i] == keys[i - 1] ? run + 1 : 1;
+      most = Math.max(most, run);
+    }
+    return most;
+  }
+
   /** Adds {@code column * multiplier} of the fact row to its key. */
   public DeviceProbe keyColumn(String factColumn, long multiplier) {
     return keyColumn(factColumn, multiplier, 0, Integer.MAX_VALUE);

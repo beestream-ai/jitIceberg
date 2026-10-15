@@ -423,7 +423,17 @@ object ProbeAggregates extends PredicateHelper {
   }
 
   /** The build side's rows: each key part's value, then the compared value. */
-  case class BuildRows(parts: Array[Array[Long]], compared: Array[Long], sums: Array[Array[Double]])
+  /**
+   * A collected build side: each key part's values, the compared values, and the summed columns
+   * (NaN for null) with each one's largest magnitude and whether it is integral (an integer, or a
+   * decimal as its unscaled value), so that the run can bound the sums over the join.
+   */
+  case class BuildRows(
+      parts: Array[Array[Long]],
+      compared: Array[Long],
+      sums: Array[Array[Double]],
+      largest: Array[Double],
+      integral: Array[Boolean])
 
   /**
    * Collected build sides by the query run, their plan and tables' snapshots: a query that
@@ -438,8 +448,11 @@ object ProbeAggregates extends PredicateHelper {
     })
 
   private[gpu] def collect(session: SparkSession, probe: StarProbe, execution: Option[String]): BuildRows =
-    execution.flatMap { run =>
-      StarAggregates.planKey(probe.build, s"$run|${probe.parts.size}|${probe.comparison.isDefined}|${probe.sums.size}")
+    execution.map { run =>
+      // Within one query run a stage's rows cannot change: the canonical plan identifies the side.
+      s"$run|${probe.parts.size}|${probe.comparison.isDefined}|${probe.sums.size}|" +
+        probe.build.output.map(_.name).mkString(",") + "|" + StarAggregates.relations(probe.build) + "|" +
+        probe.build.canonicalized.toString
     } match {
       case Some(key) =>
         // The two sides of a self-join start together: the second waits for the first's rows.
@@ -488,17 +501,14 @@ object ProbeAggregates extends PredicateHelper {
           }
       }
     }
-    // Integral sums (decimals as unscaled values) must stay exact in the device's doubles.
-    sums.zipWithIndex.foreach { case (column, k) =>
-      if (types(n + compared + k) != DoubleType &&
-          column.filterNot(_.isNaN).map(math.abs).sum >= math.pow(2, 53)) {
-        throw new UnsupportedOperationException(s"build column $k may not sum exactly in doubles")
-      }
-    }
+    // Whether the sums over the join stay exact is decided by the run, which knows the join's
+    // multiplicity (GpuStarAggregateSpec.requireExact).
     BuildRows(
       Array.tabulate(n)(p => live.map(long(_, p))),
       if (compared == 0) new Array[Long](live.length) else live.map(long(_, n)),
-      sums)
+      sums,
+      sums.map(column => column.foldLeft(0.0)((m, v) => if (v.isNaN) m else math.max(m, math.abs(v)))),
+      sums.indices.map(k => types(n + compared + k) != DoubleType).toArray)
   }
 
   /**
