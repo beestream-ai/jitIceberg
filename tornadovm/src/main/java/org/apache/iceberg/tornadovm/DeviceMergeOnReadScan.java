@@ -630,32 +630,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     if (filter.op() != Expression.Operation.TRUE) {
       throw new UnsupportedOperationException("A rewrite of part of a table is not supported");
     }
-    int formatVersion =
-        ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
     metrics = new ScanMetrics();
     long start = System.nanoTime();
-    List<String> columns = Lists.newArrayList();
-    for (Types.NestedField field : table.schema().columns()) {
-      if (field.type().typeId() == org.apache.iceberg.types.Type.TypeID.TIME) {
-        throw new UnsupportedOperationException("TIME columns cannot be written on the device");
-      }
-      ScanLayout.cudfType(field); // refuses what the device cannot read
-      columns.add(field.name());
-    }
-    Planned planned = new Planned(null, columns);
-    List<Region> streams =
-        reuse(
-            "rewrite" + (formatVersion >= 3 ? "-lineage" : "") + "-z" + zorderColumns,
-            planned,
-            () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns));
-    metrics.plan((System.nanoTime() - start) / 1e6);
-
+    Planned planned = new Planned(null, rewriteColumns());
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
-    long rows =
-        run(
-            streams,
-            planned,
-            (region, executed) -> ((RewriteRegion) region).collect(executed, written));
+    long rows = write(planned, zorderColumns, written, start);
 
     java.util.Set<String> deletesSeen = new java.util.HashSet<>();
     RewriteFiles rewrite = table.newRewrite();
@@ -674,6 +653,65 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     rewrite.commit();
     metrics.total((System.nanoTime() - start) / 1e6);
     return new RewriteResult(planned.tasks.size(), deletesSeen.size(), written.size(), rows);
+  }
+
+  /**
+   * The live rows of file scan tasks someone else planned -- a file group of Spark's {@code
+   * rewrite_data_files}, say -- written into new data files on the device, as {@link
+   * #rewriteDataFiles()} writes them: one file a batch, of about {@code targetFileBytes}. Nothing
+   * is committed: the caller swaps the files. One group at a time; the streams share its batches.
+   */
+  public synchronized List<DataFile> rewriteGroup(List<FileScanTask> tasks, long targetFileBytes) {
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
+    if (!tasks.isEmpty()) {
+      // A file's worth of rows a batch, at the inputs' bytes a row: files the size Spark's writer
+      // would make, and device buffers a file's rows deep however large the group.
+      long bytes = tasks.stream().mapToLong(t -> t.file().fileSizeInBytes()).sum();
+      long rows = Math.max(1, tasks.stream().mapToLong(t -> t.file().recordCount()).sum());
+      long fileRows =
+          Math.max(1, Math.min(BATCH_ROWS, targetFileBytes / Math.max(1, bytes / rows)));
+      write(new Planned(null, rewriteColumns(), tasks, fileRows), List.of(), written, start);
+    }
+    return Lists.newArrayList(written);
+  }
+
+  /** Every column of the table, refusing what the device cannot read and write. */
+  private List<String> rewriteColumns() {
+    List<String> columns = Lists.newArrayList();
+    for (Types.NestedField field : table.schema().columns()) {
+      org.apache.iceberg.types.Type.TypeID type = field.type().typeId();
+      if (type == org.apache.iceberg.types.Type.TypeID.TIME
+          || type == org.apache.iceberg.types.Type.TypeID.STRING) {
+        throw new UnsupportedOperationException(
+            field.type() + " columns cannot be written on the device");
+      }
+      ScanLayout.cudfType(field); // refuses what the device cannot read
+      columns.add(field.name());
+    }
+    return columns;
+  }
+
+  /** Writes the planned tasks' live rows into new files, added to {@code written}; their rows. */
+  private long write(
+      Planned planned, List<String> zorderColumns, List<DataFile> written, long start) {
+    int formatVersion =
+        ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
+    List<Region> streams =
+        reuse(
+            "rewrite"
+                + (formatVersion >= 3 ? "-lineage" : "")
+                + "-z"
+                + zorderColumns
+                + (planned.given ? "-given" : ""),
+            planned,
+            () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns));
+    metrics.plan((System.nanoTime() - start) / 1e6);
+    return run(
+        streams,
+        planned,
+        (region, executed) -> ((RewriteRegion) region).collect(executed, written));
   }
 
   /** The regions kept for a query shape, one a stream, rebuilt when this scan outgrows them. */
@@ -879,6 +917,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * same device buffers and plans.
      */
     Planned(String groupColumn, List<String> projection, List<FileScanTask> given) {
+      this(groupColumn, projection, given, BATCH_ROWS);
+    }
+
+    /** {@code givenBatchRows}: the most rows a batch of given tasks holds. */
+    Planned(
+        String groupColumn,
+        List<String> projection,
+        List<FileScanTask> given,
+        long givenBatchRows) {
       this.snapshotId =
           table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
       this.given = given != null;
@@ -948,7 +995,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       // Given tasks share the streams with other callers' requests, so they are not cut smaller.
       long batchRows =
           given != null
-              ? BATCH_ROWS
+              ? givenBatchRows
               : Math.max(1, Math.min(BATCH_ROWS, (totalRows + STREAMS - 1) / STREAMS));
       List<FileScanTask> current = Lists.newArrayList();
       long currentRows = 0;
@@ -2228,6 +2275,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int[] fieldIds;
     private final ParquetColumnType[] types;
     private final boolean[] optional;
+    // Each DECIMAL64 column's precision and scale, at its index.
+    private final int[] precisions;
+    private final int[] scales;
     private final boolean lineage;
     private final IntArray fileStarts;
     private final IntArray fileCount = hostInts(1);
@@ -2275,6 +2325,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.fieldIds = new int[fields.size()];
       this.types = new ParquetColumnType[fields.size()];
       this.optional = new boolean[fields.size()];
+      this.precisions = new int[fields.size()];
+      this.scales = new int[fields.size()];
       StringBuilder joined = new StringBuilder();
       for (int c = 0; c < fields.size(); c++) {
         Types.NestedField field = fields.get(c);
@@ -2288,6 +2340,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
               case LONG -> ParquetColumnType.INT64;
               case TIMESTAMP -> ParquetColumnType.TIMESTAMP_MICROS;
               case DOUBLE -> ParquetColumnType.FLOAT64;
+              case FLOAT -> ParquetColumnType.FLOAT32;
+              case DECIMAL -> {
+                Types.DecimalType decimal = (Types.DecimalType) field.type();
+                precisions[c] = decimal.precision();
+                scales[c] = decimal.scale();
+                yield ParquetColumnType.DECIMAL64;
+              }
               default ->
                   throw new UnsupportedOperationException(
                       "Cannot write " + field + " on the device");
@@ -2356,6 +2415,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           fieldIds,
           types,
           optional,
+          precisions,
+          scales,
           new long[] {-1},
           liveCount(),
           capacity,

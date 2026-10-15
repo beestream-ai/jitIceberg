@@ -595,6 +595,86 @@ public class TestDeviceMergeOnRead {
     }
   }
 
+  /**
+   * A compaction on the device of a table with decimal and float columns: the rewritten files hold
+   * exactly the live rows Iceberg read before, decimals at their scale, and no delete file is left.
+   */
+  @Test
+  public void testRewriteDecimalsAndFloats() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "price", Types.DecimalType.of(7, 2)),
+            Types.NestedField.optional(3, "amount", Types.DecimalType.of(18, 4)),
+            Types.NestedField.required(4, "ratio", Types.FloatType.get()));
+    Table table = MorTables.create(temp.resolve("rewrite-decimals").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              3000,
+              i -> {
+                long id = index * 1_000_000L + i;
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("id", id);
+                record.setField(
+                    "price", BigDecimal.valueOf((id * 7919) % 9_999_999 - 4_999_999, 2));
+                record.setField(
+                    "amount",
+                    i % 7 == 0
+                        ? null
+                        : BigDecimal.valueOf(99_999_999_999_999L - id * 1_234_567L, 4));
+                record.setField("ratio", (float) id / 3);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(3000, 5), new long[0], everyNth(3000, 11)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(4L, 1_000_009L));
+    table.refresh();
+
+    List<String> before = Lists.newArrayList();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      // The table's columns only: a file with position deletes reads back with _pos too.
+      records.forEach(
+          record ->
+              before.add(
+                  flatRow(
+                      record.getField("id"),
+                      record.getField("price"),
+                      record.getField("amount"),
+                      record.getField("ratio"))));
+    }
+    before.sort(String::compareTo);
+
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      device.rewriteDataFiles();
+    }
+    table.refresh();
+    List<String> after = Lists.newArrayList();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      // The table's columns only: a file with position deletes reads back with _pos too.
+      records.forEach(
+          record ->
+              after.add(
+                  flatRow(
+                      record.getField("id"),
+                      record.getField("price"),
+                      record.getField("amount"),
+                      record.getField("ratio"))));
+    }
+    after.sort(String::compareTo);
+    assertThat(after).containsExactlyElementsOf(before);
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        assertThat(task.deletes()).as("delete files after the rewrite").isEmpty();
+      }
+    }
+  }
+
   private static String flatRow(Object... values) {
     StringBuilder row = new StringBuilder();
     for (Object value : values) {
