@@ -55,6 +55,10 @@ dependencies {
   implementation project(':iceberg-core')
   implementation project(':iceberg-tornadovm')
   implementation project(":iceberg-spark:iceberg-spark-3.5_${scalaVersion}")
+  // CALL system.rewrite_data_files and the other procedures, for spark-submit-gpu
+  runtimeOnly(project(":iceberg-spark:iceberg-spark-extensions-3.5_${scalaVersion}")) {
+    transitive = false
+  }
 
   compileOnly("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark35.get()}") {
     exclude group: 'org.apache.avro', module: 'avro'
@@ -113,5 +117,51 @@ tasks.register('printSparkClasspath') {
   dependsOn 'jar'
   doLast {
     println((files(tasks.jar.archiveFile) + configurations.runtimeClasspath).asPath)
+  }
+}
+
+// A ready-to-use directory for spark-submit: build/spark-gpu/{jars, tornado-modules, tornado-argfile,
+// bin/spark-submit-gpu}. The jars are this module's runtime class path less what a Spark 3.5
+// distribution already ships (Hadoop, Jackson, Netty, Guava, logging, commons, ...); Iceberg's
+// modules and the Parquet, Avro, Arrow and ORC versions they need stay, ahead of Spark's.
+def sparkProvided = [
+  'org.apache.hadoop', 'org.apache.hadoop.thirdparty', 'com.fasterxml.jackson.core', 'com.fasterxml.jackson.datatype',
+  'com.fasterxml.jackson.jaxrs', 'com.fasterxml.jackson.module', 'com.fasterxml.woodstox', 'org.codehaus.woodstox',
+  'io.netty', 'com.google.guava', 'com.google.code.gson', 'com.google.code.findbugs', 'com.google.errorprone',
+  'com.google.j2objc', 'com.google.re2j', 'com.google.flatbuffers', 'org.slf4j', 'ch.qos.reload4j', 'log4j',
+  'org.apache.logging.log4j', 'commons-cli', 'commons-codec', 'commons-io', 'commons-logging', 'commons-net',
+  'commons-pool', 'commons-collections', 'commons-beanutils', 'org.apache.commons', 'com.nimbusds', 'dnsjava',
+  'io.dropwizard.metrics', 'com.sun.jersey', 'com.sun.xml.bind', 'javax.xml.bind', 'org.apache.httpcomponents',
+  'org.apache.zookeeper', 'org.apache.curator', 'org.apache.kerby', 'org.eclipse.jetty', 'javax.servlet',
+  'jakarta.activation', 'jakarta.xml.bind', 'org.xerial.snappy', 'org.lz4', 'org.apache.yetus', 'org.apache.avro.hadoop',
+  'org.scala-lang', 'org.bouncycastle', 'org.checkerframework', 'org.eclipse.collections', 'javax.annotation', 'javax.inject',
+  'org.jline', 'jline', 'org.threeten', 'com.github.pjfanning']
+def sparkGpuDir = layout.buildDirectory.dir('spark-gpu')
+tasks.register('sparkGpuBundle') {
+  dependsOn 'jar', 'tornadoModules'
+  outputs.dir sparkGpuDir
+  doLast {
+    def out = sparkGpuDir.get().asFile
+    project.delete(out)
+    def bundled = configurations.runtimeClasspath.resolvedConfiguration.resolvedArtifacts.findAll { artifact ->
+      def group = artifact.moduleVersion.id.group
+      !sparkProvided.any { group == it || group.startsWith(it + '.') }
+    }*.file
+    project.copy {
+      from tasks.jar.archiveFile
+      from bundled
+      into new File(out, 'jars')
+    }
+    project.copy {
+      from tornadoModules
+      into new File(out, 'tornado-modules')
+    }
+    new File(out, 'tornado-argfile').text = tornadoArgfile.get().asFile.text
+        .replace(tornadoModules.get().asFile.path, new File(out, 'tornado-modules').path)
+    def bin = new File(out, 'bin')
+    bin.mkdirs()
+    def script = new File(bin, 'spark-submit-gpu')
+    script.text = file('spark-submit-gpu.sh').text
+    script.setExecutable(true)
   }
 }
