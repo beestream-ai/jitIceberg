@@ -37,10 +37,15 @@ public final class AddEqualityDeletes {
 
   public static void main(String[] args) throws IOException {
     Table table = MorTables.load(args[0]);
+    // Keys as the column's type: INT columns (TPC-H keys from some generators) take Integers.
+    boolean intKey =
+        table.schema().findField(args[1]).type().typeId()
+            == org.apache.iceberg.types.Type.TypeID.INTEGER;
     List<Object> keys = Lists.newArrayList();
     for (String line : Files.readAllLines(Paths.get(args[2]))) {
       if (!line.isBlank()) {
-        keys.add(Long.parseLong(line.trim()));
+        long key = Long.parseLong(line.trim());
+        keys.add(intKey ? (Object) Math.toIntExact(key) : (Object) key);
       }
     }
     MorTables.deleteEqual(table, args[1], keys);
