@@ -29,6 +29,8 @@
 #   ... eq-load    the tables, and the deleted keys in <warehouse>/_keys/{orders,lineitem}.txt for
 #                  AddEqualityDeletes (equality deletes, as a change-data-capture writer leaves them)
 #   ... eq-append  the RF1 inserts, after the equality deletes (a later sequence number)
+#   ... refresh    the ten refresh pairs (position deletes) on tables already loaded, e.g. by
+#                  tpch_load_chunk.py at scale factors too large to generate in one piece
 import os
 import sys
 
@@ -59,14 +61,15 @@ def inserts():
     return spark.read.parquet(os.path.join(rf1, "orders")), spark.read.parquet(os.path.join(rf1, "lineitem"))
 
 
-if mode in ("pos", "eq-load"):
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS local.{namespace}")
-    for table, order in tables.items():
-        spark.read.parquet(os.path.join(source, table)).createOrReplaceTempView("src")
-        spark.sql(f"DROP TABLE IF EXISTS {T(table)}")
-        spark.sql(f"CREATE TABLE {T(table)} USING iceberg TBLPROPERTIES ({props}) AS SELECT * FROM src ORDER BY {order}")
+if mode in ("pos", "eq-load", "refresh"):
+    if mode != "refresh":
+        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS local.{namespace}")
+        for table, order in tables.items():
+            spark.read.parquet(os.path.join(source, table)).createOrReplaceTempView("src")
+            spark.sql(f"DROP TABLE IF EXISTS {T(table)}")
+            spark.sql(f"CREATE TABLE {T(table)} USING iceberg TBLPROPERTIES ({props}) AS SELECT * FROM src ORDER BY {order}")
     orders, lineitem = inserts()
-    if mode == "pos":
+    if mode in ("pos", "refresh"):
         for p in REFRESHES:
             spark.sql(f"DELETE FROM {T('lineitem')} WHERE l_orderkey % 1000 = {p}")
             spark.sql(f"DELETE FROM {T('orders')} WHERE o_orderkey % 1000 = {p}")
