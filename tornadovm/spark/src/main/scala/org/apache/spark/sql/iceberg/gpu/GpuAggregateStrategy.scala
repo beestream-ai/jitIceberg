@@ -215,6 +215,14 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
             case other => Left(s"group expression is not a column: $other")
           }
       _ <- if (groups.size <= 4) Right(()) else Left("more than 4 group columns")
+      // The groups the integer keys can make, by their files' bounds: a grouping nearly as fine as
+      // the rows (TPC-H q18's per-order sums) copies every group back and merges them on the
+      // driver, slower than Spark's own aggregate.
+      groupBound = groupExpressions.collect { case a: AttributeReference => GpuAggregates.keyRange(table, a.name) }
+        .filterNot(_.isNaN).product
+      _ <-
+        if (bucket.isDefined || groupBound <= StarAggregates.maxGroups) Right(())
+        else Left(f"up to $groupBound%.0f groups by the keys' bounds, over ${StarAggregates.maxGroups}%.0f")
       aggregates = resultExpressions
         .flatMap(_.collect { case ae: AggregateExpression => ae })
         .distinct

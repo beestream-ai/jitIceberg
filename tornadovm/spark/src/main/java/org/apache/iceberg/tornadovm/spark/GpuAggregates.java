@@ -413,6 +413,57 @@ public final class GpuAggregates {
         : Double.parseDouble(snapshot.summary().getOrDefault("total-records", "Infinity"));
   }
 
+  /**
+   * How many distinct values an integer column can hold in the current snapshot, by its files'
+   * bounds ({@code upper - lower + 1}): an upper bound on the groups it makes. NaN for a column
+   * that is not an integer (no bound from metadata), infinite when the bounds are unknown.
+   */
+  public static double keyRange(Table table, String column) {
+    return KEY_RANGE.computeIfAbsent(
+        factKey(table, column, "range"), ignored -> computeKeyRange(table, column));
+  }
+
+  private static final Map<String, Double> KEY_RANGE =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static double computeKeyRange(Table table, String column) {
+    Types.NestedField field = table.schema().findField(column);
+    if (field == null
+        || (field.type().typeId() != org.apache.iceberg.types.Type.TypeID.INTEGER
+            && field.type().typeId() != org.apache.iceberg.types.Type.TypeID.LONG)) {
+      return Double.NaN;
+    }
+    if (org.apache.iceberg.tornadovm.Ablation.off("bounds")) {
+      return Double.POSITIVE_INFINITY;
+    }
+    double low = Double.POSITIVE_INFINITY;
+    double high = Double.NEGATIVE_INFINITY;
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().includeColumnStats().planFiles()) {
+      for (FileScanTask task : tasks) {
+        Map<Integer, java.nio.ByteBuffer> lower = task.file().lowerBounds();
+        Map<Integer, java.nio.ByteBuffer> upper = task.file().upperBounds();
+        java.nio.ByteBuffer min = lower == null ? null : lower.get(field.fieldId());
+        java.nio.ByteBuffer max = upper == null ? null : upper.get(field.fieldId());
+        if (min == null || max == null) {
+          return Double.POSITIVE_INFINITY;
+        }
+        low =
+            Math.min(
+                low,
+                ((Number) org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), min))
+                    .doubleValue());
+        high =
+            Math.max(
+                high,
+                ((Number) org.apache.iceberg.types.Conversions.fromByteBuffer(field.type(), max))
+                    .doubleValue());
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    return high >= low ? high - low + 1 : 0;
+  }
+
   // A column's largest magnitude in a snapshot, by its files' bounds; infinite when unknown.
   private static final Map<String, Double> LARGEST = new java.util.concurrent.ConcurrentHashMap<>();
 
