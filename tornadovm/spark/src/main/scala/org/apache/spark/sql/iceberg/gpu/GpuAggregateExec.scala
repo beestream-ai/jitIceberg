@@ -320,10 +320,19 @@ case class GpuAggregateExec(
     }
   }
 
+  /**
+   * Aggregates on the CPU: Spark plans the aggregate's logical plan again, in a query of its own. A
+   * star dimension may be a query stage of the enclosing query's adaptive execution; planned here,
+   * a broadcast stage would sit under no broadcast join and fail validation ("Invalid broadcast query
+   * stage", TPC-DS q67), so each stage is planned again from its logical plan.
+   */
   private def cpu(): Seq[InternalRow] = {
+    val plan = logical.transformUp {
+      case s: org.apache.spark.sql.execution.adaptive.LogicalQueryStage => s.logicalPlan
+    }
     GpuAggregateStrategy.planningFallback.set(true)
     try {
-      Dataset.ofRows(session, logical).queryExecution.executedPlan.executeCollect().toVector
+      Dataset.ofRows(session, plan).queryExecution.executedPlan.executeCollect().toVector
     } finally {
       GpuAggregateStrategy.planningFallback.set(false)
     }
