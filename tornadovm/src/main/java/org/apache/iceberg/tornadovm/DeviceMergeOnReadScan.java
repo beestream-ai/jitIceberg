@@ -130,6 +130,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private static final int STREAMS = Integer.getInteger("iceberg.tornadovm.streams", 4);
 
   /**
+   * The bytes of the one device buffer a batch's string columns share; tests lower it to batch
+   * files apart without writing gigabytes.
+   */
+  static long stringBuffer = Long.getLong("iceberg.tornadovm.string-buffer", Integer.MAX_VALUE);
+
+  /**
    * Streams a rewrite of a caller's file group runs on: each holds a batch's read, gathered and
    * encoded columns at once, on the device and in cuDF's pool.
    */
@@ -1334,8 +1340,16 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       List<FileScanTask> current = Lists.newArrayList();
       long currentRows = 0;
       String currentSet = null;
+      // A batch's string columns share one device buffer (stringStride): files batch together only
+      // while every string column's decoded bytes fit their share of it. ClickBench's hits has
+      // dozens
+      // of string columns, and SELECT * over a batch of a few files needed more (q24 failed).
+      int strings = layout.stringCount();
+      long stringBudget = strings == 0 ? Long.MAX_VALUE : stringBuffer / strings - 2048;
+      long[] currentStrings = new long[strings];
       for (FileScanTask task : tasks) {
         long rows = task.file().recordCount();
+        long[] taskStrings = stringBytes(task, layout, rows);
         // Files batch together only if they share their equality deletes and their residual.
         // ... and store the projected columns at the same positions (schema evolution moves them),
         // and, for a rewrite, belong to the same partition: an output file is one partition's.
@@ -1347,14 +1361,23 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 + host.columnLayout(task)
                 + (rewrite ? "|" + task.spec().specId() + "/" + task.file().partition() : "")
                 + (Ablation.off("batching") ? "|" + task.file().location() : "");
-        if (!current.isEmpty() && (currentRows + rows > batchRows || !set.equals(currentSet))) {
+        boolean stringsFit = true;
+        for (int c = 0; c < strings; c++) {
+          stringsFit &= currentStrings[c] + taskStrings[c] <= stringBudget;
+        }
+        if (!current.isEmpty()
+            && (currentRows + rows > batchRows || !set.equals(currentSet) || !stringsFit)) {
           batches.add(current);
           current = Lists.newArrayList();
           currentRows = 0;
+          java.util.Arrays.fill(currentStrings, 0);
         }
         current.add(task);
         currentRows += rows;
         currentSet = set;
+        for (int c = 0; c < strings; c++) {
+          currentStrings[c] += taskStrings[c];
+        }
       }
       if (!current.isEmpty()) {
         batches.add(current);
@@ -1423,12 +1446,24 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       long stride = stringStride(batches, layout, capacity);
       this.stringStride =
           given != null && stride > 1
-              ? Math.min(roundUp(stride), Integer.MAX_VALUE / Math.max(1, layout.stringCount()))
+              ? Math.min(roundUp(stride), stringBuffer / Math.max(1, layout.stringCount()))
               : stride;
       boolean padded = given != null && padGiven;
       this.equalityCapacity = (int) (padded ? roundUp(maxSet) : maxSet);
       this.positionCapacity = (int) (padded ? roundUp(maxPositions) : maxPositions);
       this.maxFiles = padded ? Math.max(64, files) : files;
+    }
+
+    /** Each string column's decoded bytes in one file, as {@link #stringStride} counts them. */
+    private long[] stringBytes(FileScanTask task, ScanLayout layout, long rows) {
+      long[] bytes = new long[layout.stringCount()];
+      for (int s = 0; s < bytes.length; s++) {
+        int fieldId = layout.fields().get(layout.numericCount() + s).fieldId();
+        long file =
+            HostDeletes.stringBytes(LocalFiles.path(task.file().location(), table.io()), fieldId);
+        bytes[s] = file < 0 ? 16L * rows : file;
+      }
+      return bytes;
     }
 
     /**
@@ -1459,7 +1494,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
       }
       long stride = (most + 1023) / 1024 * 1024 + 1024;
-      if (stride * layout.stringCount() > Integer.MAX_VALUE) {
+      if (stride * layout.stringCount() > stringBuffer) {
         throw new UnsupportedOperationException(
             "String columns of " + stride + " bytes a batch are beyond one device buffer");
       }
