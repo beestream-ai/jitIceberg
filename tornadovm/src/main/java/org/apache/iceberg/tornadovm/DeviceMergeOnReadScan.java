@@ -170,6 +170,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   @Override
   public void close() {
+    LAST_REWRITER.compareAndSet(this, null);
     regions.values().forEach(list -> list.forEach(Region::close));
     regions.clear();
     sharedPools.values().forEach(SharedPool::close);
@@ -661,7 +662,18 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * #rewriteDataFiles()} writes them: one file a batch, of about {@code targetFileBytes}. Nothing
    * is committed: the caller swaps the files. One group at a time; the streams share its batches.
    */
-  public synchronized List<DataFile> rewriteGroup(List<FileScanTask> tasks, long targetFileBytes) {
+  public List<DataFile> rewriteGroup(List<FileScanTask> tasks, long targetFileBytes) {
+    // Before taking this scan's lock: another rewriter frees its regions under its own.
+    DeviceMergeOnReadScan previous = LAST_REWRITER.getAndSet(this);
+    if (previous != null && previous != this) {
+      previous.releaseRewriteRegions();
+    }
+    synchronized (this) {
+      return rewriteGroupLocked(tasks, targetFileBytes);
+    }
+  }
+
+  private List<DataFile> rewriteGroupLocked(List<FileScanTask> tasks, long targetFileBytes) {
     metrics = new ScanMetrics();
     long start = System.nanoTime();
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
@@ -672,9 +684,30 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       long rows = Math.max(1, tasks.stream().mapToLong(t -> t.file().recordCount()).sum());
       long fileRows =
           Math.max(1, Math.min(BATCH_ROWS, targetFileBytes / Math.max(1, bytes / rows)));
+      // A rewrite needs room: idle readers give their device memory back first, as the last
+      // other table rewritten has. This one keeps its regions -- and its compiled kernels -- for
+      // its next group.
+      evictIdle(null, 0);
       write(new Planned(null, rewriteColumns(), tasks, fileRows), List.of(), written, start);
     }
     return Lists.newArrayList(written);
+  }
+
+  /** The scan whose rewrite regions are kept: one rewriter's at a time hold device memory. */
+  private static final java.util.concurrent.atomic.AtomicReference<DeviceMergeOnReadScan>
+      LAST_REWRITER = new java.util.concurrent.atomic.AtomicReference<>();
+
+  private synchronized void releaseRewriteRegions() {
+    regions
+        .entrySet()
+        .removeIf(
+            entry -> {
+              if (entry.getKey().startsWith("rewrite") && entry.getKey().endsWith("-given")) {
+                entry.getValue().forEach(Region::close);
+                return true;
+              }
+              return false;
+            });
   }
 
   /** Every column of the table, refusing what the device cannot read and write. */
