@@ -40,6 +40,7 @@ import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.iceberg.gpu.GpuAggregateStrategy;
 import org.apache.spark.sql.iceberg.gpu.ProbeAggregates;
 import org.apache.spark.sql.iceberg.gpu.StarAggregates;
+import org.apache.spark.sql.iceberg.gpu.StarAggregates$;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -596,7 +597,7 @@ public class TestSparkGpuAggregates {
               }
             });
     assertThat(staged.toString()).contains("LogicalQueryStage");
-    assertThat(StarAggregates.identity(staged)).isEqualTo(StarAggregates.identity(agg));
+    assertThat(StarAggregates$.MODULE$.identity(staged)).isEqualTo(StarAggregates$.MODULE$.identity(agg));
   }
 
   @Test
