@@ -29,6 +29,7 @@ import os
 import sys
 
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 warehouse, source, mode = sys.argv[1:4]
 namespace = os.path.basename(warehouse.rstrip("/"))
@@ -39,7 +40,14 @@ props = (f"'format-version'='{version}','write.delete.mode'='merge-on-read',"
          "'write.update.mode'='merge-on-read','write.target-file-size-bytes'='134217728',"
          "'write.parquet.compression-codec'='zstd'")
 spark.sql(f"CREATE NAMESPACE IF NOT EXISTS local.{namespace}")
-spark.read.parquet(source).createOrReplaceTempView("src")
+# The Parquet file stores EventTime as Unix seconds (long) and EventDate as days since 1970 (int);
+# ClickBench's queries use them as a timestamp and a date. Typed as ClickBench's Spark entry types
+# them: otherwise extract(minute FROM EventTime) and DATE_TRUNC fail (q19, q43), and every
+# EventDate >= '2013-07-01' filter compares an int with a string and selects no rows (q37-q42).
+(spark.read.parquet(source)
+    .withColumn("EventTime", F.timestamp_seconds(F.col("EventTime")))
+    .withColumn("EventDate", F.date_add(F.lit("1970-01-01"), F.col("EventDate")))
+    .createOrReplaceTempView("src"))
 table = f"local.{namespace}.hits"
 spark.sql(f"DROP TABLE IF EXISTS {table}")
 # Ordered by CounterID and EventDate, as ClickBench's own schema clusters the table.
