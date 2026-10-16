@@ -509,6 +509,96 @@ public class TestSparkGpuAggregates {
    * warehouse's name and the week, counting rows; and sums of both sides' columns over the join
    * (the sales side's summed per stock row): the same answers on the device as on Spark.
    */
+  /**
+   * Adaptive execution plans an aggregate again after its joins become query stages. A star
+   * aggregate that failed on the device must be recognised in both shapes: keyed by the plan with
+   * the stage as a leaf, TPC-DS q67 was accepted again in every run and fell back to the CPU each
+   * time (17 s against Spark's 5.6 s).
+   */
+  @Test
+  public void testStarFailureMemorySurvivesQueryStages() {
+    Schema facts =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v", Types.IntegerType.get()));
+    view(
+        "stage_facts",
+        facts,
+        2,
+        1_000,
+        id -> {
+          GenericRecord r = GenericRecord.create(facts);
+          r.setField("id", id);
+          r.setField("k", (int) (id % 10));
+          r.setField("v", (int) id);
+          return r;
+        });
+    Schema dims =
+        new Schema(
+            Types.NestedField.required(1, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "name", Types.StringType.get()));
+    view(
+        "stage_dims",
+        dims,
+        1,
+        10,
+        id -> {
+          GenericRecord r = GenericRecord.create(dims);
+          r.setField("k", (int) id);
+          r.setField("name", "n" + id);
+          return r;
+        });
+    org.apache.spark.sql.catalyst.plans.logical.LogicalPlan agg =
+        spark
+            .sql(
+                "SELECT d.name, SUM(f.v) FROM stage_facts f JOIN stage_dims d ON f.k = d.k GROUP BY d.name")
+            .queryExecution()
+            .optimizedPlan();
+    org.apache.spark.sql.catalyst.plans.logical.Join join =
+        (org.apache.spark.sql.catalyst.plans.logical.Join)
+            agg.collectFirst(
+                    new scala.runtime.AbstractPartialFunction<
+                        org.apache.spark.sql.catalyst.plans.logical.LogicalPlan,
+                        org.apache.spark.sql.catalyst.plans.logical.LogicalPlan>() {
+                      @Override
+                      public boolean isDefinedAt(
+                          org.apache.spark.sql.catalyst.plans.logical.LogicalPlan p) {
+                        return p instanceof org.apache.spark.sql.catalyst.plans.logical.Join;
+                      }
+
+                      @Override
+                      public org.apache.spark.sql.catalyst.plans.logical.LogicalPlan apply(
+                          org.apache.spark.sql.catalyst.plans.logical.LogicalPlan p) {
+                        return p;
+                      }
+                    })
+                .get();
+    org.apache.spark.sql.catalyst.plans.logical.LogicalPlan dimension = join.right();
+    org.apache.spark.sql.execution.adaptive.LogicalQueryStage stage =
+        new org.apache.spark.sql.execution.adaptive.LogicalQueryStage(
+            dimension,
+            spark.sessionState().executePlan(dimension, org.apache.spark.sql.execution.CommandExecutionMode.ALL()).executedPlan());
+    org.apache.spark.sql.catalyst.plans.logical.LogicalPlan staged =
+        agg.transformUp(
+            new scala.runtime.AbstractPartialFunction<
+                org.apache.spark.sql.catalyst.plans.logical.LogicalPlan,
+                org.apache.spark.sql.catalyst.plans.logical.LogicalPlan>() {
+              @Override
+              public boolean isDefinedAt(org.apache.spark.sql.catalyst.plans.logical.LogicalPlan p) {
+                return p == dimension;
+              }
+
+              @Override
+              public org.apache.spark.sql.catalyst.plans.logical.LogicalPlan apply(
+                  org.apache.spark.sql.catalyst.plans.logical.LogicalPlan p) {
+                return stage;
+              }
+            });
+    assertThat(staged.toString()).contains("LogicalQueryStage");
+    assertThat(StarAggregates.identity(staged)).isEqualTo(StarAggregates.identity(agg));
+  }
+
   @Test
   public void testProbeAggregates() {
     Schema stock =
