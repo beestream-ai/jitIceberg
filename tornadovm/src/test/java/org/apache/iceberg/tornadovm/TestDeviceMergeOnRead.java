@@ -612,6 +612,87 @@ public class TestDeviceMergeOnRead {
   }
 
   /**
+   * Files batch apart when their string columns together need more than the one device buffer they
+   * share. ClickBench's q24 (SELECT * over hits, dozens of string columns) batched a few files
+   * whose strings were beyond it and failed; here the buffer holds one file's strings but not two,
+   * which the row budget alone would batch together.
+   */
+  @Test
+  public void testStringColumnsBeyondOneBufferBatchApart() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "url", Types.StringType.get()),
+            Types.NestedField.required(3, "title", Types.StringType.get()));
+    Table table = MorTables.create(temp.resolve("buffer").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 8; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              3000,
+              i -> {
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("id", index * 1_000_000L + i);
+                record.setField(
+                    "url",
+                    i % 13 == 0 ? null : "https://example.com/" + "p".repeat((int) (i % 50)));
+                record.setField("title", "title " + index + " " + i);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table,
+        files.subList(0, 2),
+        ImmutableList.of(everyNth(3000, 7), randomPositions(3000, 0.1, 5)));
+    table.refresh();
+
+    long most = 0;
+    for (DataFile file : files) {
+      for (int fieldId : new int[] {2, 3}) {
+        long bytes = HostDeletes.stringBytes(LocalFiles.path(file.location(), table.io()), fieldId);
+        assertThat(bytes).as("string bytes in the footer of %s", file.location()).isPositive();
+        most = Math.max(most, bytes);
+      }
+    }
+
+    List<String> expected = Lists.newArrayList();
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        expected.add(
+            record.getField("id") + "|" + record.getField("url") + "|" + record.getField("title"));
+      }
+    }
+    expected.sort(String::compareTo);
+
+    long saved = DeviceMergeOnReadScan.stringBuffer;
+    // Room for one file's strings in each of the two columns, not for two files'.
+    DeviceMergeOnReadScan.stringBuffer = 2 * (most * 3 / 2 + 4096);
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      List<String> actual = java.util.Collections.synchronizedList(Lists.newArrayList());
+      device.materialize(
+          ImmutableList.of("id", "url", "title"),
+          batch -> {
+            for (int r = 0; r < batch.rows(); r++) {
+              actual.add(
+                  batch.getLong("id", r)
+                      + "|"
+                      + batch.getString("url", r)
+                      + "|"
+                      + batch.getString("title", r));
+            }
+          });
+      List<String> sorted = Lists.newArrayList(actual);
+      sorted.sort(String::compareTo);
+      assertThat(sorted).containsExactlyElementsOf(expected);
+    } finally {
+      DeviceMergeOnReadScan.stringBuffer = saved;
+    }
+  }
+
+  /**
    * Decimal columns of up to 18 digits: read as their unscaled values, filtered by a decimal
    * literal, an equality-delete key, a group key, and summed exactly -- each against Iceberg's own
    * reader.
