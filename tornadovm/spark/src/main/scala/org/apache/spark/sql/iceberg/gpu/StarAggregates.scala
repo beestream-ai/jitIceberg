@@ -333,15 +333,19 @@ object StarAggregates extends PredicateHelper {
 
   /**
    * An aggregate's identity across plannings: its canonical plan, with the column names and table
-   * snapshots a canonical plan leaves out (it names every attribute "none").
+   * snapshots a canonical plan leaves out (it names every attribute "none"). Adaptive execution
+   * plans one aggregate twice, before and after its joins become query stages; a stage is a leaf
+   * that hides the scans and joins below it, so each stage stands for its logical plan here and
+   * both plannings have one identity (TPC-DS q67 failed in every run instead of only the first).
    */
   private[gpu] def identity(agg: LogicalPlan): String = {
-    val relations = agg.collect { case r: DataSourceV2ScanRelation => r }
+    val plan = agg.transformUp { case s: org.apache.spark.sql.execution.adaptive.LogicalQueryStage => s.logicalPlan }
+    val relations = plan.collect { case r: DataSourceV2ScanRelation => r }
     relations.map { r =>
       val snapshot = GpuAggregateStrategy.currentTable(r).toOption
         .map(t => s"${t.location()}@${Option(t.currentSnapshot()).map(_.snapshotId()).orNull}")
       s"$snapshot${r.output.map(_.name)}"
-    }.mkString(";") + agg.canonicalized.toString
+    }.mkString(";") + plan.canonicalized.toString
   }
 
   private[gpu] def remember(agg: LogicalPlan): Unit = failed.add(identity(agg))
