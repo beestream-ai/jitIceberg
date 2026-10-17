@@ -234,4 +234,67 @@ public class TestSparkGpuReads {
     assertThat(autoRows).containsExactlyElementsOf(cpuRows);
     assertThat(alwaysRows).containsExactlyElementsOf(cpuRows);
   }
+
+  /**
+   * A task group the device refuses as it plans it -- here every file's strings beyond their share
+   * of a lowered string buffer, as one file of ClickBench's hits with equality deletes was of the
+   * real one in q24 -- is read by Iceberg's reader instead, with the same rows, and the query does
+   * not fail.
+   */
+  @Test
+  public void testGroupTheDeviceRefusesIsReadByIcebergsReader() {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "longCol", Types.LongType.get()),
+            Types.NestedField.optional(2, "url", Types.StringType.get()),
+            Types.NestedField.required(3, "title", Types.StringType.get()));
+    String location = temp.resolve("refused").toString();
+    Table table = MorTables.create(location, schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              4000,
+              i -> {
+                GenericRecord record = GenericRecord.create(schema);
+                record.setField("longCol", index * 1_000_000L + i);
+                record.setField(
+                    "url", i % 7 == 0 ? null : "https://example.com/" + "u".repeat((int) (i % 60)));
+                record.setField("title", "title " + index + " " + i);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deleteEqual(table, "longCol", ImmutableList.of(5L, 1_000_006L, 2_000_007L));
+    spark.read().format("iceberg").load(location).createOrReplaceTempView("r");
+    String all = "SELECT * FROM r";
+
+    gpu(false);
+    List<String> cpuRows = sorted(spark.sql(all).collectAsList());
+
+    gpu(true);
+    long saved = org.apache.iceberg.tornadovm.DeviceMergeOnReadScan.stringBuffer;
+    // Smaller than any file's strings: the device refuses every group.
+    org.apache.iceberg.tornadovm.DeviceMergeOnReadScan.stringBuffer = 8192;
+    long before = GpuPartitionReader.REFUSED.get();
+    List<String> refusedRows;
+    try {
+      refusedRows = sorted(spark.sql(all).collectAsList());
+    } finally {
+      org.apache.iceberg.tornadovm.DeviceMergeOnReadScan.stringBuffer = saved;
+    }
+    long refused = GpuPartitionReader.REFUSED.get() - before;
+    before = GpuPartitionReader.TASKS.get();
+    List<String> gpuRows = sorted(spark.sql(all).collectAsList());
+    long gpuTasks = GpuPartitionReader.TASKS.get() - before;
+    gpu(false);
+
+    assertThat(cpuRows).hasSize(3 * 4000 - 3);
+    assertThat(refused).as("Spark tasks the device refused").isGreaterThan(0);
+    assertThat(refusedRows).containsExactlyElementsOf(cpuRows);
+    assertThat(gpuTasks).as("Spark tasks read on the GPU with the whole buffer").isGreaterThan(0);
+    assertThat(gpuRows).containsExactlyElementsOf(cpuRows);
+  }
 }
