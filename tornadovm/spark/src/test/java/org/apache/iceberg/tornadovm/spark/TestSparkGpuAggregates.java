@@ -579,14 +579,18 @@ public class TestSparkGpuAggregates {
     org.apache.spark.sql.execution.adaptive.LogicalQueryStage stage =
         new org.apache.spark.sql.execution.adaptive.LogicalQueryStage(
             dimension,
-            spark.sessionState().executePlan(dimension, org.apache.spark.sql.execution.CommandExecutionMode.ALL()).executedPlan());
+            spark
+                .sessionState()
+                .executePlan(dimension, org.apache.spark.sql.execution.CommandExecutionMode.ALL())
+                .executedPlan());
     org.apache.spark.sql.catalyst.plans.logical.LogicalPlan staged =
         agg.transformUp(
             new scala.runtime.AbstractPartialFunction<
                 org.apache.spark.sql.catalyst.plans.logical.LogicalPlan,
                 org.apache.spark.sql.catalyst.plans.logical.LogicalPlan>() {
               @Override
-              public boolean isDefinedAt(org.apache.spark.sql.catalyst.plans.logical.LogicalPlan p) {
+              public boolean isDefinedAt(
+                  org.apache.spark.sql.catalyst.plans.logical.LogicalPlan p) {
                 return p == dimension;
               }
 
@@ -597,7 +601,8 @@ public class TestSparkGpuAggregates {
               }
             });
     assertThat(staged.toString()).contains("LogicalQueryStage");
-    assertThat(StarAggregates$.MODULE$.identity(staged)).isEqualTo(StarAggregates$.MODULE$.identity(agg));
+    assertThat(StarAggregates$.MODULE$.identity(staged))
+        .isEqualTo(StarAggregates$.MODULE$.identity(agg));
   }
 
   @Test
