@@ -349,13 +349,43 @@ object GpuAggregateExec {
   }
   private val ids = new java.util.concurrent.atomic.AtomicLong()
 
-  // Results by id; kept for the last few so that an RDD computed again still finds its rows.
+  // Results by id, until the SQL execution they compute for ends (or, with none, for the last few):
+  // kept longer, the rows of every aggregate of the last 64 stayed on the driver's heap across
+  // queries -- 63M rows, 15 GB, before TPC-DS SF100 q78, which then took twice as long.
   private val results = java.util.Collections.synchronizedMap(
     new java.util.LinkedHashMap[Long, java.util.concurrent.Future[Seq[InternalRow]]](64, 0.75f, false) {
       override def removeEldestEntry(
           eldest: java.util.Map.Entry[Long, java.util.concurrent.Future[Seq[InternalRow]]]): Boolean =
         size() > 64
     })
+
+  // The aggregates of each SQL execution, dropped from results when it ends.
+  private val byExecution =
+    new java.util.concurrent.ConcurrentHashMap[String, java.util.Set[Long]]()
+
+  // Each aggregate's plan node while something still holds it: an RDD computed again after its
+  // execution ended (a cached plan run once more) computes its rows again rather than failing.
+  private val owners =
+    new java.util.concurrent.ConcurrentHashMap[Long, java.lang.ref.WeakReference[GpuAggregateExec]]()
+
+  @volatile private var listening = false
+
+  private def listen(sc: org.apache.spark.SparkContext): Unit = synchronized {
+    if (!listening) {
+      sc.addSparkListener(new org.apache.spark.scheduler.SparkListener {
+        override def onOtherEvent(event: org.apache.spark.scheduler.SparkListenerEvent): Unit =
+          event match {
+            case end: org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd =>
+              Option(byExecution.remove(end.executionId.toString)).foreach(_.forEach(id => results.remove(id)))
+            case _ =>
+          }
+      })
+      listening = true
+    }
+  }
+
+  /** Results still on the driver, for tests. */
+  private[gpu] def kept: Int = results.size()
 
   /** The SQL execution (one run of a query) an aggregate computes for, on its thread. */
   private val executions = new ThreadLocal[String]
@@ -364,23 +394,34 @@ object GpuAggregateExec {
 
   private[gpu] def start(exec: GpuAggregateExec): Long = {
     val id = ids.incrementAndGet()
-    val session = exec.session
     val execution = exec.sparkContext.getLocalProperty(
       org.apache.spark.sql.execution.SQLExecution.EXECUTION_ID_KEY)
-    results.put(
-      id,
-      threads.submit { () =>
-        org.apache.spark.sql.SparkSession.setActiveSession(session)
-        executions.set(execution)
-        try exec.compute()
-        finally executions.remove()
-      })
+    listen(exec.sparkContext)
+    owners.values().removeIf(_.get() == null)
+    owners.put(id, new java.lang.ref.WeakReference(exec))
+    if (execution != null) {
+      byExecution.computeIfAbsent(execution, _ => java.util.concurrent.ConcurrentHashMap.newKeySet[Long]()).add(id)
+    }
+    results.put(id, submit(exec, execution))
     id
   }
 
-  private[gpu] def await(id: Long): Iterator[InternalRow] =
-    Option(results.get(id))
-      .getOrElse(throw new IllegalStateException(s"GPU aggregate $id is no longer kept"))
-      .get()
-      .iterator
+  private def submit(exec: GpuAggregateExec, execution: String) = {
+    val session = exec.session
+    threads.submit { () =>
+      org.apache.spark.sql.SparkSession.setActiveSession(session)
+      executions.set(execution)
+      try exec.compute()
+      finally executions.remove()
+    }
+  }
+
+  private[gpu] def await(id: Long): Iterator[InternalRow] = {
+    val result = Option(results.get(id)).getOrElse {
+      val exec = Option(owners.get(id)).flatMap(owner => Option(owner.get()))
+        .getOrElse(throw new IllegalStateException(s"GPU aggregate $id is no longer kept"))
+      submit(exec, null)
+    }
+    result.get().iterator
+  }
 }
