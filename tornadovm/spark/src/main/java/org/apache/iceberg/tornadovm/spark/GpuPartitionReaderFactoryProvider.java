@@ -113,7 +113,12 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
           && iceberg.allTasksOfType(FileScanTask.class)) {
         ScanTaskGroup<FileScanTask> group = iceberg.taskGroup();
         PartitionReader<ColumnarBatch> reader =
-            reader(iceberg.table(), group, iceberg.expectedSchema(), iceberg.isCaseSensitive());
+            reader(
+                iceberg.table(),
+                group,
+                iceberg.expectedSchema(),
+                iceberg.isCaseSensitive(),
+                () -> delegate.createColumnarReader(partition));
         return ScanLog.timed(
             reader != null ? reader : delegate.createColumnarReader(partition),
             reader != null ? "gpu" : "cpu",
@@ -130,12 +135,16 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
     }
   }
 
-  /** A device reader for the task group, or null to leave it to Iceberg's reader. */
+  /**
+   * A device reader for the task group, or null to leave it to Iceberg's reader; {@code cpu} makes
+   * Iceberg's reader for a group the device refuses once it plans it.
+   */
   static PartitionReader<ColumnarBatch> reader(
       Table table,
       ScanTaskGroup<FileScanTask> taskGroup,
       Schema expectedSchema,
-      boolean caseSensitive) {
+      boolean caseSensitive,
+      java.util.function.Supplier<PartitionReader<ColumnarBatch>> cpu) {
     SparkEnv env = SparkEnv.get();
     if (env == null
         || !env.conf().getBoolean(ENABLED, false)
@@ -172,7 +181,7 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
         return null;
       }
     }
-    return new GpuPartitionReader(GpuScans.scan(table), taskGroup, expectedSchema);
+    return new GpuPartitionReader(GpuScans.scan(table), taskGroup, expectedSchema, cpu);
   }
 
   /** Whether any task of the group applies equality deletes. */

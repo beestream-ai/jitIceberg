@@ -44,25 +44,46 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
   static final java.util.concurrent.atomic.AtomicLong TASKS =
       new java.util.concurrent.atomic.AtomicLong();
 
+  /** Spark tasks the device refused and Iceberg's reader read instead, for tests and logs. */
+  static final java.util.concurrent.atomic.AtomicLong REFUSED =
+      new java.util.concurrent.atomic.AtomicLong();
+
   private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.spark.debug");
+  private static final org.slf4j.Logger LOG =
+      org.slf4j.LoggerFactory.getLogger(GpuPartitionReader.class);
 
   private final DeviceMergeOnReadScan scan;
   private final List<FileScanTask> tasks;
   private final Schema schema;
   private final StructType sparkSchema;
+  private final java.util.function.Supplier<PartitionReader<ColumnarBatch>> cpu;
   private Iterator<ColumnarBatch> batches;
   private ColumnarBatch current;
+  // Iceberg's reader, once the device refused the group.
+  private PartitionReader<ColumnarBatch> fallback;
 
   GpuPartitionReader(
-      DeviceMergeOnReadScan scan, ScanTaskGroup<FileScanTask> taskGroup, Schema schema) {
+      DeviceMergeOnReadScan scan,
+      ScanTaskGroup<FileScanTask> taskGroup,
+      Schema schema,
+      java.util.function.Supplier<PartitionReader<ColumnarBatch>> cpu) {
     this.scan = scan;
     this.tasks = Lists.newArrayList(taskGroup.tasks());
     this.schema = schema;
     this.sparkSchema = SparkSchemaUtil.convert(schema);
+    this.cpu = cpu;
   }
 
+  /**
+   * The group's batches, from the device; when the device refuses the group as it plans it (a file
+   * whose string column is beyond its share of the one string buffer, ClickBench q24 on hits with
+   * equality deletes), before any batch, Iceberg's reader reads it instead of the query failing.
+   */
   @Override
-  public boolean next() {
+  public boolean next() throws java.io.IOException {
+    if (fallback != null) {
+      return fallback.next();
+    }
     if (batches == null) {
       // The scan hands batches over from each of its stream threads at once.
       List<ColumnarBatch> read = java.util.Collections.synchronizedList(Lists.newArrayList());
@@ -72,15 +93,27 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
         columns.add(field.name());
       }
       java.util.concurrent.atomic.AtomicLong convert = new java.util.concurrent.atomic.AtomicLong();
-      long rows =
-          scan.materialize(
-              tasks,
-              columns,
-              batch -> {
-                long converting = System.nanoTime();
-                read.add(toSpark(batch));
-                convert.addAndGet(System.nanoTime() - converting);
-              });
+      long rows;
+      try {
+        rows =
+            scan.materialize(
+                tasks,
+                columns,
+                batch -> {
+                  long converting = System.nanoTime();
+                  read.add(toSpark(batch));
+                  convert.addAndGet(System.nanoTime() - converting);
+                });
+      } catch (UnsupportedOperationException e) {
+        if (cpu == null || !read.isEmpty()) {
+          throw e;
+        }
+        REFUSED.incrementAndGet();
+        LOG.info("Reading {} files on the CPU: {}", tasks.size(), e.getMessage());
+        LOG.debug("Device refusal", e);
+        fallback = cpu.get();
+        return fallback.next();
+      }
       TASKS.incrementAndGet();
       if (DEBUG) {
         System.err.printf(
@@ -109,11 +142,14 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
 
   @Override
   public ColumnarBatch get() {
-    return current;
+    return fallback != null ? fallback.get() : current;
   }
 
   @Override
-  public void close() {
+  public void close() throws java.io.IOException {
+    if (fallback != null) {
+      fallback.close();
+    }
     if (current != null) {
       current.close();
     }

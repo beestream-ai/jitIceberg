@@ -131,9 +131,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   /**
    * The bytes of the one device buffer a batch's string columns share; tests lower it to batch
-   * files apart without writing gigabytes.
+   * files apart, or to have the device refuse a file, without writing gigabytes.
    */
-  static long stringBuffer = Long.getLong("iceberg.tornadovm.string-buffer", Integer.MAX_VALUE);
+  public static long stringBuffer =
+      Long.getLong("iceberg.tornadovm.string-buffer", Integer.MAX_VALUE);
 
   /**
    * Streams a rewrite of a caller's file group runs on: each holds a batch's read, gathered and
