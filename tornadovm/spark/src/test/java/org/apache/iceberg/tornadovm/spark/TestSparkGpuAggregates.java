@@ -37,6 +37,7 @@ import org.apache.spark.SparkEnv;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.iceberg.gpu.GpuAggregateExec$;
 import org.apache.spark.sql.iceberg.gpu.GpuAggregateStrategy;
 import org.apache.spark.sql.iceberg.gpu.ProbeAggregates;
 import org.apache.spark.sql.iceberg.gpu.StarAggregates;
@@ -277,6 +278,52 @@ public class TestSparkGpuAggregates {
    * column and a fact column as a group key are declined; a dimension with a repeated key fails on
    * the device and runs on the CPU.
    */
+  /**
+   * A device aggregate's rows leave the driver when the query that computed them ends: they were
+   * kept for the last 64 aggregates, and at TPC-DS SF100 that held 63M rows (15 GB) on the heap
+   * across queries, doubling q78's time.
+   */
+  @Test
+  public void testDeviceAggregateResultsLeaveWithTheirQuery() throws InterruptedException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.required(3, "v", Types.DoubleType.get()));
+    view(
+        "kept",
+        schema,
+        2,
+        20_000,
+        i -> {
+          GenericRecord record = GenericRecord.create(schema);
+          record.setField("id", i);
+          record.setField("k", (int) (i % 1000));
+          record.setField("v", i * 0.5);
+          return record;
+        });
+    String sql = "SELECT k, sum(v), count(*) FROM kept GROUP BY k";
+    Answer cpu = run(sql);
+    gpu(true);
+    try {
+      for (int repeat = 0; repeat < 3; repeat++) {
+        Answer device = run(sql);
+        assertThat(device.onDevice()).isTrue();
+        assertSameAnswer(device.rows(), cpu.rows());
+        // The execution's end reaches the listener on Spark's bus, a moment later.
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (GpuAggregateExec$.MODULE$.kept() > 0 && System.currentTimeMillis() < deadline) {
+          Thread.sleep(20);
+        }
+        assertThat(GpuAggregateExec$.MODULE$.kept())
+            .as("results kept after query %d", repeat)
+            .isZero();
+      }
+    } finally {
+      gpu(false);
+    }
+  }
+
   @Test
   @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:MethodLength"})
   public void testStarAggregates() {
