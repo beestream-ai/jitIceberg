@@ -120,6 +120,8 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
 
     @Override
     public Set<DataFile> rewrite(RewriteFileGroup group) {
+      // The aggregates' kept scans hold device memory a rewrite needs; they rebuild when next used.
+      GpuAggregates.releaseAll();
       Set<DataFile> written =
           Sets.newHashSet(
               GpuScans.rewriteScan(table)

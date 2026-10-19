@@ -78,6 +78,14 @@ public final class GpuAggregates {
 
   private GpuAggregates() {}
 
+  /** Frees every kept scan's device memory -- for a compaction, which needs the room. */
+  static void releaseAll() {
+    synchronized (SCANS) {
+      SCANS.values().forEach(DeviceMergeOnReadScan::close);
+      SCANS.clear();
+    }
+  }
+
   private static String factKey(Table table, String column, String fact) {
     Snapshot snapshot = table.currentSnapshot();
     return table.location()
