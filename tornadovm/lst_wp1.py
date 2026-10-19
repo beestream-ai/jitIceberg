@@ -80,7 +80,8 @@ def single_user(label):
             answers.setdefault(q, []).append(checksum(rows))
         totals[engine] = total
     wrong = [q for q, a in answers.items() if len(set(a)) != 1]
-    deletes = sum(spark.sql(f"SELECT count(*) FROM {t}.files WHERE content > 0").collect()[0][0]
+    deletes = sum(spark.sql(f"SELECT count(*) FROM local.{namespace}.{t}.files WHERE content > 0")
+                  .collect()[0][0]
                   for t, *_ in FACTS)
     print(f"{label},{totals['spark']:.0f},{totals['gpu']:.0f},{deletes},{'ok' if not wrong else wrong}",
           flush=True)

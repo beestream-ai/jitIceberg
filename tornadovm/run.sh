@@ -115,13 +115,18 @@ case "$mode" in
         # modules and the GPU path on the driver class path, ahead of Spark's jars, and TornadoVM in
         # the driver JVM through an argfile whose module path leaves out the jars that clash with
         # Spark's (see SPARK_GPU_ARGFILE). The GPU JVM keeps its heap under 32 GB.
-        : "${SPARK_HOME:?set SPARK_HOME}"; : "${SPARK_GPU_CP:?set SPARK_GPU_CP}"; : "${SPARK_GPU_ARGFILE:?set SPARK_GPU_ARGFILE}"
+        # Defaults: the bundle of :iceberg-tornadovm-spark:sparkGpuBundle (spark/build/spark-gpu).
+        : "${SPARK_HOME:?set SPARK_HOME}"
+        BUNDLE="$HERE/spark/build/spark-gpu"
+        SPARK_GPU_CP="${SPARK_GPU_CP:-$(ls "$BUNDLE"/jars/*.jar 2>/dev/null | paste -sd: -)}"
+        SPARK_GPU_ARGFILE="${SPARK_GPU_ARGFILE:-$BUNDLE/tornado-argfile}"
+        : "${SPARK_GPU_CP:?run :iceberg-tornadovm-spark:sparkGpuBundle or set SPARK_GPU_CP}"
         ENGINE=spark-gpu exec "$SPARK_HOME/bin/spark-submit" --master "local[${THREADS:-$(nproc)}]" \
             --driver-memory "${GPU_HEAP:-24g}" --driver-class-path "$SPARK_GPU_CP" \
             --conf spark.driver.extraJavaOptions="--enable-preview @$SPARK_GPU_ARGFILE -Dtornado.device.memory=20GB -da:tornado... -da:uk.ac.manchester.tornado... ${SPARK_GPU_JAVA_OPTS:-}" \
             --conf spark.iceberg.gpu.enabled=true \
             --conf spark.iceberg.gpu.aggregate.enabled="${SPARK_GPU_AGGREGATE:-true}" \
-            --conf spark.sql.extensions=org.apache.spark.sql.iceberg.gpu.GpuAggregateExtensions \
+            --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.spark.sql.iceberg.gpu.GpuAggregateExtensions \
             --conf spark.sql.catalog.default_iceberg=org.apache.iceberg.spark.SparkCatalog \
             --conf spark.sql.catalog.default_iceberg.type=hadoop \
             --conf spark.sql.catalog.default_iceberg.warehouse="$(dirname "$1")" \
