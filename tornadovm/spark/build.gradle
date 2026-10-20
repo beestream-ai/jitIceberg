@@ -139,6 +139,9 @@ def sparkProvided = [
 def sparkGpuDir = layout.buildDirectory.dir('spark-gpu')
 tasks.register('sparkGpuBundle') {
   dependsOn 'jar', 'tornadoModules'
+  // Inputs, so that the bundle is rebuilt whenever a jar or the TornadoVM SDK changes.
+  inputs.files(tasks.jar.archiveFile, configurations.runtimeClasspath, tornadoArgfile, 'spark-submit-gpu.sh')
+  inputs.property('tornadoHome', tornadoHome)
   outputs.dir sparkGpuDir
   doLast {
     def out = sparkGpuDir.get().asFile
