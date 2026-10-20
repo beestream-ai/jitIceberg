@@ -129,6 +129,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    */
   private static final int STREAMS = Integer.getInteger("iceberg.tornadovm.streams", 4);
 
+  /**
+   * Streams a rewrite of a caller's file group runs on: each holds a batch's read, gathered and
+   * encoded columns at once, on the device and in cuDF's pool.
+   */
+  private static final int REWRITE_STREAMS =
+      Integer.getInteger("iceberg.tornadovm.rewriteStreams", STREAMS);
+
   private final Table table;
   private final Expression filter;
   private final Map<String, List<Region>> regions = Maps.newHashMap();
@@ -688,7 +695,22 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       // other table rewritten has. This one keeps its regions -- and its compiled kernels -- for
       // its next group.
       evictIdle(null, 0);
-      write(new Planned(null, rewriteColumns(), tasks, fileRows), List.of(), written, start);
+      Planned planned = new Planned(null, rewriteColumns(), tasks, fileRows, false);
+      if (DEBUG) {
+        System.err.printf(
+            "[mor] rewrite group: %d files, %d rows, target %d bytes -> %d rows a file; capacity %d,"
+                + " %d batches, positions %d, set %d, %d fields%n",
+            tasks.size(),
+            rows,
+            targetFileBytes,
+            fileRows,
+            planned.capacity,
+            planned.batches.size(),
+            planned.positionCapacity,
+            planned.equalityCapacity,
+            planned.layout.fields().size());
+      }
+      write(planned, List.of(), written, start);
     }
     return Lists.newArrayList(written);
   }
@@ -739,7 +761,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 + zorderColumns
                 + (planned.given ? "-given" : ""),
             planned,
-            () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns));
+            () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns),
+            planned.given ? REWRITE_STREAMS : STREAMS);
     metrics.plan((System.nanoTime() - start) / 1e6);
     return run(
         streams,
@@ -750,6 +773,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   /** The regions kept for a query shape, one a stream, rebuilt when this scan outgrows them. */
   private List<Region> reuse(
       String key, Planned planned, java.util.function.Supplier<Region> create) {
+    return reuse(key, planned, create, STREAMS);
+  }
+
+  private List<Region> reuse(
+      String key, Planned planned, java.util.function.Supplier<Region> create, int maxStreams) {
     List<Region> kept = regions.get(key);
     if (kept != null && kept.get(0).fits(planned)) {
       return kept;
@@ -758,7 +786,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       kept.forEach(Region::close);
     }
     // Planned tasks someone else will send more of get every stream from the start.
-    int streams = Math.max(1, planned.given ? STREAMS : Math.min(STREAMS, planned.batches.size()));
+    int streams =
+        Math.max(1, planned.given ? maxStreams : Math.min(maxStreams, planned.batches.size()));
     List<Region> created = Lists.newArrayList();
     for (int i = 0; i < streams; i++) {
       created.add(create.get());
@@ -950,15 +979,20 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * same device buffers and plans.
      */
     Planned(String groupColumn, List<String> projection, List<FileScanTask> given) {
-      this(groupColumn, projection, given, BATCH_ROWS);
+      this(groupColumn, projection, given, BATCH_ROWS, true);
     }
 
-    /** {@code givenBatchRows}: the most rows a batch of given tasks holds. */
+    /**
+     * {@code givenBatchRows}: the most rows a batch of given tasks holds. {@code padGiven}: whether
+     * their sizes are rounded up for the next caller's tasks -- a reader's; a rewrite plans its
+     * whole group up front and sizes the device to it exactly.
+     */
     Planned(
         String groupColumn,
         List<String> projection,
         List<FileScanTask> given,
-        long givenBatchRows) {
+        long givenBatchRows,
+        boolean padGiven) {
       this.snapshotId =
           table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
       this.given = given != null;
@@ -1097,7 +1131,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           (int)
               Math.min(
                   Integer.MAX_VALUE / 8,
-                  (Math.max(maxRows, given != null ? Math.min(BATCH_ROWS, roundUp(maxRows)) : 0)
+                  (Math.max(
+                              maxRows,
+                              given != null && padGiven
+                                  ? Math.min(BATCH_ROWS, roundUp(maxRows))
+                                  : 0)
                           + 1023)
                       / 1024
                       * 1024);
@@ -1111,7 +1149,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           given != null && stride > 1
               ? Math.min(roundUp(stride), Integer.MAX_VALUE / Math.max(1, layout.stringCount()))
               : stride;
-      boolean padded = given != null;
+      boolean padded = given != null && padGiven;
       this.equalityCapacity = (int) (padded ? roundUp(maxSet) : maxSet);
       this.positionCapacity = (int) (padded ? roundUp(maxPositions) : maxPositions);
       this.maxFiles = padded ? Math.max(64, files) : files;
