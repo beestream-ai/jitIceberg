@@ -52,6 +52,12 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
    */
   public static final String MIN_ROWS = "spark.iceberg.gpu.minRows";
 
+  /**
+   * The Spark configuration key that keeps reads on Spark while aggregates and compaction use the
+   * GPU: for join-heavy queries, whose rows Spark's CPU joins would have to get back anyway.
+   */
+  public static final String READ_ENABLED = "spark.iceberg.gpu.read.enabled";
+
   private static final long DEFAULT_MIN_ROWS = 1_000_000L;
 
   @Override
@@ -61,7 +67,9 @@ public class GpuColumnarReaderProvider implements ColumnarReaderProvider {
       Schema expectedSchema,
       boolean caseSensitive) {
     SparkEnv env = SparkEnv.get();
-    if (env == null || !env.conf().getBoolean(ENABLED, false)) {
+    if (env == null
+        || !env.conf().getBoolean(ENABLED, false)
+        || !env.conf().getBoolean(READ_ENABLED, true)) {
       return null;
     }
     if (!DeviceMergeOnReadScan.isAvailable()) {
