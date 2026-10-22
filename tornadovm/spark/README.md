@@ -57,8 +57,8 @@ spark.iceberg.gpu.read.enabled=false
 - JDK 21. The device scan uses Java's foreign-memory API, which needs `--enable-preview` on 21.
 - Spark 3.5 (Scala 2.12), **local mode**: the GPU work runs in the driver JVM.
 - A TornadoVM SDK built with the CUDA backend and the cuDF shim (`libtornado-cudf.so`), with
-  `TORNADOVM_HOME` set. That means TornadoVM 7.2 or later, plus #1215 for decimal columns, plus
-  `fix/cudf-pool-release-threshold`, so that cuDF's memory pool gives memory back between calls.
+  `TORNADOVM_HOME` set. That means TornadoVM 7.2 or later, plus #1215 for decimal columns and #1219,
+  so that cuDF's memory pool gives memory back between calls.
 - libcudf 26.08 (the `libcudf-cu12` wheels) and its dependencies on `LD_LIBRARY_PATH`.
 
 ## Build and run
