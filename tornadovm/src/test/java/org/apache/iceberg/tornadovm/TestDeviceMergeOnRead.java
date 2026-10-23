@@ -1200,6 +1200,248 @@ public class TestDeviceMergeOnRead {
     return rows;
   }
 
+  /**
+   * Equality deletes become deletion vectors: the table reads the same rows, no equality-delete
+   * file is left, each data file the deletes applied to has one deletion vector (its earlier one
+   * merged in), and a file appended after the deletes keeps the row they would have matched.
+   */
+  @Test
+  public void testConvertEqualityDeletesToDeletionVectors() throws IOException {
+    Table table = equalityDeletesToConvert("eq-to-dv");
+    List<String> before = rows(table);
+
+    DeviceMergeOnReadScan.ConversionResult result;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      result = device.convertEqualityDeletes();
+    }
+    table.refresh();
+
+    // The CPU twin converts the same table to the same deletion vectors.
+    Table twin = equalityDeletesToConvert("eq-to-dv-cpu");
+    assertThat(CpuMergeOnReadScan.of(twin, 4).convertEqualityDeletes()).isEqualTo(result);
+    twin.refresh();
+    assertThat(rows(twin)).isEqualTo(before);
+
+    assertThat(result.dataFiles()).isEqualTo(3);
+    assertThat(result.equalityDeletesRemoved()).isEqualTo(2);
+    assertThat(result.positionDeletesReplaced()).isEqualTo(1);
+    assertThat(result.vectorsAdded()).isEqualTo(3);
+    assertThat(rows(table)).isEqualTo(before);
+    assertThat(result.deletedRows()).isEqualTo(7500 - before.size());
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        assertThat(task.deletes()).hasSize(1);
+        assertThat(org.apache.iceberg.util.ContentFileUtil.isDV(task.deletes().get(0))).isTrue();
+      }
+    }
+    assertMatchesIceberg(table);
+  }
+
+  /** Position deletes, two equality deletes, and a file appended between them: v3. */
+  private Table equalityDeletesToConvert(String name) {
+    Table table = MorTables.create(temp.resolve(name).toString(), MorTables.SCHEMA, 3);
+    List<DataFile> files = writeFiles(table, 0, 4000, 3000);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(randomPositions(4000, 0.05, 5), new long[0]));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(1L, 2L, 3_999L, 1_000_002L, 9_000_000L));
+    writeFiles(table, 0, 500); // ids 1 and 2 again, after the deletes
+    MorTables.deleteEqual(table, "id", ImmutableList.of(3L, 400L, 1_000_400L));
+    table.refresh();
+    return table;
+  }
+
+  /**
+   * Rows deleted by key as deletion vectors: the table reads its earlier rows minus the keys' rows,
+   * only the files whose id bounds can hold a key get a vector (with their earlier deletes folded
+   * in), no equality-delete file is added, and the table's own equality deletes stay.
+   */
+  @Test
+  public void testDeleteKeysToDeletionVectors() throws IOException {
+    Table table = equalityDeletesToConvert("delete-keys");
+    List<String> before = rows(table);
+    // 2 and 1_000_123 exist; 300 exists in file 0 and in the file appended after the first
+    // deletes; 77_000_000 exists nowhere.
+    List<Long> keys = ImmutableList.of(2L, 300L, 1_000_123L, 77_000_000L);
+    long deleteFilesBefore = equalityDeleteFiles(table);
+
+    DeviceMergeOnReadScan.ConversionResult result;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      result = device.deleteKeys("id", keys);
+    }
+    table.refresh();
+
+    List<String> expected = Lists.newArrayList();
+    for (String row : before) {
+      long id = Long.parseLong(row.substring(0, row.indexOf('|')));
+      if (!keys.contains(id)) {
+        expected.add(row);
+      }
+    }
+    assertThat(rows(table)).isEqualTo(expected);
+    // ids 0..3999 (file 0), 1_000_000.. (file 1), 0..499 (the late file): all three can hold a key.
+    assertThat(result.dataFiles()).isEqualTo(3);
+    assertThat(result.vectorsAdded()).isEqualTo(3);
+    assertThat(result.equalityDeletesRemoved()).isZero();
+    assertThat(equalityDeleteFiles(table)).isEqualTo(deleteFilesBefore);
+    assertMatchesIceberg(table);
+
+    // A key that no file's bounds can hold changes nothing.
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      assertThat(device.deleteKeys("id", ImmutableList.of(99_000_000L)).dataFiles()).isZero();
+    }
+  }
+
+  private static long equalityDeleteFiles(Table table) throws IOException {
+    java.util.Set<String> seen = new java.util.HashSet<>();
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        for (org.apache.iceberg.DeleteFile delete : task.deletes()) {
+          if (delete.content() == org.apache.iceberg.FileContent.EQUALITY_DELETES) {
+            seen.add(delete.location());
+          }
+        }
+      }
+    }
+    return seen.size();
+  }
+
+  /**
+   * A v2 table: equality deletes become file-scoped position-delete files (v2 has no deletion
+   * vectors), one per data file with its earlier position deletes folded in; then keys deleted the
+   * same way. Both read as Iceberg's reader says.
+   */
+  @Test
+  public void testConvertAndDeleteKeysOnV2() throws IOException {
+    Table table = MorTables.create(temp.resolve("v2-convert").toString(), MorTables.SCHEMA, 2);
+    List<DataFile> files = writeFiles(table, 0, 4000, 3000);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(randomPositions(4000, 0.05, 6), everyNth(3000, 7)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(1L, 2L, 3_999L, 1_000_002L));
+    table.refresh();
+    List<String> before = rows(table);
+
+    DeviceMergeOnReadScan.ConversionResult converted;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      converted = device.convertEqualityDeletes();
+    }
+    table.refresh();
+    assertThat(converted.dataFiles()).isEqualTo(2);
+    assertThat(converted.equalityDeletesRemoved()).isEqualTo(1);
+    assertThat(converted.positionDeletesReplaced()).isEqualTo(2);
+    assertThat(converted.vectorsAdded()).isEqualTo(2);
+    assertThat(rows(table)).isEqualTo(before);
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        assertThat(task.deletes()).hasSize(1);
+        org.apache.iceberg.DeleteFile delete = task.deletes().get(0);
+        assertThat(delete.content()).isEqualTo(org.apache.iceberg.FileContent.POSITION_DELETES);
+        assertThat(org.apache.iceberg.util.ContentFileUtil.isDV(delete)).isFalse();
+        assertThat(
+                String.valueOf(org.apache.iceberg.util.ContentFileUtil.referencedDataFile(delete)))
+            .isEqualTo(task.file().location());
+      }
+    }
+
+    List<Long> keys = ImmutableList.of(5L, 1_000_010L);
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      device.deleteKeys("id", keys);
+    }
+    table.refresh();
+    List<String> expected = Lists.newArrayList();
+    for (String row : before) {
+      if (!keys.contains(Long.parseLong(row.substring(0, row.indexOf('|'))))) {
+        expected.add(row);
+      }
+    }
+    assertThat(rows(table)).isEqualTo(expected);
+    assertMatchesIceberg(table);
+  }
+
+  /**
+   * NDV statistics as Iceberg's compute_table_stats writes them: for each column the device's
+   * smallest distinct hashes are exactly the smallest hashes of a DataSketches sketch fed the live
+   * values' Iceberg serialization (as the Spark action feeds it), the estimate is exact below the
+   * sketch's size and close above it, and a Puffin statistics file with the theta blobs and their
+   * ndv property is set on the snapshot.
+   */
+  @Test
+  public void testComputeTableStats() throws IOException {
+    Table table = equalityDeletesToConvert("stats");
+    String[] columns = {"id", "k", "v1"};
+    Map<String, org.apache.datasketches.theta.UpdateSketch> reference = Maps.newHashMap();
+    Map<String, java.util.Set<Object>> distinct = Maps.newHashMap();
+    for (String column : columns) {
+      reference.put(
+          column,
+          org.apache.datasketches.theta.UpdateSketch.builder()
+              .setFamily(org.apache.datasketches.common.Family.ALPHA)
+              .build());
+      distinct.put(column, new java.util.HashSet<>());
+    }
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+      for (Record record : records) {
+        for (String column : columns) {
+          Object value = record.getField(column);
+          org.apache.iceberg.types.Type type = table.schema().findField(column).type();
+          reference
+              .get(column)
+              .update(org.apache.iceberg.types.Conversions.toByteBuffer(type, value));
+          distinct.get(column).add(value);
+        }
+      }
+    }
+
+    Map<String, Long> estimates;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      estimates = device.computeTableStats(columns);
+    }
+    table.refresh();
+
+    assertThat(estimates.get("k")).isEqualTo(distinct.get("k").size());
+    for (String column : new String[] {"id", "v1"}) {
+      long exact = distinct.get(column).size();
+      assertThat((double) estimates.get(column))
+          .isCloseTo(exact, org.assertj.core.data.Percentage.withPercentage(5));
+    }
+    assertThat(table.statisticsFiles()).hasSize(1);
+    org.apache.iceberg.StatisticsFile statistics = table.statisticsFiles().get(0);
+    assertThat(statistics.snapshotId()).isEqualTo(table.currentSnapshot().snapshotId());
+    assertThat(statistics.blobMetadata()).hasSize(3);
+    try (org.apache.iceberg.puffin.PuffinReader reader =
+        org.apache.iceberg.puffin.Puffin.read(table.io().newInputFile(statistics.path())).build()) {
+      for (org.apache.iceberg.util.Pair<org.apache.iceberg.puffin.BlobMetadata, java.nio.ByteBuffer>
+          blob : reader.readAll(reader.fileMetadata().blobs())) {
+        assertThat(blob.first().type())
+            .isEqualTo(org.apache.iceberg.puffin.StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1);
+        String column = table.schema().findField(blob.first().inputFields().get(0)).name();
+        assertThat(blob.first().properties())
+            .containsEntry("ndv", String.valueOf(estimates.get(column)));
+        org.apache.datasketches.theta.Sketch ours =
+            org.apache.datasketches.theta.CompactSketch.heapify(
+                org.apache.datasketches.memory.Memory.wrap(
+                    org.apache.iceberg.util.ByteBuffers.toByteArray(blob.second())));
+        // The hash port: our hashes are the reference sketch's smallest ones.
+        java.util.TreeSet<Long> mine = new java.util.TreeSet<>();
+        for (org.apache.datasketches.theta.HashIterator it = ours.iterator(); it.next(); ) {
+          mine.add(it.get());
+        }
+        java.util.TreeSet<Long> theirs = new java.util.TreeSet<>();
+        for (org.apache.datasketches.theta.HashIterator it =
+                reference.get(column).compact().iterator();
+            it.next(); ) {
+          theirs.add(it.get());
+        }
+        // DataSketches' own sketch keeps only the hashes below its theta, which may be below our
+        // largest: compare up to the smaller of the two.
+        assertThat(mine).isNotEmpty();
+        long upTo = Math.min(mine.last(), theirs.last());
+        assertThat(mine.headSet(upTo, true)).as(column).isEqualTo(theirs.headSet(upTo, true));
+        assertThat(mine.headSet(upTo, true).size())
+            .isGreaterThanOrEqualTo(Math.min(1000, distinct.get(column).size()));
+      }
+    }
+  }
+
   /** An equality key of type INT, which the device probes as 32-bit keys. */
   @Test
   public void testIntEqualityKey() throws IOException {

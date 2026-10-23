@@ -293,6 +293,85 @@ public class TestDeviceEvolutionAndStorage {
   }
 
   /**
+   * Equality deletes in two partitions of a partitioned v3 table become deletion vectors: only the
+   * files they apply to get a vector (their earlier one folded in), each vector carries its file's
+   * partition, the third partition is untouched, and the table reads the same rows.
+   */
+  @Test
+  public void testPartitionedConversionToDeletionVectors() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "region", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "amount", Types.DoubleType.get()));
+    PartitionSpec spec = PartitionSpec.builderFor(schema).identity("region").build();
+    Table table =
+        new org.apache.iceberg.hadoop.HadoopTables(new org.apache.hadoop.conf.Configuration())
+            .create(
+                schema,
+                spec,
+                ImmutableMap.of(TableProperties.FORMAT_VERSION, "3"),
+                temp.resolve("partitioned-dv").toString());
+    List<DataFile> files = Lists.newArrayList();
+    List<PartitionKey> keys = Lists.newArrayList();
+    for (int region = 0; region < 3; region++) {
+      int r = region;
+      GenericRecord sample = GenericRecord.create(schema);
+      sample.setField("region", r);
+      PartitionKey key = new PartitionKey(spec, schema);
+      key.partition(sample);
+      keys.add(key);
+      for (int f = 0; f < 2; f++) {
+        long base = (region * 10L + f) * 1_000_000L;
+        files.add(
+            MorTables.writeDataFile(
+                table,
+                key,
+                3000,
+                i -> {
+                  GenericRecord record = GenericRecord.create(schema);
+                  record.setField("id", base + i);
+                  record.setField("region", r);
+                  record.setField("amount", i % 7 == 0 ? null : i * 0.5);
+                  return record;
+                }));
+      }
+    }
+    MorTables.append(table, files);
+    List<long[]> positions = Lists.newArrayList();
+    for (int f = 0; f < files.size(); f++) {
+      positions.add(everyNth(3000, 5 + f));
+    }
+    MorTables.deletePositions(table, files, positions);
+    MorTables.deleteEqual(table, "id", ImmutableList.of(7L, 1_000_008L, 9L), keys.get(0));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(20_000_100L, 21_000_101L), keys.get(2));
+    table.refresh();
+    List<String> columns = ImmutableList.of("id", "region", "amount");
+    List<String> expected = icebergRows(table, columns);
+
+    DeviceMergeOnReadScan.ConversionResult result;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      result = device.convertEqualityDeletes();
+    }
+    table.refresh();
+
+    assertThat(result.dataFiles()).isEqualTo(4);
+    assertThat(result.equalityDeletesRemoved()).isEqualTo(2);
+    assertThat(result.positionDeletesReplaced()).isEqualTo(4);
+    assertThat(result.vectorsAdded()).isEqualTo(4);
+    assertThat(icebergRows(table, columns)).containsExactlyElementsOf(expected);
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        assertThat(task.deletes()).hasSize(1);
+        org.apache.iceberg.DeleteFile vector = task.deletes().get(0);
+        assertThat(org.apache.iceberg.util.ContentFileUtil.isDV(vector)).isTrue();
+        assertThat(vector.partition().get(0, Integer.class))
+            .isEqualTo(task.file().partition().get(0, Integer.class));
+      }
+    }
+  }
+
+  /**
    * A v3 table with string columns compacted on the device: the strings are gathered from the read
    * inside the write, and every row keeps its lineage (_row_id, _last_updated_sequence_number).
    */

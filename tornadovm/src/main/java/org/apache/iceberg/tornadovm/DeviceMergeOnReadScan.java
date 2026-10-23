@@ -172,6 +172,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /**
+   * Drops the local copies of object-store files ({@code s3://} and the like) that scans fetched,
+   * so the next scan reads from the store again -- for measuring cold reads.
+   */
+  public static void clearObjectStoreCache() {
+    LocalFiles.clear();
+  }
+
+  /**
    * Whether this JVM can run device scans: TornadoVM with a cuDF shim that has the typed reader.
    */
   public static boolean isAvailable() {
@@ -765,6 +773,405 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     return new RewriteResult(planned.tasks.size(), deletesSeen.size(), written.size(), rows);
   }
 
+  /** What {@link #convertEqualityDeletes()} did. */
+  public record ConversionResult(
+      int dataFiles,
+      int equalityDeletesRemoved,
+      int positionDeletesReplaced,
+      int vectorsAdded,
+      long deletedRows) {}
+
+  /**
+   * Turns a v3 table's equality deletes into deletion vectors, without rewriting a data file.
+   *
+   * <p>Every data file that equality deletes apply to is read -- its key columns only -- with all
+   * of its deletes applied, as a scan reads it. A kernel marks the rows merge-on-read drops, cuDF
+   * compacts their positions, and only those come back. Each file gets one deletion vector holding
+   * all of its deleted rows: the equality hits and its earlier deletion vector or file-scoped
+   * position deletes, which the same {@code RowDelta} replaces. The equality-delete files are
+   * removed with them: every data file they apply to was planned, so none still needs them.
+   * Validated against the snapshot that was planned; a concurrent delete fails the commit.
+   */
+  public ConversionResult convertEqualityDeletes() {
+    if (filter.op() != Expression.Operation.TRUE) {
+      throw new UnsupportedOperationException("A conversion of part of a table is not supported");
+    }
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    table.refresh();
+    if (table.currentSnapshot() == null) {
+      return new ConversionResult(0, 0, 0, 0, 0);
+    }
+    long snapshotId = table.currentSnapshot().snapshotId();
+    List<FileScanTask> tasks = Lists.newArrayList();
+    try (CloseableIterable<FileScanTask> planned =
+        table.newScan().useSnapshot(snapshotId).planFiles()) {
+      for (FileScanTask task : planned) {
+        if (task.deletes().stream().anyMatch(d -> d.content() == FileContent.EQUALITY_DELETES)) {
+          tasks.add(task);
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    if (tasks.isEmpty()) {
+      return new ConversionResult(0, 0, 0, 0, 0);
+    }
+    java.util.Set<DeleteFile> equality = Sets.newHashSet();
+    for (FileScanTask task : tasks) {
+      for (DeleteFile delete : task.deletes()) {
+        if (delete.content() == FileContent.EQUALITY_DELETES) {
+          equality.add(delete);
+        }
+      }
+    }
+    return writeVectors(snapshotId, start, tasks, equality, delta -> {});
+  }
+
+  /**
+   * Deletes the rows whose {@code column} holds one of the keys, as deletion vectors: an SQL {@code
+   * DELETE ... WHERE column IN (keys)} for a v3 table, without writing an equality-delete file for
+   * readers to apply. What a CDC writer does for keys it has seen before, with their positions
+   * found on the device instead of left to every reader.
+   *
+   * <p>Iceberg prunes the data files by the column's bounds; the device reads the column of the
+   * files that remain, with every delete already applying to them, and each such file gets one
+   * deletion vector holding its earlier deletes and the new ones. One {@code RowDelta} adds the
+   * vectors and replaces the files' earlier vectors or file-scoped position deletes. It validates
+   * against the planned snapshot, fails on concurrent deletes and on data files added since that
+   * could hold one of the keys. Equality-delete files already in the table stay as they are.
+   */
+  public ConversionResult deleteKeys(String column, java.util.Collection<?> keys) {
+    if (filter.op() != Expression.Operation.TRUE) {
+      throw new UnsupportedOperationException("A delete on a filtered scan is not supported");
+    }
+    Types.NestedField field = table.schema().findField(column);
+    if (field == null) {
+      throw new IllegalArgumentException("No column " + column);
+    }
+    boolean intKey = field.type().typeId() == org.apache.iceberg.types.Type.TypeID.INTEGER;
+    if (!intKey && field.type().typeId() != org.apache.iceberg.types.Type.TypeID.LONG) {
+      throw new UnsupportedOperationException(
+          "Keys of type " + field.type() + " are not supported");
+    }
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    table.refresh();
+    if (table.currentSnapshot() == null || keys.isEmpty()) {
+      return new ConversionResult(0, 0, 0, 0, 0);
+    }
+    long snapshotId = table.currentSnapshot().snapshotId();
+    List<Object> values = Lists.newArrayList();
+    for (Object key : keys) {
+      values.add(intKey ? (Object) ((Number) key).intValue() : (Object) ((Number) key).longValue());
+    }
+    // Up to IN_KEYS keys prune by each one; more by their range, which costs Iceberg's metrics
+    // evaluation nothing per key (an IN of 500,000 literals took most of a 0.8 s delete) and prunes
+    // the same files when the keys spread over the column's values, as upserts' do.
+    Expression matching;
+    if (values.size() <= IN_KEYS) {
+      matching = Expressions.in(column, values);
+    } else {
+      long low = Long.MAX_VALUE;
+      long high = Long.MIN_VALUE;
+      for (Object value : values) {
+        long key = ((Number) value).longValue();
+        low = Math.min(low, key);
+        high = Math.max(high, key);
+      }
+      matching =
+          intKey
+              ? Expressions.and(
+                  Expressions.greaterThanOrEqual(column, (int) low),
+                  Expressions.lessThanOrEqual(column, (int) high))
+              : Expressions.and(
+                  Expressions.greaterThanOrEqual(column, low),
+                  Expressions.lessThanOrEqual(column, high));
+    }
+    // Files that may hold a key, by their bounds; their tasks come from a plan without the filter,
+    // so that no residual drops the rows that do not match.
+    Set<String> candidates = Sets.newHashSet();
+    try (CloseableIterable<FileScanTask> pruned =
+        table.newScan().useSnapshot(snapshotId).filter(matching).planFiles()) {
+      pruned.forEach(task -> candidates.add(task.file().location()));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    if (candidates.isEmpty()) {
+      return new ConversionResult(0, 0, 0, 0, 0);
+    }
+    long[] held = new long[values.size()];
+    for (int i = 0; i < held.length; i++) {
+      held[i] = ((Number) values.get(i)).longValue();
+    }
+    DeleteFile keyFile = keyFile(field, HostDeletes.provide(held), held.length);
+    List<FileScanTask> tasks = Lists.newArrayList();
+    try (CloseableIterable<FileScanTask> planned =
+        table.newScan().useSnapshot(snapshotId).planFiles()) {
+      for (FileScanTask task : planned) {
+        if (candidates.contains(task.file().location())) {
+          tasks.add(new WithKeys(task, keyFile));
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    try {
+      return writeVectors(
+          snapshotId,
+          start,
+          tasks,
+          Set.of(),
+          delta -> delta.conflictDetectionFilter(matching).validateNoConflictingDataFiles());
+    } finally {
+      HostDeletes.forget(keyFile.location());
+    }
+  }
+
+  private static final int IN_KEYS =
+      Integer.getInteger("iceberg.tornadovm.deleteKeys.inLimit", 1000);
+
+  /**
+   * An equality-delete file that names keys held in memory ({@link HostDeletes#provide}): never
+   * written, never committed, only attached to the tasks the device runs.
+   */
+  private static DeleteFile keyFile(Types.NestedField field, String location, long count) {
+    return org.apache.iceberg.FileMetadata.deleteFileBuilder(
+            org.apache.iceberg.PartitionSpec.unpartitioned())
+        .ofEqualityDeletes(field.fieldId())
+        .withPath(location)
+        .withFormat(org.apache.iceberg.FileFormat.PARQUET)
+        .withFileSizeInBytes(0)
+        .withRecordCount(count)
+        .build();
+  }
+
+  /** A planned task with one more delete file, for the device only. */
+  private static final class WithKeys implements FileScanTask {
+    private final FileScanTask task;
+    private final List<DeleteFile> deletes;
+
+    WithKeys(FileScanTask task, DeleteFile keys) {
+      this.task = task;
+      List<DeleteFile> all = Lists.newArrayList(task.deletes());
+      all.add(keys);
+      this.deletes = List.copyOf(all);
+    }
+
+    @Override
+    public DataFile file() {
+      return task.file();
+    }
+
+    @Override
+    public List<DeleteFile> deletes() {
+      return deletes;
+    }
+
+    @Override
+    public org.apache.iceberg.PartitionSpec spec() {
+      return task.spec();
+    }
+
+    @Override
+    public long start() {
+      return task.start();
+    }
+
+    @Override
+    public long length() {
+      return task.length();
+    }
+
+    @Override
+    public Expression residual() {
+      return task.residual();
+    }
+
+    @Override
+    public Iterable<FileScanTask> split(long splitSize) {
+      return List.of(this);
+    }
+  }
+
+  /**
+   * The shared tail of {@link #convertEqualityDeletes()} and {@link #deleteKeys}: every row the
+   * tasks' deletes drop goes into one deletion vector per data file (v3), or one file-scoped
+   * position-delete file per data file (v2), which replaces the file's earlier vector or
+   * file-scoped position deletes; {@code removed} are further delete files the commit removes, and
+   * {@code validate} adds the operation's own checks.
+   */
+  private ConversionResult writeVectors(
+      long snapshotId,
+      long start,
+      List<FileScanTask> tasks,
+      Set<DeleteFile> removed,
+      Consumer<org.apache.iceberg.RowDelta> validate) {
+    java.util.Set<DeleteFile> replaced = Sets.newHashSet();
+    for (FileScanTask task : tasks) {
+      for (DeleteFile delete : task.deletes()) {
+        if (delete.content() == FileContent.EQUALITY_DELETES) {
+          continue;
+        } else if (org.apache.iceberg.util.ContentFileUtil.isDV(delete)
+            || org.apache.iceberg.util.ContentFileUtil.referencedDataFile(delete) != null) {
+          replaced.add(delete);
+        } else {
+          throw new UnsupportedOperationException(
+              "A partition-scoped position delete file applies: " + delete.location());
+        }
+      }
+    }
+    List<String> keys = Lists.newArrayList();
+    for (int keyId : HostDeletes.equalityKeyIds(tasks)) {
+      keys.add(table.schema().findField(keyId).name());
+    }
+    Planned planned = new Planned(null, keys, tasks, BATCH_ROWS, false, false);
+    PositionSink writer =
+        org.apache.iceberg.TableUtil.formatVersion(table) >= 3
+            ? PositionSink.vectors(table, start)
+            : PositionSink.positionFiles(table, start);
+    List<Region> streams =
+        reuse("dead:" + String.join(",", keys), planned, () -> new DeadRegion(planned));
+    metrics.plan((System.nanoTime() - start) / 1e6);
+    long runStart = System.nanoTime();
+    long dead =
+        run(
+            streams,
+            planned,
+            (region, executed) -> ((DeadRegion) region).collect(executed, writer));
+    metrics.run((System.nanoTime() - runStart) / 1e6);
+    long writeStart = System.nanoTime();
+    List<DeleteFile> vectors;
+    try {
+      vectors = writer.close();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    metrics.write((System.nanoTime() - writeStart) / 1e6);
+    org.apache.iceberg.RowDelta delta =
+        table
+            .newRowDelta()
+            .validateFromSnapshot(snapshotId)
+            .validateNoConflictingDeleteFiles()
+            .validateDeletedFiles();
+    validate.accept(delta);
+    removed.forEach(delta::removeDeletes);
+    replaced.forEach(delta::removeDeletes);
+    vectors.forEach(delta::addDeletes);
+    long commitStart = System.nanoTime();
+    delta.commit();
+    metrics.commit((System.nanoTime() - commitStart) / 1e6);
+    metrics.total((System.nanoTime() - start) / 1e6);
+    return new ConversionResult(
+        tasks.size(), removed.size(), replaced.size(), vectors.size(), dead);
+  }
+
+  /**
+   * Nominal entries of the theta sketches: what Iceberg's compute_table_stats builds by default.
+   */
+  private static final int SKETCH_ENTRIES = 4096;
+
+  /**
+   * Iceberg's {@code compute_table_stats} on the device: for each column, the number of distinct
+   * values as an Apache DataSketches theta sketch, written to a Puffin statistics file and set on
+   * the current snapshot -- the blob type ({@code apache-datasketches-theta-v1}), {@code ndv}
+   * property and commit the Spark action writes, so planners that read Iceberg's NDV statistics use
+   * these as they are.
+   *
+   * <p>The device hashes every live value as DataSketches does (MurmurHash3, seed 9001, of the
+   * value's Iceberg serialization), sorts each batch's hashes, and keeps the smallest {@value
+   * #SKETCH_ENTRIES} + 1 distinct ones; only those come back. The host merges the batches and
+   * writes the compact sketch: the {@value #SKETCH_ENTRIES} smallest distinct hashes and, past
+   * them, theta. Columns of int, long, date, timestamp and double. Returns each column's estimate.
+   */
+  public Map<String, Long> computeTableStats(String... columns) {
+    if (filter.op() != Expression.Operation.TRUE) {
+      throw new UnsupportedOperationException("Statistics of part of a table are not supported");
+    }
+    table.refresh();
+    org.apache.iceberg.Snapshot snapshot = table.currentSnapshot();
+    if (snapshot == null) {
+      return Map.of();
+    }
+    metrics = new ScanMetrics();
+    long start = System.nanoTime();
+    Planned planned = new Planned(null, List.of(columns));
+    List<Types.NestedField> fields = Lists.newArrayList();
+    for (String column : columns) {
+      Types.NestedField field = table.schema().findField(column);
+      if (field == null) {
+        throw new IllegalArgumentException("No column " + column);
+      }
+      switch (field.type().typeId()) {
+        case INTEGER, DATE, LONG, TIMESTAMP, DOUBLE -> fields.add(field);
+        default ->
+            throw new UnsupportedOperationException(
+                "Statistics of " + field.type() + " columns are not supported on the device");
+      }
+    }
+    List<java.util.TreeSet<Long>> smallest = Lists.newArrayList();
+    fields.forEach(field -> smallest.add(new java.util.TreeSet<>()));
+    List<Region> streams =
+        reuse(
+            "stats:" + String.join(",", columns),
+            planned,
+            () -> new StatsRegion(planned, fields, SKETCH_ENTRIES + 1));
+    metrics.plan((System.nanoTime() - start) / 1e6);
+    long runStart = System.nanoTime();
+    run(
+        streams,
+        planned,
+        (region, executed) ->
+            ((StatsRegion) region).collect(executed, smallest, SKETCH_ENTRIES + 1));
+    metrics.run((System.nanoTime() - runStart) / 1e6);
+
+    long writeStart = System.nanoTime();
+    Map<String, Long> estimates = new java.util.LinkedHashMap<>();
+    String location =
+        table
+            .locationProvider()
+            .newDataLocation("stats-" + java.util.UUID.randomUUID() + ".puffin");
+    org.apache.iceberg.io.OutputFile output = table.io().newOutputFile(location);
+    org.apache.iceberg.StatisticsFile statistics;
+    try (org.apache.iceberg.puffin.PuffinWriter writer =
+        org.apache.iceberg.puffin.Puffin.write(output).createdBy("iceberg-tornadovm").build()) {
+      for (int c = 0; c < fields.size(); c++) {
+        byte[] sketch = ThetaSketches.compact(smallest.get(c), SKETCH_ENTRIES);
+        long estimate =
+            (long)
+                org.apache.datasketches.theta.CompactSketch.heapify(
+                        org.apache.datasketches.memory.Memory.wrap(sketch))
+                    .getEstimate();
+        estimates.put(fields.get(c).name(), estimate);
+        writer.add(
+            new org.apache.iceberg.puffin.Blob(
+                org.apache.iceberg.puffin.StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1,
+                List.of(fields.get(c).fieldId()),
+                snapshot.snapshotId(),
+                snapshot.sequenceNumber(),
+                java.nio.ByteBuffer.wrap(sketch),
+                org.apache.iceberg.puffin.PuffinCompressionCodec.ZSTD,
+                Map.of("ndv", String.valueOf(estimate))));
+      }
+      writer.finish();
+      statistics =
+          new org.apache.iceberg.GenericStatisticsFile(
+              snapshot.snapshotId(),
+              output.location(),
+              writer.fileSize(),
+              writer.footerSize(),
+              org.apache.iceberg.GenericBlobMetadata.from(writer.writtenBlobsMetadata()));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    metrics.write((System.nanoTime() - writeStart) / 1e6);
+    long commitStart = System.nanoTime();
+    table.updateStatistics().setStatistics(statistics).commit();
+    metrics.commit((System.nanoTime() - commitStart) / 1e6);
+    metrics.total((System.nanoTime() - start) / 1e6);
+    return estimates;
+  }
+
   /**
    * The live rows of file scan tasks someone else planned -- a file group of Spark's {@code
    * rewrite_data_files}, say -- written into new data files on the device, as {@link
@@ -1319,12 +1726,26 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.host = new HostDeletes(table, layout, equalityKeyId, true).withKeyIds(keyIds);
       // Files on an object store are fetched to the local cache together, before their footers
       // are read below.
-      List<String> locations = Lists.newArrayList();
+      // Data files bring only the columns the device reads (a rewrite reads them all); delete
+      // files come whole.
+      List<String> dataLocations = Lists.newArrayList();
+      List<String> deleteLocations = Lists.newArrayList();
       for (FileScanTask task : tasks) {
-        locations.add(task.file().location());
-        task.deletes().forEach(delete -> locations.add(delete.location()));
+        dataLocations.add(task.file().location());
+        for (DeleteFile delete : task.deletes()) {
+          if (!HostDeletes.isProvided(delete.location())) {
+            deleteLocations.add(delete.location());
+          }
+        }
       }
-      LocalFiles.prefetch(locations, table.io());
+      Set<Integer> readIds = Sets.newHashSet();
+      layout.fields().forEach(field -> readIds.add(field.fieldId()));
+      if (rewrite) {
+        LocalFiles.prefetch(dataLocations, table.io());
+      } else {
+        LocalFiles.prefetch(dataLocations, table.io(), readIds);
+      }
+      LocalFiles.prefetch(deleteLocations, table.io());
       this.equalityKeyType = equalityKeyId == null ? null : layout.type(equalityKeyId);
       this.keyNullable =
           equalityKeyId != null && table.schema().findField(equalityKeyId).isOptional();
@@ -3082,6 +3503,335 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
               .withMetrics(fileMetrics)
               .build());
       return rows;
+    }
+  }
+
+  /** The positions merge-on-read deletes in each batch's files, for deletion vectors. */
+  private static final class DeadRegion extends Region {
+    private final ByteArray dead = hostBytes(capacity);
+    private final IntArray droppedRows = hostInts(capacity);
+    private final IntArray deadCount = hostInts(1);
+    private HostDeletes.FilePrep prep;
+
+    DeadRegion(Planned planned) {
+      super(planned);
+    }
+
+    @Override
+    List<String> extraTasks() {
+      return List.of("dead");
+    }
+
+    @Override
+    void consumer(TaskGraph graph) {
+      graph
+          .task("dead", DeviceKernels::deadRows, context, meta, live, dead)
+          .libraryTask(
+              "droppedRows",
+              Cudf::selectedIndices,
+              capacity,
+              capacity,
+              dead,
+              droppedRows,
+              deadCount)
+          .transferToHost(DataTransferMode.UNDER_DEMAND, deadCount, droppedRows);
+    }
+
+    @Override
+    void stageOutput(HostDeletes.FilePrep batch) {
+      this.prep = batch;
+    }
+
+    /** Hands the batch's deleted positions, by data file, to the writer; how many there were. */
+    long collect(TornadoExecutionResult executed, PositionSink writer) {
+      executed.transferToHost(deadCount);
+      int rows = deadCount.get(0);
+      if (rows > 0) {
+        executed.transferToHost(new DataRange(droppedRows).withSize(rows));
+      }
+      List<Integer> starts = prep.fileStarts();
+      List<FileScanTask> tasks = prep.tasks();
+      synchronized (writer) {
+        int file = 0;
+        // Ascending positions: each file's run follows the previous one's.
+        for (int r = 0; r < rows; r++) {
+          int position = droppedRows.get(r);
+          while (file + 1 < starts.size() && position >= starts.get(file + 1)) {
+            file++;
+          }
+          DataFile data = tasks.get(file).file();
+          writer.delete(
+              data.location(),
+              position - starts.get(file),
+              tasks.get(file).spec(),
+              data.partition());
+        }
+      }
+      return rows;
+    }
+  }
+
+  /**
+   * Where a maintenance operation's deleted positions go: one deletion vector per data file for a
+   * v3 table, one file-scoped position-delete file per data file for a v2 table -- what Iceberg's
+   * own writers produce for each version ({@code DeleteGranularity.FILE} for v2).
+   */
+  interface PositionSink {
+    void delete(
+        String path,
+        long position,
+        org.apache.iceberg.PartitionSpec spec,
+        org.apache.iceberg.StructLike partition);
+
+    /** Writes what was collected; the delete files written. */
+    List<DeleteFile> close() throws IOException;
+
+    static PositionSink vectors(Table table, long operationId) {
+      org.apache.iceberg.io.OutputFileFactory files =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, operationId)
+              .format(org.apache.iceberg.FileFormat.PUFFIN)
+              .build();
+      // Earlier deletes are already in the live mask: nothing to load.
+      org.apache.iceberg.deletes.BaseDVFileWriter writer =
+          new org.apache.iceberg.deletes.BaseDVFileWriter(files, path -> null);
+      return new PositionSink() {
+        @Override
+        public void delete(
+            String path,
+            long position,
+            org.apache.iceberg.PartitionSpec spec,
+            org.apache.iceberg.StructLike partition) {
+          writer.delete(path, position, spec, partition);
+        }
+
+        @Override
+        public List<DeleteFile> close() throws IOException {
+          writer.close();
+          return writer.result().deleteFiles();
+        }
+      };
+    }
+
+    static PositionSink positionFiles(Table table, long operationId) {
+      org.apache.iceberg.io.OutputFileFactory files =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, operationId)
+              .format(org.apache.iceberg.FileFormat.PARQUET)
+              .build();
+      Map<String, FilePositions> byFile = new java.util.TreeMap<>();
+      return new PositionSink() {
+        @Override
+        public void delete(
+            String path,
+            long position,
+            org.apache.iceberg.PartitionSpec spec,
+            org.apache.iceberg.StructLike partition) {
+          byFile.computeIfAbsent(path, p -> new FilePositions(spec, partition)).add(position);
+        }
+
+        @Override
+        public List<DeleteFile> close() throws IOException {
+          // One delete file a data file, each written on its own thread: Iceberg's generic
+          // Parquet writer takes one row at a time (9.5M positions took 4.9 s on one thread).
+          List<Map.Entry<String, FilePositions>> entries = Lists.newArrayList(byFile.entrySet());
+          ExecutorService writers =
+              Executors.newFixedThreadPool(
+                  Math.max(
+                      1, Math.min(entries.size(), Runtime.getRuntime().availableProcessors())));
+          try {
+            List<java.util.concurrent.Future<DeleteFile>> futures = Lists.newArrayList();
+            for (Map.Entry<String, FilePositions> entry : entries) {
+              futures.add(writers.submit(() -> write(entry.getKey(), entry.getValue())));
+            }
+            List<DeleteFile> written = Lists.newArrayList();
+            for (java.util.concurrent.Future<DeleteFile> future : futures) {
+              written.add(future.get());
+            }
+            return written;
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(e);
+          } catch (java.util.concurrent.ExecutionException e) {
+            throw new IOException(e.getCause());
+          } finally {
+            writers.shutdownNow();
+          }
+        }
+
+        private DeleteFile write(String path, FilePositions file) throws IOException {
+          org.apache.iceberg.deletes.PositionDelete<org.apache.iceberg.data.Record> row =
+              org.apache.iceberg.deletes.PositionDelete.create();
+          {
+            // Full bounds on file_path (forPositionDelete) are what mark the file as scoped to
+            // one data file.
+            org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record> writer =
+                org.apache.iceberg.formats.FormatModelRegistry
+                    .<org.apache.iceberg.data.Record>positionDeleteWriteBuilder(
+                        org.apache.iceberg.FileFormat.PARQUET,
+                        files.newOutputFile(file.spec, file.partition))
+                    .spec(file.spec)
+                    .partition(file.partition)
+                    .metricsConfig(org.apache.iceberg.MetricsConfig.forPositionDelete())
+                    .build();
+            try (org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record>
+                closing = writer) {
+              java.util.Arrays.sort(file.positions, 0, file.count);
+              for (int i = 0; i < file.count; i++) {
+                closing.write(row.set(path, file.positions[i]));
+              }
+            }
+            return writer.toDeleteFile();
+          }
+        }
+      };
+    }
+  }
+
+  /** One data file's deleted positions, for a position-delete file. */
+  private static final class FilePositions {
+    private final org.apache.iceberg.PartitionSpec spec;
+    private final org.apache.iceberg.StructLike partition;
+    private long[] positions = new long[1024];
+    private int count = 0;
+
+    FilePositions(org.apache.iceberg.PartitionSpec spec, org.apache.iceberg.StructLike partition) {
+      this.spec = spec;
+      this.partition = partition;
+    }
+
+    void add(long position) {
+      if (count == positions.length) {
+        positions = java.util.Arrays.copyOf(positions, count * 2);
+      }
+      positions[count++] = position;
+    }
+  }
+
+  /** Per batch, the smallest distinct theta-sketch hashes of each statistics column. */
+  private static final class StatsRegion extends Region {
+    private final int statsColumns;
+    private final int keep;
+    private final IntArray[] specs;
+    private final LongArray[] hashes;
+    private final LongArray[] sorted;
+    private final ByteArray[] firsts;
+    private final IntArray[] firstIndices;
+    private final IntArray[] counts;
+    private final LongArray[] kept;
+    private final int[][] sizes;
+
+    StatsRegion(Planned planned, List<Types.NestedField> fields, int keep) {
+      super(planned);
+      this.statsColumns = fields.size();
+      this.keep = keep;
+      this.specs = new IntArray[statsColumns];
+      this.hashes = new LongArray[statsColumns];
+      this.sorted = new LongArray[statsColumns];
+      this.firsts = new ByteArray[statsColumns];
+      this.firstIndices = new IntArray[statsColumns];
+      this.counts = new IntArray[statsColumns];
+      this.kept = new LongArray[statsColumns];
+      this.sizes = new int[statsColumns][];
+      for (int c = 0; c < statsColumns; c++) {
+        Types.NestedField field = fields.get(c);
+        CudfType type = layout.type(field.fieldId());
+        specs[c] = hostInts(3);
+        specs[c].set(
+            0,
+            type == CudfType.INT32
+                ? DeviceKernels.STATS_INT
+                : type == CudfType.INT64 ? DeviceKernels.STATS_LONG : DeviceKernels.STATS_DOUBLE);
+        specs[c].set(1, layout.slot(field.fieldId()));
+        specs[c].set(
+            2, layout.anyOptional() && field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
+        hashes[c] = hostLongs(capacity);
+        sorted[c] = hostLongs(capacity);
+        firsts[c] = hostBytes(capacity);
+        firstIndices[c] = hostInts(capacity);
+        counts[c] = hostInts(1);
+        kept[c] = hostLongs(keep);
+        sizes[c] = new int[] {capacity};
+      }
+    }
+
+    @Override
+    List<String> extraTasks() {
+      List<String> tasks = Lists.newArrayList();
+      for (int c = 0; c < statsColumns; c++) {
+        tasks.add("statsHash" + c);
+        tasks.add("statsFirsts" + c);
+        tasks.add("statsKeep" + c);
+      }
+      return tasks;
+    }
+
+    @Override
+    void consumer(TaskGraph graph) {
+      for (int c = 0; c < statsColumns; c++) {
+        graph
+            .transferToDevice(DataTransferMode.FIRST_EXECUTION, specs[c])
+            .task(
+                "statsHash" + c,
+                DeviceKernels::statsHashes,
+                context,
+                meta,
+                live,
+                ints,
+                longs,
+                doubles,
+                valid,
+                specs[c],
+                capacity,
+                hashes[c])
+            .libraryTask("statsSort" + c, Cudf::sortKeys, sizes[c], hashes[c], sorted[c])
+            .task(
+                "statsFirsts" + c,
+                DeviceKernels::firstOfRuns,
+                context,
+                sorted[c],
+                capacity,
+                firsts[c])
+            .libraryTask(
+                "statsSelect" + c,
+                Cudf::selectedIndices,
+                capacity,
+                capacity,
+                firsts[c],
+                firstIndices[c],
+                counts[c])
+            .task(
+                "statsKeep" + c,
+                DeviceKernels::gatherFirsts,
+                context,
+                firstIndices[c],
+                counts[c],
+                sorted[c],
+                keep,
+                kept[c])
+            .transferToHost(DataTransferMode.UNDER_DEMAND, kept[c]);
+      }
+    }
+
+    /** Folds the batch's smallest distinct hashes into each column's running set. */
+    long collect(
+        TornadoExecutionResult executed, List<java.util.TreeSet<Long>> smallest, int limit) {
+      for (int c = 0; c < statsColumns; c++) {
+        executed.transferToHost(kept[c]);
+        java.util.TreeSet<Long> set = smallest.get(c);
+        synchronized (set) {
+          for (int j = 0; j < keep; j++) {
+            long hash = kept[c].get(j);
+            if (hash == Long.MAX_VALUE) {
+              break;
+            }
+            if (set.size() < limit) {
+              set.add(hash);
+            } else if (hash < set.last() && set.add(hash)) {
+              set.pollLast();
+            }
+          }
+        }
+      }
+      return 0;
     }
   }
 }

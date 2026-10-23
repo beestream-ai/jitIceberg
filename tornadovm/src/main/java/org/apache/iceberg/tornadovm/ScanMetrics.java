@@ -27,6 +27,12 @@ public final class ScanMetrics {
   private double deviceMillis;
   private double copyBackMillis;
   private double totalMillis;
+  // A maintenance operation's phases after planning: the batches on the device (wall clock),
+  // writing
+  // its output files on the host, and the Iceberg commit.
+  private double runMillis;
+  private double writeMillis;
+  private double commitMillis;
   private long batches;
   private long files;
   private long rowsRead;
@@ -49,6 +55,30 @@ public final class ScanMetrics {
 
   synchronized void copyBack(double millis) {
     copyBackMillis += millis;
+  }
+
+  synchronized void run(double millis) {
+    runMillis += millis;
+  }
+
+  synchronized void write(double millis) {
+    writeMillis += millis;
+  }
+
+  synchronized void commit(double millis) {
+    commitMillis += millis;
+  }
+
+  public double runMillis() {
+    return runMillis;
+  }
+
+  public double writeMillis() {
+    return writeMillis;
+  }
+
+  public double commitMillis() {
+    return commitMillis;
   }
 
   synchronized void total(double millis) {
@@ -99,6 +129,20 @@ public final class ScanMetrics {
 
   public long rowsLive() {
     return rowsLive;
+  }
+
+  /**
+   * Planning, the device run, writing and committing: where a maintenance operation's time went.
+   */
+  public String phases() {
+    return String.format(
+        Locale.ROOT,
+        "plan %.1f, run %.1f, write %.1f, commit %.1f, total %.1f ms",
+        planMillis,
+        runMillis,
+        writeMillis,
+        commitMillis,
+        totalMillis);
   }
 
   @Override

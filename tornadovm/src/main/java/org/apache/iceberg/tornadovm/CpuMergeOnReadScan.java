@@ -178,9 +178,125 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     }
   }
 
+  /**
+   * {@link DeviceMergeOnReadScan#convertEqualityDeletes()} on the CPU, for comparison: the same
+   * files, read the same way (key columns only, every delete applied), each file's deleted
+   * positions written into one deletion vector, and the same {@code RowDelta}.
+   */
+  public DeviceMergeOnReadScan.ConversionResult convertEqualityDeletes() {
+    table.refresh();
+    long snapshotId = table.currentSnapshot().snapshotId();
+    List<String> keys = Lists.newArrayList();
+    java.util.Set<DeleteFile> equality =
+        org.apache.iceberg.relocated.com.google.common.collect.Sets.newHashSet();
+    java.util.Set<DeleteFile> replaced =
+        org.apache.iceberg.relocated.com.google.common.collect.Sets.newHashSet();
+    try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+      for (FileScanTask task : planned) {
+        for (DeleteFile delete : task.deletes()) {
+          if (delete.content() == org.apache.iceberg.FileContent.EQUALITY_DELETES) {
+            equality.add(delete);
+            for (int id : delete.equalityFieldIds()) {
+              String name = table.schema().findField(id).name();
+              if (!keys.contains(name)) {
+                keys.add(name);
+              }
+            }
+          }
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    org.apache.iceberg.io.OutputFileFactory files =
+        org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, System.nanoTime())
+            .format(org.apache.iceberg.FileFormat.PUFFIN)
+            .build();
+    org.apache.iceberg.deletes.BaseDVFileWriter writer =
+        new org.apache.iceberg.deletes.BaseDVFileWriter(files, path -> null);
+    long[] dead = new long[1];
+    int[] converted = new int[1];
+    run(
+        keys,
+        (file, columnIndex) -> new DeadSink(file),
+        sinks -> {
+          // Only the files equality deletes apply to were read.
+          for (DeadSink sink : sinks) {
+            converted[0]++;
+            for (int i = 0; i < sink.count; i++) {
+              writer.delete(
+                  sink.file.location(),
+                  sink.positions[i],
+                  table.specs().get(sink.file.specId()),
+                  sink.file.partition());
+            }
+            dead[0] += sink.count;
+          }
+        },
+        task -> {
+          boolean hasEquality =
+              task.deletes().stream()
+                  .anyMatch(d -> d.content() == org.apache.iceberg.FileContent.EQUALITY_DELETES);
+          if (hasEquality) {
+            task.deletes().stream()
+                .filter(d -> d.content() != org.apache.iceberg.FileContent.EQUALITY_DELETES)
+                .forEach(replaced::add);
+          }
+          return hasEquality;
+        });
+    try {
+      writer.close();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    List<DeleteFile> vectors = writer.result().deleteFiles();
+    org.apache.iceberg.RowDelta delta =
+        table
+            .newRowDelta()
+            .validateFromSnapshot(snapshotId)
+            .validateNoConflictingDeleteFiles()
+            .validateDeletedFiles();
+    equality.forEach(delta::removeDeletes);
+    replaced.forEach(delta::removeDeletes);
+    vectors.forEach(delta::addDeletes);
+    delta.commit();
+    return new DeviceMergeOnReadScan.ConversionResult(
+        converted[0], equality.size(), replaced.size(), vectors.size(), dead[0]);
+  }
+
+  /** One file's deleted positions, ascending. */
+  private static final class DeadSink implements Sink {
+    private final DataFile file;
+    private long[] positions = new long[1024];
+    private int count = 0;
+
+    DeadSink(DataFile file) {
+      this.file = file;
+    }
+
+    @Override
+    public void accept(ColumnarBatch batch, int row) {}
+
+    @Override
+    public void deleted(long position) {
+      if (count == positions.length) {
+        positions = java.util.Arrays.copyOf(positions, count * 2);
+      }
+      positions[count++] = position;
+    }
+
+    @Override
+    public int rows() {
+      return 0;
+    }
+  }
+
   /** What one thread accumulates over the live rows of one data file. */
   private interface Sink {
     void accept(ColumnarBatch batch, int row);
+
+    /** A row of the file, by position, that a delete drops. */
+    default void deleted(long position) {}
 
     int rows();
   }
@@ -191,11 +307,24 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
 
   private <S extends Sink> long run(
       List<String> projection, SinkFactory<S> factory, Consumer<List<S>> finish) {
+    return run(projection, factory, finish, task -> true);
+  }
+
+  /** {@code include}: which planned tasks to read. */
+  private <S extends Sink> long run(
+      List<String> projection,
+      SinkFactory<S> factory,
+      Consumer<List<S>> finish,
+      java.util.function.Predicate<FileScanTask> include) {
     metrics = new ScanMetrics();
     long start = System.nanoTime();
-    List<FileScanTask> tasks;
+    List<FileScanTask> tasks = Lists.newArrayList();
     try (CloseableIterable<FileScanTask> planned = table.newScan().filter(filter).planFiles()) {
-      tasks = Lists.newArrayList(planned);
+      for (FileScanTask task : planned) {
+        if (include.test(task)) {
+          tasks.add(task);
+        }
+      }
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -287,14 +416,17 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
                       for (int r = 0; r < rows; r++) {
                         long pos = position + r;
                         if (bits != null && ((bits[(int) (pos >> 3)] >> (pos & 7)) & 1) == 1) {
+                          sink.deleted(pos);
                           continue;
                         }
                         if (set != null) {
                           if (key.isNullAt(r)) {
                             if (setHasNull) {
+                              sink.deleted(pos);
                               continue;
                             }
                           } else if (set.contains(keyIsInt ? key.getInt(r) : key.getLong(r))) {
+                            sink.deleted(pos);
                             continue;
                           }
                         }
@@ -308,6 +440,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
                                     : keyInts[c] ? column.getInt(r) : column.getLong(r);
                           }
                           if (keySet.contains(keyValues, keyNulls)) {
+                            sink.deleted(pos);
                             continue;
                           }
                         }

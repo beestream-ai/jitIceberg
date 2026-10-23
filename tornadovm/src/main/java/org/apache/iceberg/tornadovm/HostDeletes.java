@@ -101,6 +101,8 @@ final class HostDeletes {
     private final List<Long> firstRowIds = Lists.newArrayList();
     private final List<Long> sequences = Lists.newArrayList();
     private boolean storedLineage;
+    // The batch's file scan tasks, in the order fileStarts lists them.
+    private final List<FileScanTask> tasks = Lists.newArrayList();
 
     String path() {
       return path;
@@ -155,6 +157,10 @@ final class HostDeletes {
 
     List<Long> sequences() {
       return sequences;
+    }
+
+    List<FileScanTask> tasks() {
+      return tasks;
     }
 
     /** True when a data file of the batch stores lineage columns of its own. */
@@ -506,6 +512,7 @@ final class HostDeletes {
       }
       paths.append(path);
       prep.fileStarts.add((int) offset);
+      prep.tasks.add(task);
       prep.firstRowIds.add(task.file().firstRowId());
       prep.sequences.add(task.file().dataSequenceNumber());
 
@@ -588,7 +595,8 @@ final class HostDeletes {
     }
     Types.NestedField key = table.schema().findField(equalityKeyId);
     boolean allParquet = deletes.stream().allMatch(d -> d.format() == FileFormat.PARQUET);
-    if (deviceDeletes && key.isRequired() && allParquet) {
+    boolean provided = deletes.stream().anyMatch(d -> isProvided(d.location()));
+    if (deviceDeletes && key.isRequired() && allParquet && !provided) {
       // A required key cannot be null in a delete file either, so the device needs no null flag.
       List<DeleteFile> sorted = Lists.newArrayList(deletes);
       sorted.sort(Comparator.comparing(DeleteFile::location));
@@ -745,6 +753,31 @@ final class HostDeletes {
     return new KeySet(id, columns, size, hashes, values, nulls);
   }
 
+  /**
+   * Keys held in memory under a placeholder delete-file location that was never written: what
+   * {@code deleteKeys} probes. Read in place of a file, merged with any real equality-delete files
+   * that apply too.
+   */
+  private static final Map<String, long[]> PROVIDED =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  static final String PROVIDED_PREFIX = "memory://iceberg-tornadovm/keys/";
+
+  static String provide(long[] keys) {
+    String location = PROVIDED_PREFIX + java.util.UUID.randomUUID();
+    PROVIDED.put(location, keys);
+    return location;
+  }
+
+  static void forget(String location) {
+    PROVIDED.remove(location);
+    EQUALITY_SETS.asMap().keySet().removeIf(key -> key.contains(location));
+  }
+
+  static boolean isProvided(String location) {
+    return location.startsWith(PROVIDED_PREFIX);
+  }
+
   private EqualitySet equalitySet(List<DeleteFile> deletes) {
     String id =
         deletes.stream()
@@ -765,6 +798,15 @@ final class HostDeletes {
     int size = 0;
     boolean hasNull = false;
     for (DeleteFile delete : deletes) {
+      long[] held = PROVIDED.get(delete.location());
+      if (held != null) {
+        if (size + held.length > keys.length) {
+          keys = Arrays.copyOf(keys, Math.max(keys.length * 2, size + held.length));
+        }
+        System.arraycopy(held, 0, keys, size, held.length);
+        size += held.length;
+        continue;
+      }
       if (delete.format() != FileFormat.PARQUET) {
         throw new UnsupportedOperationException("Not a Parquet delete file: " + delete.location());
       }

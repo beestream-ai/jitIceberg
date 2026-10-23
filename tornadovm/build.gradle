@@ -45,6 +45,8 @@ dependencies {
   implementation project(':iceberg-parquet')
   implementation project(':iceberg-arrow')
   implementation libs.caffeine
+  // Theta sketches for table statistics (the format Iceberg's compute_table_stats writes).
+  implementation libs.datasketches
 
   implementation(libs.parquet.hadoop) {
     exclude group: 'org.apache.avro', module: 'avro'
@@ -63,10 +65,15 @@ dependencies {
     exclude group: 'org.slf4j', module: 'slf4j-log4j12'
   }
 
+  // Tables on S3 (benchmarks): Iceberg's S3FileIO and the AWS SDK it needs, loaded by name.
+  runtimeOnly project(':iceberg-aws')
+  runtimeOnly project(path: ':iceberg-aws-bundle', configuration: 'shadow')
+  runtimeOnly libs.sqlite.jdbc
   compileOnly tornadoApi
   testCompileOnly tornadoApi
 
   testImplementation project(path: ':iceberg-api', configuration: 'testArtifacts')
+  testImplementation libs.datasketches
   testImplementation project(path: ':iceberg-core', configuration: 'testArtifacts')
 }
 

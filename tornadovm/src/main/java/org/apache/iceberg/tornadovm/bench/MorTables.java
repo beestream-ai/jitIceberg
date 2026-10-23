@@ -83,12 +83,67 @@ public final class MorTables {
             .putAll(properties)
             .put(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
             .buildKeepingLast();
+    if (isObjectStore(location)) {
+      return S3_CATALOG
+          .buildTable(identifier(location), schema)
+          .withLocation(location)
+          .withProperties(props)
+          .create();
+    }
     return new HadoopTables(new Configuration())
         .create(schema, PartitionSpec.unpartitioned(), SortOrder.unsorted(), props, location);
   }
 
+  /** A table by location: a local directory (HadoopTables), or an {@code s3://} location. */
   public static Table load(String location) {
+    if (isObjectStore(location)) {
+      return S3_CATALOG.loadTable(identifier(location));
+    }
     return new HadoopTables(new Configuration()).load(location);
+  }
+
+  /** Forgets an S3 table in the catalog (its files stay); nothing if there is none. */
+  public static void dropFromCatalog(String location) {
+    S3_CATALOG.dropTable(identifier(location), false);
+  }
+
+  public static boolean isObjectStore(String location) {
+    return location.startsWith("s3://") || location.startsWith("s3a://");
+  }
+
+  private static org.apache.iceberg.catalog.TableIdentifier identifier(String location) {
+    String path = location.substring(location.indexOf("://") + 3).replaceAll("[^A-Za-z0-9_]", "_");
+    return org.apache.iceberg.catalog.TableIdentifier.of("s3", path);
+  }
+
+  /**
+   * Tables on S3 go through a JDBC catalog (SQLite, {@code -Dbench.catalog=<file>}, by default
+   * ~/.iceberg-tornadovm/s3-catalog.db) whose FileIO is Iceberg's S3FileIO, configured from the
+   * {@code s3.*} and {@code client.*} system properties ({@code -Ds3.endpoint=...} for an
+   * S3-compatible server such as SeaweedFS or MinIO).
+   */
+  private static final org.apache.iceberg.jdbc.JdbcCatalog S3_CATALOG = s3Catalog();
+
+  private static org.apache.iceberg.jdbc.JdbcCatalog s3Catalog() {
+    Map<String, String> props = new java.util.HashMap<>();
+    for (String name : System.getProperties().stringPropertyNames()) {
+      if (name.startsWith("s3.") || name.startsWith("client.")) {
+        props.put(name, System.getProperty(name));
+      }
+    }
+    props.putIfAbsent("client.region", "us-east-1");
+    props.putIfAbsent("s3.path-style-access", "true");
+    props.put(
+        org.apache.iceberg.CatalogProperties.FILE_IO_IMPL, "org.apache.iceberg.aws.s3.S3FileIO");
+    String db =
+        System.getProperty(
+            "bench.catalog", System.getProperty("user.home") + "/.iceberg-tornadovm/s3-catalog.db");
+    new java.io.File(db).getParentFile().mkdirs();
+    props.put(org.apache.iceberg.CatalogProperties.URI, "jdbc:sqlite:" + db);
+    props.put(org.apache.iceberg.CatalogProperties.WAREHOUSE_LOCATION, "s3://iceberg/catalog");
+    org.apache.iceberg.jdbc.JdbcCatalog catalog = new org.apache.iceberg.jdbc.JdbcCatalog();
+    catalog.initialize("s3", props);
+    return catalog;
   }
 
   /**
@@ -212,6 +267,18 @@ public final class MorTables {
    * data files committed before it, and not to any committed after.
    */
   public static void deleteEqual(Table table, String column, List<Object> keys) {
+    deleteEqual(table, column, keys, null);
+  }
+
+  /** {@link #deleteEqual(Table, String, List)} scoped to one partition of a partitioned table. */
+  public static void deleteEqual(
+      Table table, String column, List<Object> keys, org.apache.iceberg.StructLike partition) {
+    table.newRowDelta().addDeletes(writeEqualityDeletes(table, column, keys, partition)).commit();
+  }
+
+  /** The equality-delete file of {@link #deleteEqual}, written but not committed. */
+  public static DeleteFile writeEqualityDeletes(
+      Table table, String column, List<Object> keys, org.apache.iceberg.StructLike partition) {
     Types.NestedField field = table.schema().findField(column);
     Schema keySchema = new Schema(field);
     try {
@@ -219,6 +286,7 @@ public final class MorTables {
           Parquet.writeDeletes(newFile(table, "eq-deletes"))
               .forTable(table)
               .withSpec(table.spec())
+              .withPartition(partition)
               .rowSchema(keySchema)
               .createWriterFunc(GenericParquetWriter::create)
               .equalityFieldIds(field.fieldId())
@@ -231,7 +299,7 @@ public final class MorTables {
           closing.write(record.copy(column, key));
         }
       }
-      table.newRowDelta().addDeletes(writer.toDeleteFile()).commit();
+      return writer.toDeleteFile();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

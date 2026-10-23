@@ -119,6 +119,124 @@ final class DeviceKernels {
   }
 
   /**
+   * A column's value types for {@link #statsHashes}: 4-byte int/date, 8-byte long/timestamp,
+   * double.
+   */
+  static final int STATS_INT = 0;
+
+  static final int STATS_LONG = 1;
+
+  static final int STATS_DOUBLE = 2;
+
+  /**
+   * Each live, non-null value's theta-sketch hash, as Apache DataSketches computes it for Iceberg's
+   * {@code compute_table_stats}: MurmurHash3 x64 128 (seed 9001) of the value's single-value
+   * serialization ({@code Conversions.toByteBuffer}: 4 or 8 bytes, little-endian), first half,
+   * shifted right by one. Rows that are not live, null or past the batch get {@code
+   * Long.MAX_VALUE}, which sorts last and is never kept.
+   *
+   * @param spec {type, slot, validity index or -1}
+   */
+  static void statsHashes(
+      KernelContext context,
+      IntArray meta,
+      ByteArray live,
+      IntArray ints,
+      LongArray longs,
+      DoubleArray doubles,
+      ByteArray valid,
+      IntArray spec,
+      int capacity,
+      LongArray out) {
+    int i = context.globalIdx;
+    if (i < capacity) {
+      long hash = Long.MAX_VALUE;
+      int validIndex = spec.get(2);
+      boolean present =
+          i < meta.get(META_ROWS)
+              && live.get(i) == 1
+              && (validIndex < 0 || valid.get(validIndex * capacity + i) == 1);
+      if (present) {
+        int type = spec.get(0);
+        int slot = spec.get(1);
+        long k1;
+        long length;
+        if (type == STATS_INT) {
+          k1 = ints.get(slot * capacity + i) & 0xFFFFFFFFL;
+          length = 4;
+        } else if (type == STATS_LONG) {
+          k1 = longs.get(slot * capacity + i);
+          length = 8;
+        } else {
+          k1 = Double.doubleToRawLongBits(doubles.get(slot * capacity + i));
+          length = 8;
+        }
+        // MurmurHash3 x64 128 of fewer than 16 bytes: the tail's first 8 bytes only.
+        long h1 = 9001L;
+        long h2 = 9001L;
+        k1 *= 0x87c37b91114253d5L;
+        k1 = (k1 << 31) | (k1 >>> 33);
+        k1 *= 0x4cf5ad432745937fL;
+        h1 ^= k1;
+        h1 ^= length;
+        h2 ^= length;
+        h1 += h2;
+        h2 += h1;
+        h1 ^= h1 >>> 33;
+        h1 *= 0xff51afd7ed558ccdL;
+        h1 ^= h1 >>> 33;
+        h1 *= 0xc4ceb9fe1a85ec53L;
+        h1 ^= h1 >>> 33;
+        h2 ^= h2 >>> 33;
+        h2 *= 0xff51afd7ed558ccdL;
+        h2 ^= h2 >>> 33;
+        h2 *= 0xc4ceb9fe1a85ec53L;
+        h2 ^= h2 >>> 33;
+        h1 += h2;
+        hash = h1 >>> 1;
+      }
+      out.set(i, hash);
+    }
+  }
+
+  /**
+   * {@code mark[i] = 1} for the first of each run of equal sorted hashes, other than the filler.
+   */
+  static void firstOfRuns(KernelContext context, LongArray sorted, int capacity, ByteArray mark) {
+    int i = context.globalIdx;
+    if (i < capacity) {
+      long value = sorted.get(i);
+      mark.set(
+          i, (byte) (value != Long.MAX_VALUE && (i == 0 || sorted.get(i - 1) != value) ? 1 : 0));
+    }
+  }
+
+  /** The first {@code keep} distinct hashes, in order: {@code out[j] = sorted[firsts[j]]}. */
+  static void gatherFirsts(
+      KernelContext context,
+      IntArray firsts,
+      IntArray count,
+      LongArray sorted,
+      int keep,
+      LongArray out) {
+    int j = context.globalIdx;
+    if (j < keep) {
+      out.set(j, j < count.get(0) ? sorted.get(firsts.get(j)) : Long.MAX_VALUE);
+    }
+  }
+
+  /**
+   * The rows of a batch that merge-on-read deletes: {@code dead[i] = 1} for a read row whose live
+   * byte is 0, and 0 past the rows read -- the rows a deletion vector of the batch's files keeps.
+   */
+  static void deadRows(KernelContext context, IntArray meta, ByteArray live, ByteArray dead) {
+    int i = context.globalIdx;
+    if (i < dead.getSize()) {
+      dead.set(i, (byte) (i < meta.get(META_ROWS) && live.get(i) == 0 ? 1 : 0));
+    }
+  }
+
+  /**
    * Applies position-delete files the device read itself: entry {@code j} is a row position within
    * its data file, and the run of entries it belongs to says where that file starts in the batch.
    * Runs are few (one a data file of the batch), so each thread finds its own by a short scan. Only
