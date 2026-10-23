@@ -81,7 +81,7 @@ public final class MorBench {
               ? DeviceMergeOnReadScan.of(table, filter)
               : "cpu".equals(engine) ? CpuMergeOnReadScan.of(table, threads, filter) : null;
       for (int run = 0; run < runs; run++) {
-        if ("rewrite".equals(query) || "zorder".equals(query)) {
+        if ("rewrite".equals(query) || "zorder".equals(query) || "sorted".equals(query)) {
           rewriteRun(table, (DeviceMergeOnReadScan) scan, run, args[t], threads, query);
           continue;
         }
@@ -242,12 +242,20 @@ public final class MorBench {
   private static void rewriteRun(
       Table table, DeviceMergeOnReadScan scan, int run, String name, int threads, String query) {
     table.refresh();
+    if ("sorted".equals(query) && table.sortOrder().isUnsorted()) {
+      table.replaceSortOrder().asc("k").asc("v1").commit();
+    }
     long snapshot = table.currentSnapshot().snapshotId();
     long cpuStart = PROCESS.getProcessCpuTime();
     long start = System.nanoTime();
-    // zorder: the same compaction, each file written in Iceberg's Z-order of (k, v1).
+    // zorder: the same compaction, each file written in Iceberg's Z-order of (k, v1); sorted: in
+    // the table's sort order, (k, v1) ascending, set before the timed runs when the table has none.
     DeviceMergeOnReadScan.RewriteResult result =
-        "zorder".equals(query) ? scan.rewriteDataFilesZOrder("k", "v1") : scan.rewriteDataFiles();
+        switch (query) {
+          case "zorder" -> scan.rewriteDataFilesZOrder("k", "v1");
+          case "sorted" -> scan.rewriteDataFilesSorted();
+          default -> scan.rewriteDataFiles();
+        };
     double millis = (System.nanoTime() - start) / 1e6;
     double cpuSeconds = (PROCESS.getProcessCpuTime() - cpuStart) / 1e9;
     table.refresh();

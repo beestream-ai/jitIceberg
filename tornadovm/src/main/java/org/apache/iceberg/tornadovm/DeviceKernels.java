@@ -891,6 +891,64 @@ final class DeviceKernels {
     }
   }
 
+  /**
+   * A row's place in a table's sort order, as {@code 1 + 2 * columns} INT64 sort words a row at
+   * {@code stride}, for a lexicographic signed sort: word 0 is 0 for a live row and 1 otherwise, as
+   * in {@link #zorderKeys}; then, a column, its null word (a null sorts first or last as the sort
+   * field's null order says) and its value word -- the value made order-preserving as {@link
+   * #zorderKeys} does, so doubles order as {@code Double.compare} does with NaN last, and
+   * complemented for a descending field.
+   *
+   * <p>{@code spec} is {@link #zorderKeys}'s; {@code orders} holds a column's flags: bit 0
+   * descending, bit 1 nulls first.
+   */
+  static void sortOrderKeys(
+      KernelContext context,
+      IntArray spec,
+      IntArray orders,
+      int columns,
+      ByteArray live,
+      IntArray ints,
+      LongArray longs,
+      DoubleArray doubles,
+      ByteArray valid,
+      int stride,
+      LongArray keys) {
+    int i = context.globalIdx;
+    if (i < stride) {
+      if (live.get(i) == 0) {
+        keys.set(i, 1L);
+        for (int w = 1; w <= 2 * columns; w++) {
+          keys.set((long) w * stride + i, Long.MAX_VALUE);
+        }
+      } else {
+        keys.set(i, 0L);
+        for (int c = 0; c < columns; c++) {
+          int validSlot = spec.get(3 * c + 2);
+          int flags = orders.get(c);
+          long nullWord = 0L;
+          long word = 0L;
+          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+            if ((flags & 2) == 0) {
+              nullWord = 1L;
+            }
+          } else {
+            if ((flags & 2) != 0) {
+              nullWord = 1L;
+            }
+            word = orderedBits(spec, c, columns, i, ints, longs, doubles, valid, stride);
+            word = word ^ Long.MIN_VALUE;
+            if ((flags & 1) == 1) {
+              word = ~word;
+            }
+          }
+          keys.set((long) (1 + 2 * c) * stride + i, nullWord);
+          keys.set((long) (2 + 2 * c) * stride + i, word);
+        }
+      }
+    }
+  }
+
   // value != value is NaN in a form the kernel compiler takes; Double.isNaN may not be.
   @SuppressWarnings("IdentityBinaryExpression")
   private static long orderedBits(

@@ -52,8 +52,15 @@ def rewrite_run(name, run, query="rewrite"):
         "'target-file-size-bytes','134217728'",
     )
     start = time.perf_counter()
-    # zorder: the same compaction, sorting each file group by Iceberg's Z-order of (k, v1).
-    sort = ", strategy => 'sort', sort_order => 'zorder(k, v1)'" if query == "zorder" else ""
+    # zorder: the same compaction, sorting each file group by Iceberg's Z-order of (k, v1); sorted:
+    # by the table's sort order, (k, v1) ascending, set first when the table has none.
+    sort = ""
+    if query == "zorder":
+        sort = ", strategy => 'sort', sort_order => 'zorder(k, v1)'"
+    elif query == "sorted":
+        if run == 0:
+            spark.sql(f"ALTER TABLE {table} WRITE ORDERED BY k, v1")
+        sort = ", strategy => 'sort'"
     spark.sql(f"CALL local.system.rewrite_data_files(table => '{namespace}.{name}'{sort}, options => map({options}))").collect()
     millis = (time.perf_counter() - start) * 1000
     spark.sql(f"REFRESH TABLE {table}")
@@ -72,7 +79,7 @@ def rewrite_run(name, run, query="rewrite"):
 
 
 for name in tables:
-    if query in ("rewrite", "zorder"):
+    if query in ("rewrite", "zorder", "sorted"):
         for run in range(runs):
             rewrite_run(name, run, query)
         continue

@@ -722,7 +722,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * new files, so rows keep them. Data files that already store lineage columns are refused.
    */
   public RewriteResult rewriteDataFiles() {
-    return rewrite(List.of());
+    return rewrite(RowOrder.NONE);
   }
 
   /**
@@ -741,10 +741,62 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       throw new IllegalArgumentException(
           "Z-order takes 1 to " + DeviceKernels.MAX_ZORDER_COLUMNS + " columns");
     }
-    return rewrite(List.of(zorderColumns));
+    return rewrite(new RowOrder(List.of(zorderColumns), new int[zorderColumns.length], 0, true));
   }
 
-  private RewriteResult rewrite(List<String> zorderColumns) {
+  /**
+   * {@link #rewriteDataFiles()}, writing each new file's rows in the table's sort order -- what
+   * {@code rewrite_data_files(strategy => 'sort')} writes when no sort order is given -- and
+   * recording the order's id on each new file, as Spark's writes do ({@code sort_order_id}), so
+   * that readers and later rewrites know the file is sorted.
+   *
+   * <p>A kernel turns each row's sort fields into words that compare as the order says (direction,
+   * null order, doubles as {@code Double.compare}); cuDF sorts the rows of a batch by them. Each
+   * output file is sorted; files are not sorted against each other, as Spark's file groups are not.
+   * Up to {@value DeviceKernels#MAX_ZORDER_COLUMNS} identity fields of integer, long, date,
+   * timestamp or double columns.
+   */
+  public RewriteResult rewriteDataFilesSorted() {
+    org.apache.iceberg.SortOrder order = table.sortOrder();
+    if (order.isUnsorted()) {
+      throw new IllegalStateException("The table has no sort order");
+    }
+    if (order.fields().size() > DeviceKernels.MAX_ZORDER_COLUMNS) {
+      throw new UnsupportedOperationException(
+          "Sort orders of more than " + DeviceKernels.MAX_ZORDER_COLUMNS + " fields");
+    }
+    List<String> columns = Lists.newArrayList();
+    int[] flags = new int[order.fields().size()];
+    for (int f = 0; f < flags.length; f++) {
+      org.apache.iceberg.SortField field = order.fields().get(f);
+      if (!field.transform().isIdentity()) {
+        throw new UnsupportedOperationException("Sort field " + field + " is not an identity");
+      }
+      columns.add(table.schema().findColumnName(field.sourceId()));
+      flags[f] =
+          (field.direction() == org.apache.iceberg.SortDirection.DESC ? 1 : 0)
+              | (field.nullOrder() == org.apache.iceberg.NullOrder.NULLS_FIRST ? 2 : 0);
+    }
+    return rewrite(new RowOrder(columns, flags, order.orderId(), false));
+  }
+
+  /**
+   * How a rewrite orders each file's rows: by the Z-order of {@code columns}, or by them in turn
+   * with {@code flags} (bit 0 descending, bit 1 nulls first) for sort order {@code sortOrderId}.
+   */
+  private record RowOrder(List<String> columns, int[] flags, int sortOrderId, boolean zorder) {
+    static final RowOrder NONE = new RowOrder(List.of(), new int[0], 0, true);
+
+    int words() {
+      return zorder ? columns.size() + 1 : 1 + 2 * columns.size();
+    }
+
+    String key() {
+      return (zorder ? "-z" : "-sorted" + sortOrderId) + columns + java.util.Arrays.toString(flags);
+    }
+  }
+
+  private RewriteResult rewrite(RowOrder order) {
     if (filter.op() != Expression.Operation.TRUE) {
       throw new UnsupportedOperationException("A rewrite of part of a table is not supported");
     }
@@ -752,7 +804,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     long start = System.nanoTime();
     Planned planned = new Planned(null, rewriteColumns(), null, BATCH_ROWS, true, true);
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
-    long rows = write(planned, zorderColumns, written, start);
+    long rows = write(planned, order, written, start);
 
     java.util.Set<String> deletesSeen = new java.util.HashSet<>();
     RewriteFiles rewrite = table.newRewrite();
@@ -1224,7 +1276,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             planned.layout.fields().size());
       }
       try {
-        write(planned, List.of(), written, start, REWRITE_STREAMS);
+        write(planned, RowOrder.NONE, written, start, REWRITE_STREAMS);
       } catch (RuntimeException e) {
         if (!outOfDeviceMemory(e)) {
           throw e;
@@ -1236,7 +1288,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         evictIdle(null, 0);
         Planned smaller =
             new Planned(null, rewriteColumns(), tasks, Math.max(1, fileRows / 2), false, true);
-        write(smaller, List.of(), written, System.nanoTime(), 1);
+        write(smaller, RowOrder.NONE, written, System.nanoTime(), 1);
       }
     }
     return Lists.newArrayList(written);
@@ -1312,28 +1364,22 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /** Writes the planned tasks' live rows into new files, added to {@code written}; their rows. */
-  private long write(
-      Planned planned, List<String> zorderColumns, List<DataFile> written, long start) {
-    return write(planned, zorderColumns, written, start, STREAMS);
+  private long write(Planned planned, RowOrder order, List<DataFile> written, long start) {
+    return write(planned, order, written, start, STREAMS);
   }
 
   private long write(
-      Planned planned,
-      List<String> zorderColumns,
-      List<DataFile> written,
-      long start,
-      int maxStreams) {
+      Planned planned, RowOrder order, List<DataFile> written, long start, int maxStreams) {
     int formatVersion =
         ((org.apache.iceberg.HasTableOperations) table).operations().current().formatVersion();
     List<Region> streams =
         reuse(
             "rewrite"
                 + (formatVersion >= 3 ? "-lineage" : "")
-                + "-z"
-                + zorderColumns
+                + order.key()
                 + (planned.given ? "-given" : ""),
             planned,
-            () -> new RewriteRegion(planned, formatVersion >= 3, zorderColumns),
+            () -> new RewriteRegion(planned, formatVersion >= 3, order),
             maxStreams);
     metrics.plan((System.nanoTime() - start) / 1e6);
     return run(
@@ -2196,6 +2242,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         "groupKeys",
         "values",
         "zorder",
+        "sortkeys",
         "lineage"
       };
       for (String task : perRow) {
@@ -3247,8 +3294,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final IntArray fileCount = hostInts(1);
     private final LongArray firstRowIds;
     private final LongArray sequences;
+    private final RowOrder order;
     private final int zColumns;
     private final IntArray zSpec;
+    private final IntArray zFlags;
     private final int[] zSize;
     private final LongArray zKeys;
     private final IntArray zOrder;
@@ -3263,19 +3312,22 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * {@code lineage}: a v3 table's rewrite, which also writes each row's {@code _row_id} and
      * {@code _last_updated_sequence_number}, as two INT64 columns after the table's.
      */
-    RewriteRegion(Planned planned, boolean lineage, List<String> zorderColumns) {
+    RewriteRegion(Planned planned, boolean lineage, RowOrder order) {
       super(planned, lineage ? 2 : 0);
       this.lineage = lineage;
-      this.zColumns = zorderColumns.size();
+      this.order = order;
+      this.zColumns = order.columns().size();
       this.zSpec = hostInts(Math.max(1, 3 * zColumns));
-      this.zSize = new int[] {0, zColumns + 1};
-      this.zKeys = hostLongs(zColumns == 0 ? 1L : (long) (zColumns + 1) * capacity);
+      this.zFlags = hostInts(Math.max(1, zColumns));
+      this.zSize = new int[] {0, order.words()};
+      this.zKeys = hostLongs(zColumns == 0 ? 1L : (long) order.words() * capacity);
       this.zOrder = hostInts(zColumns == 0 ? 1 : capacity);
       for (int c = 0; c < zColumns; c++) {
-        Types.NestedField field = table.schema().findField(zorderColumns.get(c));
+        Types.NestedField field = table.schema().findField(order.columns().get(c));
         if (field == null) {
-          throw new IllegalArgumentException("No column " + zorderColumns.get(c));
+          throw new IllegalArgumentException("No column " + order.columns().get(c));
         }
+        zFlags.set(c, order.flags()[c]);
         CudfType type = layout.type(field.fieldId());
         zSpec.set(3 * c, type == CudfType.INT32 ? 0 : type == CudfType.INT64 ? 1 : 2);
         zSpec.set(3 * c + 1, layout.slot(field.fieldId()));
@@ -3339,7 +3391,25 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     @Override
     void beforeGather(TaskGraph graph) {
-      if (zColumns > 0) {
+      if (zColumns > 0 && !order.zorder()) {
+        graph
+            .transferToDevice(DataTransferMode.FIRST_EXECUTION, zSpec, zFlags)
+            .task(
+                "sortkeys",
+                DeviceKernels::sortOrderKeys,
+                context,
+                zSpec,
+                zFlags,
+                zColumns,
+                live,
+                ints,
+                longs,
+                doubles,
+                valid,
+                capacity,
+                zKeys)
+            .libraryTask("zsort", Cudf::sortedOrderLongs, zSize, zKeys, capacity, zOrder);
+      } else if (zColumns > 0) {
         graph
             .transferToDevice(DataTransferMode.FIRST_EXECUTION, zSpec)
             .task(
@@ -3494,14 +3564,17 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       org.apache.iceberg.Metrics fileMetrics =
           org.apache.iceberg.parquet.ParquetUtil.fileMetrics(
               file, org.apache.iceberg.MetricsConfig.forTable(table));
-      written.add(
+      org.apache.iceberg.DataFiles.Builder builder =
           org.apache.iceberg.DataFiles.builder(spec)
               .withPartition(partition)
               .withPath(location)
               .withFormat(org.apache.iceberg.FileFormat.PARQUET)
               .withFileSizeInBytes(file.getLength())
-              .withMetrics(fileMetrics)
-              .build());
+              .withMetrics(fileMetrics);
+      if (!order.zorder()) {
+        builder.withSortOrder(table.sortOrders().get(order.sortOrderId()));
+      }
+      written.add(builder.build());
       return rows;
     }
   }

@@ -1145,6 +1145,80 @@ public class TestDeviceMergeOnRead {
     assertThat(checked).isEqualTo(before.size());
   }
 
+  /**
+   * A sorted rewrite keeps every row, writes each new file in the table's sort order -- descending
+   * and nulls-last on v1, which has nulls -- as Iceberg's {@code SortOrderComparators} orders it,
+   * and records that order's id on every new file.
+   */
+  @Test
+  public void testRewriteDataFilesSorted() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.required(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("sorted").toString(), schema, 3);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              3000,
+              i -> {
+                Record record = row(schema, index, i);
+                record.setField("k", (int) ((i * 7919 + index) % 13) - 6);
+                record.setField("v1", i % 11 == 0 ? null : Math.sin(i + index) * 1e3);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(3000, 7), new long[0], everyNth(3000, 3)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(10L, 1_000_020L));
+    table.replaceSortOrder().asc("k").desc("v1", org.apache.iceberg.NullOrder.NULLS_LAST).commit();
+
+    table.refresh();
+    List<String> before = rows(table);
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      device.rewriteDataFilesSorted();
+    }
+    table.refresh();
+    assertThat(rows(table)).containsExactlyElementsOf(before);
+
+    java.util.Comparator<org.apache.iceberg.StructLike> order =
+        org.apache.iceberg.SortOrderComparators.forSchema(schema, table.sortOrder());
+    long checked = 0;
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        assertThat(task.file().sortOrderId()).isEqualTo(table.sortOrder().orderId());
+        Record previous = null;
+        try (CloseableIterable<Record> records =
+            org.apache.iceberg.parquet.Parquet.read(table.io().newInputFile(task.file().location()))
+                .project(schema)
+                .createReaderFunc(
+                    fileSchema ->
+                        org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(
+                            schema, fileSchema))
+                .build()) {
+          for (Record record : records) {
+            if (previous != null) {
+              assertThat(order.compare(previous, record))
+                  .as("row %d of %s", checked, task.file().location())
+                  .isLessThanOrEqualTo(0);
+            }
+            previous = record.copy();
+            checked++;
+          }
+        }
+      }
+    }
+    assertThat(checked).isEqualTo(before.size());
+  }
+
   private static byte[] zorder(int k, Double v1) {
     byte[] key =
         org.apache.iceberg.util.ZOrderByteUtils.intToOrderedBytes(
