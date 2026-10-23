@@ -640,7 +640,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
     metrics = new ScanMetrics();
     long start = System.nanoTime();
-    Planned planned = new Planned(null, rewriteColumns());
+    Planned planned = new Planned(null, rewriteColumns(), null, BATCH_ROWS, true, true);
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
     long rows = write(planned, zorderColumns, written, start);
 
@@ -695,7 +695,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       // other table rewritten has. This one keeps its regions -- and its compiled kernels -- for
       // its next group.
       evictIdle(null, 0);
-      Planned planned = new Planned(null, rewriteColumns(), tasks, fileRows, false);
+      Planned planned = new Planned(null, rewriteColumns(), tasks, fileRows, false, true);
       if (DEBUG) {
         System.err.printf(
             "[mor] rewrite group: %d files, %d rows, target %d bytes -> %d rows a file; capacity %d,"
@@ -737,8 +737,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     List<String> columns = Lists.newArrayList();
     for (Types.NestedField field : table.schema().columns()) {
       org.apache.iceberg.types.Type.TypeID type = field.type().typeId();
-      if (type == org.apache.iceberg.types.Type.TypeID.TIME
-          || type == org.apache.iceberg.types.Type.TypeID.STRING) {
+      if (type == org.apache.iceberg.types.Type.TypeID.TIME) {
         throw new UnsupportedOperationException(
             field.type() + " columns cannot be written on the device");
       }
@@ -979,7 +978,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * same device buffers and plans.
      */
     Planned(String groupColumn, List<String> projection, List<FileScanTask> given) {
-      this(groupColumn, projection, given, BATCH_ROWS, true);
+      this(groupColumn, projection, given, BATCH_ROWS, true, false);
     }
 
     /**
@@ -992,7 +991,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         List<String> projection,
         List<FileScanTask> given,
         long givenBatchRows,
-        boolean padGiven) {
+        boolean padGiven,
+        boolean rewrite) {
       this.snapshotId =
           table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
       this.given = given != null;
@@ -1051,6 +1051,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       this.layout = new ScanLayout(table.schema(), equalityKeyId, groupColumn, read);
       this.host = new HostDeletes(table, layout, equalityKeyId, true).withKeyIds(keyIds);
+      // Files on an object store are fetched to the local cache together, before their footers
+      // are read below.
+      List<String> locations = Lists.newArrayList();
+      for (FileScanTask task : tasks) {
+        locations.add(task.file().location());
+        task.deletes().forEach(delete -> locations.add(delete.location()));
+      }
+      LocalFiles.prefetch(locations, table.io());
       this.equalityKeyType = equalityKeyId == null ? null : layout.type(equalityKeyId);
       this.keyNullable =
           equalityKeyId != null && table.schema().findField(equalityKeyId).isOptional();
@@ -1070,7 +1078,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       for (FileScanTask task : tasks) {
         long rows = task.file().recordCount();
         // Files batch together only if they share their equality deletes and their residual.
-        String set = HostDeletes.equalityId(task) + "|" + task.residual();
+        // ... and store the projected columns at the same positions (schema evolution moves them),
+        // and, for a rewrite, belong to the same partition: an output file is one partition's.
+        String set =
+            HostDeletes.equalityId(task)
+                + "|"
+                + task.residual()
+                + "|"
+                + host.columnLayout(task)
+                + (rewrite ? "|" + task.spec().specId() + "/" + task.file().partition() : "");
         if (!current.isEmpty() && (currentRows + rows > batchRows || !set.equals(currentSet))) {
           batches.add(current);
           current = Lists.newArrayList();
@@ -1160,8 +1176,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * (parquet-java records them); a writer that left them out gets 16 bytes a row, and a batch
      * that needs more is refused rather than truncated.
      */
-    private static long stringStride(
-        List<List<FileScanTask>> batches, ScanLayout layout, int rows) {
+    private long stringStride(List<List<FileScanTask>> batches, ScanLayout layout, int rows) {
       if (layout.stringCount() == 0) {
         return 1;
       }
@@ -1172,7 +1187,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           long bytes = 0;
           for (FileScanTask task : batch) {
             long file =
-                HostDeletes.stringBytes(HostDeletes.localPath(task.file().location()), fieldId);
+                HostDeletes.stringBytes(
+                    LocalFiles.path(task.file().location(), table.io()), fieldId);
             if (file < 0) {
               bytes = 16L * rows;
               break;
@@ -2021,10 +2037,6 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     /** What a shape adds between the compaction and the gathers; nothing by default. */
     void beforeGather(TaskGraph graph) {}
 
-    int longSlots() {
-      return longSlots;
-    }
-
     IntArray outInts() {
       return outInts;
     }
@@ -2346,9 +2358,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final int[] fieldIds;
     private final ParquetColumnType[] types;
     private final boolean[] optional;
-    // Each DECIMAL64 column's precision and scale, at its index.
-    private final int[] precisions;
-    private final int[] scales;
+    // Per column: a DECIMAL64's precision * 256 + scale, a STRING's read-validity slot.
+    private final int[] details;
+    // Read when the write runs: {codec, row-group rows, string bytes a column, rows read}.
+    private final long[] settings = new long[4];
     private final boolean lineage;
     private final IntArray fileStarts;
     private final IntArray fileCount = hostInts(1);
@@ -2360,6 +2373,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final LongArray zKeys;
     private final IntArray zOrder;
     private String location;
+    // Where cuDF writes the batch's file when its location is on an object store, and the batch's
+    // partition spec and partition.
+    private java.nio.file.Path staged;
+    private org.apache.iceberg.PartitionSpec spec;
+    private org.apache.iceberg.StructLike partition;
 
     /**
      * {@code lineage}: a v3 table's rewrite, which also writes each row's {@code _row_id} and
@@ -2396,8 +2414,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.fieldIds = new int[fields.size()];
       this.types = new ParquetColumnType[fields.size()];
       this.optional = new boolean[fields.size()];
-      this.precisions = new int[fields.size()];
-      this.scales = new int[fields.size()];
+      this.details = new int[fields.size()];
       StringBuilder joined = new StringBuilder();
       for (int c = 0; c < fields.size(); c++) {
         Types.NestedField field = fields.get(c);
@@ -2414,9 +2431,14 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
               case FLOAT -> ParquetColumnType.FLOAT32;
               case DECIMAL -> {
                 Types.DecimalType decimal = (Types.DecimalType) field.type();
-                precisions[c] = decimal.precision();
-                scales[c] = decimal.scale();
+                details[c] = decimal.precision() * 256 + decimal.scale();
                 yield ParquetColumnType.DECIMAL64;
+              }
+              case STRING -> {
+                // Gathered from the read's offsets and bytes inside the write; its validity is the
+                // read's, at the column's read index.
+                details[c] = layout.readIndex(field.fieldId());
+                yield ParquetColumnType.STRING;
               }
               default ->
                   throw new UnsupportedOperationException(
@@ -2474,20 +2496,23 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 fileCount,
                 firstRowIds,
                 sequences,
-                longSlots(),
+                // After the numeric INT64 slots: the writer takes a string from the read, not
+                // from the INT64 slot the layout keeps for its packed key.
+                layout.firstStringSlot(),
                 capacity,
                 outLongs());
       }
+      settings[0] = codec();
+      settings[2] = stringStride;
       graph.libraryTask(
           "write",
-          Cudf::writeParquetColumns,
+          Cudf::writeParquetColumnsWithStrings,
           outputPath,
           names,
           fieldIds,
           types,
           optional,
-          precisions,
-          scales,
+          details,
           new long[] {-1},
           liveCount(),
           capacity,
@@ -2495,8 +2520,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           outLongs(),
           outDoubles(),
           outValid(),
-          codec(),
-          0);
+          stringOffsets,
+          stringChars,
+          valid,
+          positions(),
+          settings);
     }
 
     /**
@@ -2544,18 +2572,37 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           sequences.set(f, sequence);
         }
       }
+      spec = prep.spec();
+      partition = prep.partition();
+      settings[3] = prep.rows();
+      String name = "gpu-rewrite-" + java.util.UUID.randomUUID() + ".parquet";
       location =
-          table
-              .locationProvider()
-              .newDataLocation("gpu-rewrite-" + java.util.UUID.randomUUID() + ".parquet");
+          spec.isUnpartitioned()
+              ? table.locationProvider().newDataLocation(name)
+              : table.locationProvider().newDataLocation(spec, partition, name);
+      staged = LocalFiles.isLocal(location) ? null : LocalFiles.stagingFile();
+      String local = staged == null ? LocalFiles.path(location, table.io()) : staged.toString();
+      try {
+        // cuDF opens the file but makes no directories: a new partition's directory is made here.
+        java.nio.file.Files.createDirectories(java.nio.file.Paths.get(local).getParent());
+      } catch (java.io.IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
       outputPath.setLength(0);
-      outputPath.append(HostDeletes.localPath(location));
+      outputPath.append(local);
     }
 
     /** The batch's file as an Iceberg data file, with metrics from the footer libcudf wrote. */
     long collect(TornadoExecutionResult executed, List<DataFile> written) {
       executed.transferToHost(liveCount());
       int rows = liveCount().get(0);
+      if (staged != null) {
+        if (rows == 0) {
+          LocalFiles.discard(staged);
+          return 0;
+        }
+        LocalFiles.upload(staged, location, table.io());
+      }
       org.apache.iceberg.io.InputFile file = table.io().newInputFile(location);
       if (rows == 0) {
         table.io().deleteFile(location);
@@ -2565,7 +2612,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           org.apache.iceberg.parquet.ParquetUtil.fileMetrics(
               file, org.apache.iceberg.MetricsConfig.forTable(table));
       written.add(
-          org.apache.iceberg.DataFiles.builder(table.spec())
+          org.apache.iceberg.DataFiles.builder(spec)
+              .withPartition(partition)
               .withPath(location)
               .withFormat(org.apache.iceberg.FileFormat.PARQUET)
               .withFileSizeInBytes(file.getLength())

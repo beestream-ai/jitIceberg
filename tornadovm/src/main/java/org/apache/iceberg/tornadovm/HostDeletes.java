@@ -20,7 +20,6 @@ package org.apache.iceberg.tornadovm;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.net.URI;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -109,6 +108,18 @@ final class HostDeletes {
 
     long rows() {
       return rows;
+    }
+
+    // The batch's partition spec and partition (a rewrite's batch is one partition's).
+    private org.apache.iceberg.PartitionSpec spec;
+    private org.apache.iceberg.StructLike partition;
+
+    org.apache.iceberg.PartitionSpec spec() {
+      return spec;
+    }
+
+    org.apache.iceberg.StructLike partition() {
+      return partition;
     }
 
     int files() {
@@ -430,15 +441,15 @@ final class HostDeletes {
         && dataLocation.equals(ContentFileUtil.referencedDataFileLocation(delete));
   }
 
-  /** A local path cuDF can open. Object stores are not wired up in this prototype. */
-  static String localPath(String location) {
-    if (location.startsWith("file:")) {
-      return Paths.get(URI.create(location)).toString();
-    }
-    if (location.startsWith("/")) {
-      return location;
-    }
-    throw new UnsupportedOperationException("Not a local file: " + location);
+  /** A local path cuDF can open: the file itself, or its cached copy from an object store. */
+  String localPath(String location) {
+    return LocalFiles.path(location, table.io());
+  }
+
+  /** Where the file stores the projected columns, -1 for one it lacks: what a batch must share. */
+  String columnLayout(FileScanTask task) {
+    String location = task.file().location();
+    return Arrays.toString(layout.parquetColumns(footerSchema(localPath(location)), location));
   }
 
   /** One data file. */
@@ -456,6 +467,8 @@ final class HostDeletes {
     long start = System.nanoTime();
     FilePrep prep = new FilePrep();
     prep.files = batch.size();
+    prep.spec = batch.get(0).spec();
+    prep.partition = batch.get(0).file().partition();
     StringBuilder paths = new StringBuilder();
     List<long[]> hostPositions = Lists.newArrayList();
     long offset = 0;

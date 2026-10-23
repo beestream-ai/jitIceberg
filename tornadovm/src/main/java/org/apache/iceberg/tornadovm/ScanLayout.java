@@ -249,9 +249,12 @@ final class ScanLayout {
           break;
         }
       }
-      if (columns[c] < 0) {
-        // A column added after the file was written reads as null; that needs a default the
-        // device read cannot produce, so the scan declines rather than guess.
+      if (columns[c] < 0
+          && (field.isRequired()
+              || field.initialDefault() != null
+              || field.type().typeId() == Type.TypeID.STRING)) {
+        // A column added after the file was written reads as null, which the device read does
+        // (index -1); a required one or one with a default value needs what it cannot produce.
         throw new UnsupportedOperationException(
             "Data file " + location + " has no column with field id " + field.fieldId());
       }
