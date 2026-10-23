@@ -3632,11 +3632,20 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         public List<DeleteFile> close() throws IOException {
           // One delete file a data file, each written on its own thread: Iceberg's generic
           // Parquet writer takes one row at a time (9.5M positions took 4.9 s on one thread).
+          // One writer per ~32k positions, up to a core each: small files written on every core
+          // contend (2xA10 host, 128 cores, 1M positions over 320 files: 1.25 s on 128 writers,
+          // 0.80 s on 32), large ones still gain from all of them (9.9M positions: 1.87 s on 128).
           List<Map.Entry<String, FilePositions>> entries = Lists.newArrayList(byFile.entrySet());
-          ExecutorService writers =
-              Executors.newFixedThreadPool(
-                  Math.max(
-                      1, Math.min(entries.size(), Runtime.getRuntime().availableProcessors())));
+          long positions = 0;
+          for (Map.Entry<String, FilePositions> entry : entries) {
+            positions += entry.getValue().count;
+          }
+          int threads =
+              (int)
+                  Math.min(
+                      Math.min(entries.size(), Runtime.getRuntime().availableProcessors()),
+                      Math.max(1, (positions + POSITIONS_PER_WRITER - 1) / POSITIONS_PER_WRITER));
+          ExecutorService writers = Executors.newFixedThreadPool(Math.max(1, threads));
           try {
             List<java.util.concurrent.Future<DeleteFile>> futures = Lists.newArrayList();
             for (Map.Entry<String, FilePositions> entry : entries) {
@@ -3687,6 +3696,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /** One data file's deleted positions, for a position-delete file. */
+  private static final long POSITIONS_PER_WRITER = 32_768;
+
   private static final class FilePositions {
     private final org.apache.iceberg.PartitionSpec spec;
     private final org.apache.iceberg.StructLike partition;
