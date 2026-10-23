@@ -38,8 +38,12 @@ try (DeviceMergeOnReadScan scan = DeviceMergeOnReadScan.of(table)) {
   long live = scan.materialize(List.of("id", "k", "v1"), rows -> { ... }); // live rows, to the host
 
   // Maintenance: each is one Iceberg commit, validated against the snapshot it planned.
-  scan.convertEqualityDeletes();       // equality deletes -> one deletion vector per data file (v3)
+  scan.convertEqualityDeletes();       // equality deletes -> a deletion vector per data file (v3),
+                                       //   or a file-scoped position-delete file (v2)
+  scan.deleteKeys("id", keys);         // DELETE ... WHERE id IN (keys), as deletion vectors
+  scan.computeTableStats("id", "k");   // NDV theta sketches in a Puffin file, as compute_table_stats
   scan.rewriteDataFiles();             // compaction: deletes applied, files rewritten
+  scan.rewriteDataFilesSorted();       // compaction in the table's sort order, sort_order_id set
   scan.rewriteDataFilesZOrder("k", "v1");
 }
 // Filters: Iceberg prunes files, the device applies the residual.
@@ -53,7 +57,25 @@ file-scoped position deletes folded in. One `RowDelta` adds the vectors and remo
 equality-delete files and the deletes they replace, validated against the planned snapshot.
 These are the rules Flink's `ConvertEqualityDeletes` maintenance task follows (apache/iceberg
 #16858, #16874, #17189), here without a Flink job. Iceberg v4 forbids writing new equality
-deletes (#17783), so this is the conversion v4 tables need.
+deletes (#17783), so this is the conversion v4 tables need. On a v2 table each data file gets one
+file-scoped position-delete file instead.
+
+**`deleteKeys(column, keys)`** deletes by key without writing an equality-delete file: what a CDC
+writer does for keys it has seen before (Spark and Flink write deletion vectors only for positions
+they already know, #11561, #14197). Iceberg prunes files by the column's bounds (`IN` up to
+`iceberg.tornadovm.deleteKeys.inLimit` keys, 1000 by default, otherwise the key range); the keys
+stay in memory; the device finds their rows. The `RowDelta` also validates that no data file added
+since could hold one of the keys.
+
+**`computeTableStats(columns...)`** writes what Spark's `compute_table_stats` writes: an
+`apache-datasketches-theta-v1` blob a column (MurmurHash3 seed 9001 over Iceberg's serialization,
+4096 entries) with the `ndv` property, in a Puffin file set on the snapshot. The device hashes and
+sorts; the host merges the smallest hashes.
+
+**`rewriteDataFilesSorted()`** is `rewrite_data_files(strategy => 'sort')` with the table's sort
+order: identity fields, either direction and null order, and the order's id on every new file
+(`sort_order_id`, as Spark's writes set it since #15150 and #15832). Each output file is sorted;
+files are not sorted against each other, as with Spark's file groups.
 
 ## How a batch runs
 
@@ -85,7 +107,8 @@ that cuDF opens as the original file. Delete files and rewrites fetch whole file
 | Types | int, long, date, timestamp, float, double, decimal (precision <= 18), string | nested types, decimal > 18, `time` in writes |
 | Deletes | v2 position deletes, v3 deletion vectors, equality deletes on int/long keys (one or several columns) | equality deletes on string keys |
 | Tables | v2 and v3, partitioned or not, evolved schemas (added columns read as null) | |
-| Conversion | v3 tables | v2 tables, partition-scoped position delete files |
+| Conversion, delete by key | v3 (deletion vectors) and v2 (file-scoped position deletes); int/long keys | partition-scoped position delete files |
+| Sorted rewrite | up to 4 identity sort fields on int, long, date, timestamp, double | transforms (bucket, truncate, ...) in the sort order |
 
 Anything refused fails with `UnsupportedOperationException`. Nothing is answered wrongly.
 
@@ -104,8 +127,10 @@ The tests check every device and CPU result against `IcebergGenerics`, Iceberg's
 reader:
 - **`TestDeviceMergeOnRead`:** v2 position deletes, v3 deletion vectors, equality deletes before
   and after an append (the sequence-number rules), several key columns, nulls in keys and values,
-  filters, strings, decimals, compaction with v3 row lineage, z-order, and conversion to deletion
-  vectors (GPU and CPU twin give the same vectors).
+  filters, strings, decimals, compaction with v3 row lineage, z-order, sorted rewrites (checked
+  with Iceberg's `SortOrderComparators`), conversion to deletion vectors and to v2 position deletes
+  (GPU and CPU twin give the same vectors), delete by key, and NDV sketches (checked against
+  DataSketches' own update sketch).
 - **`TestDeviceEvolutionAndStorage`:** evolved schemas, object-store tables, partitioned compaction
   and partitioned conversion.
 
@@ -117,7 +142,7 @@ The benchmarks print each answer's row count and checksum, and every engine must
    `CUDF_PACKAGE=libcudf-cu13` selects the CUDA 13 build.
 2. **TornadoVM with the cuDF shim**, built with the CUDA backend (released SDKs don't ship the
    shim): branch `iceberg-bench` of `mikepapadim/TornadoVM`, which is master plus three changes
-   in review.
+   in review upstream (beehive-lab/TornadoVM #1276, #1277, #1278).
    ```bash
    make BACKEND=cuda && source setvars.sh      # with CUDF_HOME from step 1; JDK 21
    ```
@@ -130,8 +155,24 @@ The module is part of the build only when `TORNADOVM_HOME` is set. Run `./gradle
 ```bash
 tornadovm/run.sh gen /data/wh 64 1562500                    # 100M rows, a table per delete layout
 tornadovm/run.sh gpu /data/wh q2 6 none pos05 dv05 eq1m     # and `cpu` for the CPU twin
+tornadovm/run.sh gpu /data/wh sorted 4 pos05 eq1m             # sorted rewrite; `spark` for Spark's
 MAIN=org.apache.iceberg.tornadovm.bench.ConvertBench tornadovm/run.sh gpu /data/wh gpu 4 eq1m eq10m
+MAIN=org.apache.iceberg.tornadovm.bench.NewOpsBench tornadovm/run.sh gpu /data/wh deletekeys 3 none 1000 1000000
+MAIN=org.apache.iceberg.tornadovm.bench.NewOpsBench tornadovm/run.sh gpu /data/wh convertv2 3 eq1m eq10m
+MAIN=org.apache.iceberg.tornadovm.bench.StatsBench tornadovm/run.sh gpu /data/wh id,k,v1,v2 3 none eq1m
 ```
+
+The Spark baselines run the same operations through Spark 3.5 and Iceberg's procedures:
+`BENCH_SCRIPT=spark_delete_keys.py` (`MERGE ... WHEN MATCHED THEN DELETE`) and
+`BENCH_SCRIPT=stats_bench.py` (`compute_table_stats`) with `tornadovm/run.sh spark`.
+
+| Property | Default | |
+|---|---|---|
+| `iceberg.tornadovm.batch-rows` | 8M | rows a batch |
+| `iceberg.tornadovm.streams` | 3 | batches in flight, one CUDA stream each |
+| `iceberg.tornadovm.deleteKeys.inLimit` | 1000 | up to this many keys prune by `IN`, more by range |
+| `iceberg.tornadovm.positionWriters` | 0 (auto: one per 32k positions, up to a core each) | v2 position-delete writers |
+| `tornado.cuda.sched` | `yield` | `blocking`: waiting threads sleep; less host CPU, a little slower (TornadoVM #1277) |
 
 To run everything on a new machine with one command (checks, build, tables, every suite,
 summary), use `mikepapadim/iceberg-gpu-bench`.
