@@ -27,7 +27,12 @@ exactly is left to Spark:
 |---|---|---|
 | **Reads**: a Spark task's data files are read on the GPU with their position, deletion-vector and equality deletes applied and Spark's pushed filters evaluated, and come back as `ColumnarBatch`es | `ColumnarReaderProvider`, a ServiceLoader SPI in Iceberg's Spark module | Parquet files read whole; columns are int, bigint, float, double, date, timestamp, string or decimal up to 18 digits, and at least one is not a string; a task of at least `spark.iceberg.gpu.minRows` rows |
 | **Grouped aggregates**: an `Aggregate` over filters and projections of one Iceberg table runs as a single GPU scan, and only the groups come back | planner strategy (`GpuAggregateExtensions`) | SUM / AVG / COUNT of products of double columns and `1 - c` / `1 + c`; integer and decimal sums the files' bounds prove exact; up to 4 group columns or Iceberg's `bucket(n, bigint)`; value columns null-free by metrics |
-| **Compaction**: `rewrite_data_files` (bin-pack) rewrites each file group on the GPU, and Iceberg's action plans and commits as usual | `FileRewriteRunnerProvider`, a ServiceLoader SPI in Iceberg's Spark module | unpartitioned, unsorted tables whose columns are int, bigint, float, double, date, timestamp or decimal up to 18 digits |
+| **Compaction**: `rewrite_data_files` (bin-pack) rewrites each file group on the GPU, and Iceberg's action plans and commits as usual | `FileRewriteRunnerProvider`, a ServiceLoader SPI in Iceberg's Spark module | unsorted tables, partitioned or not (one partition spec), whose columns are int, bigint, float, double, date, timestamp, string or decimal up to 18 digits |
+
+All three work on tables on local disk or on an object store (S3, GCS, ADLS: anything Iceberg's
+`FileIO` reads), with merge-on-read deletes of every kind, and on evolved schemas: columns added
+after a file was written read as nulls, and int→long and float→double promotions are widened on
+the device.
 
 Answers match Spark's. The tests compare every path with the GPU on and off. On TPC-DS SF10 after
 merge-on-read maintenance, all 102 runnable queries return identical results on Spark, Spark + GPU
@@ -57,8 +62,8 @@ spark.iceberg.gpu.read.enabled=false
 - JDK 21. The device scan uses Java's foreign-memory API, which needs `--enable-preview` on 21.
 - Spark 3.5 (Scala 2.12), **local mode**: the GPU work runs in the driver JVM.
 - A TornadoVM SDK built with the CUDA backend and the cuDF shim (`libtornado-cudf.so`), with
-  `TORNADOVM_HOME` set. That means TornadoVM 7.2 or later, plus #1215 for decimal columns and #1219,
-  so that cuDF's memory pool gives memory back between calls.
+  `TORNADOVM_HOME` set. That means TornadoVM 7.2 or later, plus #1215 (decimals), #1219 (cuDF's
+  memory pool gives memory back), #1220 (evolved schemas) and #1221 (strings in compaction).
 - libcudf 26.08 (the `libcudf-cu12` wheels) and its dependencies on `LD_LIBRARY_PATH`.
 
 ## Build and run
@@ -101,6 +106,9 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 | `tornado.device.memory` | `20GB` (`GPU_DEVICE_MEMORY`) | TornadoVM's share of device memory. Leave a few GB for cuDF's own allocations |
 | `iceberg.tornadovm.streams` | `4` | concurrent device streams |
 | `iceberg.tornadovm.rewriteStreams` | the streams | concurrent streams of a compaction's file group. Each holds a batch's read, gathered and encoded columns at once |
+| `iceberg.tornadovm.cacheDir` | `java.io.tmpdir`/`iceberg-tornadovm-cache` | local copies of object-store files |
+| `iceberg.tornadovm.cacheBytes` | 64 GB | the cache's size; least recently used files go first |
+| `iceberg.tornadovm.fetchThreads` | `16` | parallel fetches from the object store |
 | `iceberg.tornadovm.sharedPools` | `6` | table and projection shapes that keep device buffers. Past this, the least recently used idle ones are freed |
 | `iceberg.tornadovm.spark.debug` | `false` | per-task timings on stderr |
 | `iceberg.tornadovm.debug` | `false` | per-batch and per-compaction-group sizes on stderr |
@@ -108,7 +116,12 @@ CALL local.system.rewrite_data_files(table => 'db.sales')
 ## Limits
 
 - Local mode only.
-- No rewrites of partitioned or sorted tables, string columns, or decimals over 18 digits.
+- No rewrites of sorted tables, of tables whose partition spec evolved, or of decimals over 18
+  digits.
+- Object-store files are fetched whole into a local cache before cuDF reads them (and a
+  compaction's files are uploaded after it writes them); the cache needs local disk.
+- Columns added with a default value (v3), required added columns and added string columns are
+  declined.
 - Nested types are not read.
 - Reads take whole Parquet files only, as Iceberg plans unsplit files. A file split inside a task is
   read by Spark.
