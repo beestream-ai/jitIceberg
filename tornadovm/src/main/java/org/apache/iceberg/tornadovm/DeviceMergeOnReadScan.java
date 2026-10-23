@@ -3645,6 +3645,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                   Math.min(
                       Math.min(entries.size(), Runtime.getRuntime().availableProcessors()),
                       Math.max(1, (positions + POSITIONS_PER_WRITER - 1) / POSITIONS_PER_WRITER));
+          int writersSet = Integer.getInteger("iceberg.tornadovm.positionWriters", 0);
+          if (writersSet > 0) {
+            threads = Math.min(entries.size(), writersSet);
+          }
           ExecutorService writers = Executors.newFixedThreadPool(Math.max(1, threads));
           try {
             List<java.util.concurrent.Future<DeleteFile>> futures = Lists.newArrayList();
