@@ -69,7 +69,8 @@ public final class MorBench {
     String query = args[2];
     int runs = Integer.parseInt(args[3]);
     int threads = Integer.getInteger("threads", Runtime.getRuntime().availableProcessors());
-    System.out.println("table,engine,query,run,warmup,millis,live_rows,checksum,breakdown");
+    System.out.println(
+        "table,engine,query,run,warmup,millis,live_rows,checksum,breakdown,cpu_seconds");
     for (int t = 4; t < args.length; t++) {
       Table table = MorTables.load(warehouse + "/" + args[t]);
       // One scan object a table, as an engine keeps its operators: a device scan keeps its buffers
@@ -84,6 +85,8 @@ public final class MorBench {
           rewriteRun(table, (DeviceMergeOnReadScan) scan, run, args[t], threads, query);
           continue;
         }
+        beforeRun();
+        long cpuStart = PROCESS.getProcessCpuTime();
         long start = System.nanoTime();
         double[] answer;
         String breakdown = "";
@@ -94,10 +97,12 @@ public final class MorBench {
           breakdown = scan.metrics().toString();
         }
         double millis = (System.nanoTime() - start) / 1e6;
+        // The JVM's CPU time over the run, every thread: what the query cost the host.
+        double cpuSeconds = (PROCESS.getProcessCpuTime() - cpuStart) / 1e9;
         System.out.println(
             String.format(
                 Locale.ROOT,
-                "%s,%s,%s,%d,%s,%.1f,%d,%.6e,\"%s\"",
+                "%s,%s,%s,%d,%s,%.1f,%d,%.6e,\"%s\",%.2f",
                 args[t],
                 engine,
                 query,
@@ -106,7 +111,8 @@ public final class MorBench {
                 millis,
                 (long) answer[0],
                 answer[1],
-                breakdown));
+                breakdown,
+                cpuSeconds));
       }
       if (scan instanceof AutoCloseable closeable) {
         try {
@@ -115,6 +121,39 @@ public final class MorBench {
           throw new IllegalStateException(e);
         }
       }
+    }
+    // Object-store clients (S3FileIO) start threads that are not daemons.
+    System.exit(0);
+  }
+
+  private static final com.sun.management.OperatingSystemMXBean PROCESS =
+      (com.sun.management.OperatingSystemMXBean)
+          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+
+  /**
+   * Runs {@code -Dbench.beforeRun=<command>} before each timed run, outside the timing -- dropping
+   * the page cache of the table's files, for cold reads -- after dropping cached object-store
+   * copies if {@code -Dbench.coldObjectStore=true}.
+   */
+  private static void beforeRun() {
+    // -Dbench.coldObjectStore=true: every run fetches object-store files again.
+    if (Boolean.getBoolean("bench.coldObjectStore")) {
+      DeviceMergeOnReadScan.clearObjectStoreCache();
+    }
+    String command = System.getProperty("bench.beforeRun");
+    if (command == null) {
+      return;
+    }
+    try {
+      int status = new ProcessBuilder("sh", "-c", command).inheritIO().start().waitFor();
+      if (status != 0) {
+        throw new IllegalStateException("bench.beforeRun failed: " + status);
+      }
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(e);
     }
   }
 
@@ -204,11 +243,13 @@ public final class MorBench {
       Table table, DeviceMergeOnReadScan scan, int run, String name, int threads, String query) {
     table.refresh();
     long snapshot = table.currentSnapshot().snapshotId();
+    long cpuStart = PROCESS.getProcessCpuTime();
     long start = System.nanoTime();
     // zorder: the same compaction, each file written in Iceberg's Z-order of (k, v1).
     DeviceMergeOnReadScan.RewriteResult result =
         "zorder".equals(query) ? scan.rewriteDataFilesZOrder("k", "v1") : scan.rewriteDataFiles();
     double millis = (System.nanoTime() - start) / 1e6;
+    double cpuSeconds = (PROCESS.getProcessCpuTime() - cpuStart) / 1e9;
     table.refresh();
     double[] check = run(CpuMergeOnReadScan.of(table, threads), "q2");
     List<String> added = Lists.newArrayList();
@@ -223,7 +264,7 @@ public final class MorBench {
     System.out.println(
         String.format(
             Locale.ROOT,
-            "%s,gpu,%s,%d,%s,%.1f,%d,%.6e,\"%s; %d data + %d delete files -> %d files\"",
+            "%s,gpu,%s,%d,%s,%.1f,%d,%.6e,\"%s; %d data + %d delete files -> %d files\",%.2f",
             name,
             query,
             run,
@@ -234,7 +275,8 @@ public final class MorBench {
             scan.metrics(),
             result.dataFilesRemoved(),
             result.deleteFilesRemoved(),
-            result.dataFilesAdded()));
+            result.dataFilesAdded(),
+            cpuSeconds));
   }
 
   /** Q5's filter: ids are ascending file by file, so the id bound prunes three files in four. */

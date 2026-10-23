@@ -23,17 +23,19 @@
 #
 #   source tornadovm/cudf-env.sh [DIR]       DIR defaults to ~/.iceberg-tornadovm/cudf
 #
-# CUDF_VERSION picks the release (default 26.8.*, the one this module is tested with).
+# CUDF_VERSION picks the release (default 26.8.*, the one this module is tested with);
+# CUDF_PACKAGE the CUDA build (libcudf-cu12 by default, libcudf-cu13 for a CUDA 13 toolkit).
 
 CUDF_VERSION="${CUDF_VERSION:-26.8.*}"
+CUDF_PACKAGE="${CUDF_PACKAGE:-libcudf-cu12}"
 CUDF_DIR="${1:-$HOME/.iceberg-tornadovm/cudf}"
 
 if [ ! -s "$CUDF_DIR/ld_library_path" ]; then
-    echo "Installing libcudf $CUDF_VERSION into $CUDF_DIR" >&2
+    echo "Installing $CUDF_PACKAGE $CUDF_VERSION into $CUDF_DIR" >&2
     mkdir -p "$CUDF_DIR/wheels"
     python3 -m pip download --quiet --timeout 120 --retries 10 --only-binary=:all: --python-version 3.12 \
         --platform manylinux_2_28_x86_64 --platform manylinux_2_27_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
-        --extra-index-url https://pypi.nvidia.com -d "$CUDF_DIR/wheels" "libcudf-cu12==$CUDF_VERSION" \
+        --extra-index-url https://pypi.nvidia.com -d "$CUDF_DIR/wheels" "$CUDF_PACKAGE==$CUDF_VERSION" \
         || { echo "cudf-env.sh: downloading the libcudf wheels failed" >&2; return 1 2>/dev/null || exit 1; }
     for wheel in "$CUDF_DIR"/wheels/*.whl; do
         python3 -m zipfile -e "$wheel" "$CUDF_DIR"

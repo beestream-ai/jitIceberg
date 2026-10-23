@@ -21,7 +21,8 @@
 #
 #   run.sh gen      <warehouse> <files> <rowsPerFile>
 #   run.sh gpu      <warehouse> <q1|q2|q3|q4> <runs> <table>...     TornadoVM JVM, CUDA device
-#   run.sh cpu      <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, all cores (THREADS=n)
+#   run.sh cpu      <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, all cores (THREADS=n);
+#                                                                    MAIN=<class> runs another benchmark there
 #   run.sh generics <warehouse> <q1|q2|q3|q4> <runs> <table>...     plain JVM, IcebergGenerics, 1 thread
 #   run.sh spark    <warehouse> <q1|q2|q3|q4> <runs> <table>...     Spark local[*] + iceberg-spark-runtime
 #   BENCH_SCRIPT=tpcds_bench.py run.sh spark|rapids|spark-gpu <warehouse>/<namespace> <query dir> <runs> [q...]
@@ -76,6 +77,12 @@ case "$mode" in
         ;;
     cpu|generics)
         CP="$(classpath):$(ls "$TORNADOVM_HOME"/share/java/tornado/tornado-{api,cudf}-*.jar | tr '\n' ':')"
+        # MAIN=<class> runs another benchmark (ConvertBench, say) in this plain JVM, whose heap is not
+        # capped for TornadoVM; its arguments are passed as given.
+        if [ -n "${MAIN:-}" ]; then
+            exec "$JAVA_HOME/bin/java" -Xmx"$HEAP" --enable-preview --add-opens=java.base/java.nio=ALL-UNNAMED -Dthreads="${THREADS:-$(nproc)}" -cp "$CP" \
+                "$MAIN" "$@"
+        fi
         exec "$JAVA_HOME/bin/java" -Xmx"$HEAP" --enable-preview --add-opens=java.base/java.nio=ALL-UNNAMED -Dthreads="${THREADS:-$(nproc)}" -cp "$CP" \
             org.apache.iceberg.tornadovm.bench.MorBench "$1" "$mode" "${@:2}"
         ;;
