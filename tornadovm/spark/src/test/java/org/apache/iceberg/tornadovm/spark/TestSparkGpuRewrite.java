@@ -93,7 +93,8 @@ public class TestSparkGpuRewrite {
     return out;
   }
 
-  private static Table table(Path temp, String name, boolean withString) {
+  /** {@code withBoolean}: a column type the device does not write, so Spark's runner takes it. */
+  private static Table table(Path temp, String name, boolean withBoolean) {
     List<Types.NestedField> fields =
         Lists.newArrayList(
             Types.NestedField.required(1, "id", Types.LongType.get()),
@@ -102,9 +103,10 @@ public class TestSparkGpuRewrite {
             Types.NestedField.optional(4, "net", Types.DecimalType.of(15, 2)),
             Types.NestedField.optional(5, "ratio", Types.FloatType.get()),
             Types.NestedField.optional(6, "score", Types.DoubleType.get()),
-            Types.NestedField.optional(7, "day", Types.DateType.get()));
-    if (withString) {
-      fields.add(Types.NestedField.optional(8, "note", Types.StringType.get()));
+            Types.NestedField.optional(7, "day", Types.DateType.get()),
+            Types.NestedField.optional(8, "note", Types.StringType.get()));
+    if (withBoolean) {
+      fields.add(Types.NestedField.optional(9, "flag", Types.BooleanType.get()));
     }
     Schema schema = new Schema(fields);
     Table table = MorTables.create(temp.resolve(name).toString(), schema, 2);
@@ -127,8 +129,10 @@ public class TestSparkGpuRewrite {
                 record.setField("ratio", i % 7 == 0 ? null : (float) id / 3);
                 record.setField("score", id * 0.5);
                 record.setField("day", LocalDate.of(2026, 10, 1).plusDays(i % 40));
-                if (withString) {
-                  record.setField("note", "note " + id);
+                record.setField(
+                    "note", i % 8 == 0 ? null : "note " + id + " Ωé " + "x".repeat((int) (i % 20)));
+                if (withBoolean) {
+                  record.setField("flag", i % 2 == 0);
                 }
                 return record;
               }));
@@ -161,7 +165,7 @@ public class TestSparkGpuRewrite {
     Table onDevice = table(temp, "device", false);
     Table onSpark = table(temp, "spark", true);
     assertThat(GpuFileRewriteRunnerProvider.unsupported(onDevice)).isNull();
-    assertThat(GpuFileRewriteRunnerProvider.unsupported(onSpark)).contains("note");
+    assertThat(GpuFileRewriteRunnerProvider.unsupported(onSpark)).contains("flag");
 
     List<String> deviceBefore = rows(onDevice.location());
     List<String> sparkBefore = rows(onSpark.location());
@@ -184,7 +188,7 @@ public class TestSparkGpuRewrite {
 
     assertThat(deviceGroups).as("file groups rewritten on the device").isGreaterThan(0);
     assertThat(GpuFileRewriteRunnerProvider.GROUPS.get() - groups)
-        .as("no group of the string table on the device")
+        .as("no group of the boolean table on the device")
         .isEqualTo(deviceGroups);
     assertThat(deviceResult.rewrittenDataFilesCount()).isEqualTo(4);
     assertNoDeletes(onDevice);

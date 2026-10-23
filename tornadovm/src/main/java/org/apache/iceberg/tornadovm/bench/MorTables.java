@@ -115,6 +115,33 @@ public final class MorTables {
     }
   }
 
+  /**
+   * {@link #writeDataFile(Table, long, LongFunction)} into one partition of a partitioned table:
+   * every row must belong to {@code partition}.
+   */
+  public static DataFile writeDataFile(
+      Table table, org.apache.iceberg.StructLike partition, long rows, LongFunction<Record> row) {
+    OutputFile out = newFile(table, "data");
+    try {
+      DataWriter<Record> writer =
+          Parquet.writeData(out)
+              .forTable(table)
+              .createWriterFunc(GenericParquetWriter::create)
+              .withSpec(table.spec())
+              .withPartition(partition)
+              .overwrite()
+              .build();
+      try (DataWriter<Record> closing = writer) {
+        for (long i = 0; i < rows; i++) {
+          closing.write(row.apply(i));
+        }
+      }
+      return writer.toDataFile();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   public static void append(Table table, List<DataFile> files) {
     AppendFiles append = table.newAppend();
     files.forEach(append::appendFile);
@@ -141,7 +168,7 @@ public final class MorTables {
           for (int f = 0; f < files.size(); f++) {
             String path = files.get(f).location();
             for (long position : positions.get(f)) {
-              closing.delete(path, position, table.spec(), null);
+              closing.delete(path, position, table.spec(), files.get(f).partition());
             }
           }
         }
@@ -158,6 +185,7 @@ public final class MorTables {
                   // marks a delete file as scoped to one data file.
                   .metricsConfig(MetricsConfig.forPositionDelete())
                   .withSpec(table.spec())
+                  .withPartition(files.get(f).partition())
                   .overwrite()
                   .buildPositionWriter();
           PositionDelete<Record> delete = PositionDelete.create();

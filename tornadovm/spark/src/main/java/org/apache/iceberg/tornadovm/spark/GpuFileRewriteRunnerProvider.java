@@ -38,9 +38,10 @@ import org.apache.spark.sql.SparkSession;
  * Spark's bin-pack {@code rewrite_data_files} on the GPU: each file group's live rows -- deletes
  * applied -- are read, gathered and written to new Parquet files on the device, and the action
  * commits them as it would Spark's. Turned on by {@code spark.iceberg.gpu.enabled} (and off again
- * by {@code spark.iceberg.gpu.rewrite.enabled=false}), in local mode, for an unpartitioned and
- * unsorted table whose columns the device writes: int, bigint, float, double, date, timestamp and
- * decimals of up to 18 digits. Anything else gets Spark's own runner.
+ * by {@code spark.iceberg.gpu.rewrite.enabled=false}), in local mode, for an unsorted table --
+ * partitioned or not, on local disk or an object store -- whose columns the device writes: int,
+ * bigint, float, double, date, timestamp, string and decimals of up to 18 digits. Anything else
+ * gets Spark's own runner.
  */
 public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
   private static final org.slf4j.Logger LOG =
@@ -75,15 +76,17 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
 
   /** Why the device cannot rewrite the table as Spark's bin-pack would, or null. */
   static String unsupported(Table table) {
-    if (!table.spec().isUnpartitioned()) {
-      return "partitioned";
+    if (table.specs().size() > 1) {
+      // Files of an older spec would be rewritten into the current one, which needs Spark's
+      // repartitioning; a table that never changed its spec has one file group a partition.
+      return "its partition spec evolved";
     }
     if (table.sortOrder().isSorted()) {
       return "sorted (Spark's writer would order the rows)";
     }
     for (Types.NestedField field : table.schema().columns()) {
       switch (field.type().typeId()) {
-        case INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP -> {}
+        case INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING -> {}
         case DECIMAL -> {
           if (((Types.DecimalType) field.type()).precision() > 18) {
             return field.name() + " has over 18 digits";
