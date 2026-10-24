@@ -65,6 +65,11 @@ case "$mode" in
     gpu)
         # MAIN=<class> runs another main class (a probe, say) with the same JVM settings.
         CP="$(classpath)"
+        # libcudf decompresses a ZSTD page with one thread block; a large page (a dictionary of
+        # high-cardinality keys, TPC-DS's ss_ticket_number) takes 100+ ms that way. HYBRID gives
+        # the largest pages to host threads: equality-delete conversion and reads on TPC-DS 2x
+        # faster, the 100M-row suite and sorted compaction unchanged.
+        export LIBCUDF_HOST_DECOMPRESSION="${LIBCUDF_HOST_DECOMPRESSION:-HYBRID}"
         # The argfile puts TornadoVM on the module path; -da for TornadoVM packages, see build.gradle.
         # tornado.device.memory is TornadoVM's own device budget (4 GB by default); buffers a closed
         # plan released stay counted against it until reused by the same access type.
