@@ -805,18 +805,33 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     if (filter.op() != Expression.Operation.TRUE) {
       throw new UnsupportedOperationException("A rewrite of part of a table is not supported");
     }
-    metrics = new ScanMetrics();
     long start = System.nanoTime();
-    Planned planned = new Planned(null, rewriteColumns(), null, BATCH_ROWS, true, true);
-    List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
-    long rows = write(planned, order, written, start);
+    table.refresh();
+    Long snapshotId = table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
+    List<FileScanTask> tasks = Lists.newArrayList();
+    try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+      planned.forEach(tasks::add);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+    // As a file group: batches sized by the rows' decoded width, halved on running out of device
+    // memory, so a wide table (TPC-DS store_sales: 23 columns) fits as a narrow one does.
+    List<DataFile> written =
+        rewriteGroup(
+            tasks,
+            org.apache.iceberg.util.PropertyUtil.propertyAsLong(
+                table.properties(),
+                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
+                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT),
+            order);
+    long rows = written.stream().mapToLong(DataFile::recordCount).sum();
 
     java.util.Set<String> deletesSeen = new java.util.HashSet<>();
     RewriteFiles rewrite = table.newRewrite();
-    if (planned.snapshotId != null) {
-      rewrite.validateFromSnapshot(planned.snapshotId);
+    if (snapshotId != null) {
+      rewrite.validateFromSnapshot(snapshotId);
     }
-    for (FileScanTask task : planned.tasks) {
+    for (FileScanTask task : tasks) {
       rewrite.deleteFile(task.file());
       for (DeleteFile delete : task.deletes()) {
         if (deletesSeen.add(delete.location())) {
@@ -827,7 +842,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     written.forEach(rewrite::addFile);
     rewrite.commit();
     metrics.total((System.nanoTime() - start) / 1e6);
-    return new RewriteResult(planned.tasks.size(), deletesSeen.size(), written.size(), rows);
+    return new RewriteResult(tasks.size(), deletesSeen.size(), written.size(), rows);
   }
 
   /** What {@link #convertEqualityDeletes()} did. */
@@ -1384,10 +1399,6 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   }
 
   /** Writes the planned tasks' live rows into new files, added to {@code written}; their rows. */
-  private long write(Planned planned, RowOrder order, List<DataFile> written, long start) {
-    return write(planned, order, written, start, STREAMS);
-  }
-
   private long write(
       Planned planned, RowOrder order, List<DataFile> written, long start, int maxStreams) {
     int formatVersion =
@@ -1667,7 +1678,6 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   private final class Planned {
     private final List<List<FileScanTask>> batches = Lists.newArrayList();
     private final List<FileScanTask> tasks;
-    private final Long snapshotId;
     private final ScanLayout layout;
     private final HostDeletes host;
     private final Integer equalityKeyId;
@@ -1732,8 +1742,6 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         long givenBatchRows,
         boolean padGiven,
         boolean rewrite) {
-      this.snapshotId =
-          table.currentSnapshot() == null ? null : table.currentSnapshot().snapshotId();
       this.given = given != null;
       if (given != null) {
         this.tasks = Lists.newArrayList(given);
