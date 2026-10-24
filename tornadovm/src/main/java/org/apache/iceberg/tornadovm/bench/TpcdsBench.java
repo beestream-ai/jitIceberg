@@ -60,7 +60,7 @@ public final class TpcdsBench {
     for (int t = 3; t < args.length; t++) {
       Table table = MorTables.load(warehouse + "/" + args[t]);
       try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
-        double[] answer = sales(device);
+        double[] answer = sales(table, device);
         for (String engine : "convert".equals(operation) ? List.of("gpu", "cpu") : List.of("gpu")) {
           for (int run = 0; run < runs; run++) {
             table.refresh();
@@ -70,7 +70,7 @@ public final class TpcdsBench {
             String detail =
                 switch (operation) {
                   case "agg" -> {
-                    answer = sales(device);
+                    answer = sales(table, device);
                     yield device.metrics().toString();
                   }
                   case "convert" -> {
@@ -97,7 +97,7 @@ public final class TpcdsBench {
             double cpuSeconds = (PROCESS.getProcessCpuTime() - cpu) / 1e9;
             if (!"agg".equals(operation)) {
               table.refresh();
-              double[] after = sales(device);
+              double[] after = sales(table, device);
               if (after[0] != answer[0] || Math.abs(after[1] - answer[1]) > 1e-6 * answer[1]) {
                 throw new IllegalStateException(
                     args[t] + ": " + operation + " changed the answer: " + after[0]);
@@ -124,17 +124,31 @@ public final class TpcdsBench {
     System.exit(0);
   }
 
-  private static double[] sales(DeviceMergeOnReadScan device) {
+  private static final List<String> SUMS =
+      ImmutableList.of("ss_quantity", "ss_net_paid", "ss_ext_sales_price");
+
+  private static double[] sales(Table table, DeviceMergeOnReadScan device) {
     GroupedAggregate result =
         device.aggregate(
             ImmutableList.of("ss_store_sk"),
             ImmutableList.of(
-                DeviceValue.of("ss_quantity"),
-                DeviceValue.of("ss_net_paid"),
-                DeviceValue.of("ss_ext_sales_price")));
+                DeviceValue.of(SUMS.get(0)),
+                DeviceValue.of(SUMS.get(1)),
+                DeviceValue.of(SUMS.get(2))));
+    // A decimal sums as its unscaled value: scaled here, to compare with Spark's sums.
+    double[] unit = new double[SUMS.size()];
+    for (int v = 0; v < unit.length; v++) {
+      org.apache.iceberg.types.Type type = table.schema().findType(SUMS.get(v));
+      unit[v] =
+          type instanceof org.apache.iceberg.types.Types.DecimalType decimal
+              ? Math.pow(10, -decimal.scale())
+              : 1;
+    }
     double checksum = 0;
     for (double[] totals : result.groups().values()) {
-      checksum += totals[0] + totals[1] + totals[2];
+      for (int v = 0; v < unit.length; v++) {
+        checksum += totals[v] * unit[v];
+      }
     }
     return new double[] {result.rows(), checksum};
   }
