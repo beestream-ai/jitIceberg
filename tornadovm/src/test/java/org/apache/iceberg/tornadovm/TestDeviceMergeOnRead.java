@@ -326,6 +326,67 @@ public class TestDeviceMergeOnRead {
   }
 
   /**
+   * Grouped by a key whose footer bounds span few values (a dense group-by, nulls in their own
+   * slot) and by one whose bounds do not (the hash group-by), under position and equality deletes.
+   */
+  @Test
+  public void testDenseGroupBy() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "k", Types.IntegerType.get()),
+            Types.NestedField.required(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.required(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("dense").toString(), schema, 2);
+    List<DataFile> files = Lists.newArrayList();
+    for (int f = 0; f < 3; f++) {
+      int first = f * 5000;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              5000,
+              i -> {
+                Record record = row(schema, 0, first + i);
+                record.setField("id", (long) (first + i) * 1_000_003L);
+                record.setField("k", i % 13 == 0 ? null : (int) (-40 + (first + i) % 97));
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(5000, 7), everyNth(5000, 7), everyNth(5000, 7)));
+    MorTables.deleteEqual(table, "id", ImmutableList.of(0L, 1_000_003L * 4321, 1_000_003L * 9999));
+    table.refresh();
+    for (String key : ImmutableList.of("k", "id")) {
+      Map<List<Object>, double[]> expected = Maps.newHashMap();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record r : records) {
+          Object value = r.getField(key);
+          List<Object> group = Lists.newArrayList();
+          group.add(value == null ? null : ((Number) value).longValue());
+          double[] t = expected.computeIfAbsent(group, ignored -> new double[2]);
+          t[0] += (Double) r.getField("v1");
+          t[1] += 1;
+        }
+      }
+      try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+        Map<List<Object>, double[]> actual =
+            device
+                .aggregate(ImmutableList.of(key), ImmutableList.of(DeviceValue.of("v1")))
+                .groups();
+        assertThat(actual.keySet()).as(key).isEqualTo(expected.keySet());
+        for (Map.Entry<List<Object>, double[]> e : expected.entrySet()) {
+          assertThat(actual.get(e.getKey())[0])
+              .isCloseTo(e.getValue()[0], org.assertj.core.data.Offset.offset(1e-6));
+          assertThat(actual.get(e.getKey())[1]).isEqualTo(e.getValue()[1]);
+        }
+      }
+    }
+  }
+
+  /**
    * Equality deletes over two columns, (id, k), as CDC writes them: a pair deletes a row only when
    * both match, and a null id matches a null id. Thousands of random pairs exercise the hash
    * search; a file appended after the deletes keeps its rows.

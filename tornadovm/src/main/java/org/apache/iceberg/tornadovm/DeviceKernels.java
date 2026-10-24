@@ -741,6 +741,96 @@ final class DeviceKernels {
     }
   }
 
+  /** Group keys a dense group-by holds, the null key's slot not counted. */
+  static final int DENSE_SLOTS = 4096;
+
+  /** Copies of a dense group-by's sums: blocks add into copy {@code group % DENSE_COPIES}. */
+  static final int DENSE_COPIES = 32;
+
+  /**
+   * A group-by over one integer key whose values lie in a small range ({@code dense}: on, the
+   * smallest key, the slots with the null key's last): each live row adds its value columns to its
+   * key's slot in one of {@link #DENSE_COPIES} copies, so the blocks of a batch contend on as many
+   * addresses as the copies hold, not on a few hash slots. A key outside the range is counted in
+   * {@code misses}.
+   */
+  static void denseGroups(
+      KernelContext context,
+      LongArray dense,
+      IntArray spec,
+      ByteArray live,
+      IntArray ints,
+      LongArray longs,
+      ByteArray valid,
+      int stride,
+      DoubleArray values,
+      int columns,
+      DoubleArray copies,
+      IntArray misses) {
+    int i = context.globalIdx;
+    if (i < stride && dense.get(0) != 0 && live.get(i) != 0) {
+      int slots = (int) dense.get(2);
+      int validSlot = spec.get(2);
+      long slot;
+      if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+        slot = slots - 1L;
+      } else if (spec.get(0) == 0) {
+        slot = ints.get(spec.get(1) * stride + i) - dense.get(1);
+        slot = slot < slots - 1 ? slot : -1;
+      } else {
+        slot = longs.get((long) spec.get(1) * stride + i) - dense.get(1);
+        slot = slot < slots - 1 ? slot : -1;
+      }
+      if (slot < 0) {
+        context.atomicAdd(misses, 0, 1);
+      } else {
+        int base = ((context.groupIdx % DENSE_COPIES) * (DENSE_SLOTS + 1) + (int) slot) * columns;
+        for (int c = 0; c < columns; c++) {
+          double value = values.get((long) c * stride + i);
+          if (value != 0.0) {
+            context.atomicAdd(copies, base + c, value);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Sums the copies of {@link #denseGroups} into the output a hash group-by writes -- keys, then
+   * the value columns of each slot, {@code stride} apart, and the slot count -- and zeroes them for
+   * the next batch. Slots no row reached have a row count of 0.
+   */
+  static void denseReduce(
+      KernelContext context,
+      LongArray dense,
+      int columns,
+      DoubleArray copies,
+      int stride,
+      LongArray keys,
+      DoubleArray sums,
+      IntArray groups) {
+    if (dense.get(0) != 0) {
+      int slots = (int) dense.get(2);
+      for (int t = context.globalIdx; t < slots * columns; t += context.globalGroupSizeX) {
+        int slot = t / columns;
+        int c = t - slot * columns;
+        double total = 0.0;
+        for (int copy = 0; copy < DENSE_COPIES; copy++) {
+          int at = (copy * (DENSE_SLOTS + 1) + slot) * columns + c;
+          total += copies.get(at);
+          copies.set(at, 0.0);
+        }
+        sums.set((long) c * stride + slot, total);
+        if (c == 0) {
+          keys.set(slot, slot == slots - 1 ? NULL_KEY : dense.get(1) + slot);
+        }
+      }
+      if (context.globalIdx == 0) {
+        groups.set(0, slots);
+      }
+    }
+  }
+
   /**
    * Ints of {@code spec} a value: its factor count, then kind, slot and validity slot a factor,
    * then the index of its non-null count column ({@code -1} for a value that cannot be null).

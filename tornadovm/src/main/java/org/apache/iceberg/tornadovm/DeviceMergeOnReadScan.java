@@ -3034,6 +3034,12 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final IntArray outGroups = hostInts(1);
     private final int[] size;
     private final GroupedStage.Instance stage;
+    // The dense group-by (DeviceKernels.denseGroups): the key's field id, or -1 when its type rules
+    // it out; a batch takes it when its files' footers bound the key to DENSE_SLOTS values.
+    private final int denseKeyId;
+    private final LongArray dense = hostLongs(3);
+    private final DoubleArray copies;
+    private final IntArray misses = hostInts(1);
 
     GroupedRegion(
         Planned planned, List<String> groupColumns, List<DeviceValue> sums, GroupedStage stage) {
@@ -3090,6 +3096,20 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       this.outSums = hostDoubles((long) (values + 1 + counts) * capacity);
       this.size = new int[] {capacity, groupKeyColumns, values + 1 + counts};
       this.stage = stage == null ? null : stage.open(new StageContext());
+      Types.NestedField key = keys == 1 ? column(groupColumns.get(0)) : null;
+      this.denseKeyId =
+          stage == null
+                  && key != null
+                  && (key.type().typeId() == org.apache.iceberg.types.Type.TypeID.INTEGER
+                      || key.type().typeId() == org.apache.iceberg.types.Type.TypeID.LONG)
+                  && !Ablation.off("dense")
+              ? key.fieldId()
+              : -1;
+      this.copies =
+          hostDoubles(
+              denseKeyId < 0
+                  ? 1
+                  : (long) DeviceKernels.DENSE_COPIES * (DeviceKernels.DENSE_SLOTS + 1) * size[2]);
     }
 
     /** What the stage sees of this region. */
@@ -3187,7 +3207,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     @Override
     List<String> extraTasks() {
-      return stage == null ? List.of() : stage.tasks();
+      return stage != null
+          ? stage.tasks()
+          : denseKeyId >= 0 ? List.of("dense", "denseReduce") : List.of();
     }
 
     @Override
@@ -3196,6 +3218,33 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       if (stage != null) {
         stage.stage(executionPlan);
       }
+      if (denseKeyId >= 0) {
+        long[] range = denseRange(prep.tasks());
+        dense.set(0, range == null ? 0 : 1);
+        dense.set(1, range == null ? 0 : range[0]);
+        dense.set(2, range == null ? 0 : range[1] - range[0] + 2);
+        misses.set(0, 0);
+        size[0] = range == null ? capacity : 0;
+      }
+    }
+
+    /** The key's smallest and largest value over a batch's files, if few enough to go dense. */
+    private long[] denseRange(List<FileScanTask> tasks) {
+      long min = Long.MAX_VALUE;
+      long max = Long.MIN_VALUE;
+      for (FileScanTask task : tasks) {
+        long[] bounds =
+            HostDeletes.bounds(LocalFiles.path(task.file().location(), table.io()), denseKeyId);
+        if (bounds == null) {
+          return null;
+        }
+        min = Math.min(min, bounds[0]);
+        max = Math.max(max, bounds[1]);
+      }
+      long spread = max - min;
+      return min <= max && spread >= 0 && spread < DeviceKernels.DENSE_SLOTS
+          ? new long[] {min, max}
+          : null;
     }
 
     @Override
@@ -3240,19 +3289,54 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           return;
         }
       }
-      graph
-          .libraryTask(
-              "groupBy",
-              Cudf::groupAggregateLongs,
-              size,
-              CudfAggregation.SUM.code(),
-              keyColumnsData,
-              valueData,
-              capacity,
-              outKeys,
-              outSums,
-              outGroups)
-          .transferToHost(DataTransferMode.UNDER_DEMAND, outKeys, outSums, outGroups);
+      if (denseKeyId >= 0) {
+        graph
+            .transferToDevice(DataTransferMode.EVERY_EXECUTION, dense, misses)
+            .transferToDevice(DataTransferMode.FIRST_EXECUTION, copies)
+            .task(
+                "dense",
+                DeviceKernels::denseGroups,
+                context,
+                dense,
+                groupSpec,
+                live,
+                ints,
+                longs,
+                valid,
+                capacity,
+                valueData,
+                size[2],
+                copies,
+                misses);
+      }
+      // Rows 0 (size[0]) when the batch went dense: the reduce below writes the groups instead.
+      graph.libraryTask(
+          "groupBy",
+          Cudf::groupAggregateLongs,
+          size,
+          CudfAggregation.SUM.code(),
+          keyColumnsData,
+          valueData,
+          capacity,
+          outKeys,
+          outSums,
+          outGroups);
+      if (denseKeyId >= 0) {
+        graph
+            .task(
+                "denseReduce",
+                DeviceKernels::denseReduce,
+                context,
+                dense,
+                size[2],
+                copies,
+                capacity,
+                outKeys,
+                outSums,
+                outGroups)
+            .transferToHost(DataTransferMode.UNDER_DEMAND, misses);
+      }
+      graph.transferToHost(DataTransferMode.UNDER_DEMAND, outKeys, outSums, outGroups);
     }
 
     /** Copies back one batch's groups and merges them; returns the batch's live rows. */
@@ -3262,6 +3346,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
       executed.transferToHost(outGroups);
       int groups = outGroups.get(0);
+      if (dense.get(0) != 0) {
+        executed.transferToHost(misses);
+        if (misses.get(0) != 0) {
+          throw new IllegalStateException(
+              misses.get(0) + " rows have a key outside their files' footer bounds");
+        }
+      }
       if (groups == 0) {
         return 0L;
       }
@@ -3277,7 +3368,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       double[] sums = new double[values];
       double[] nonNull = new double[values];
       for (int g = 0; g < groups; g++) {
-        if (outKeys.get(g) == DeviceKernels.DEAD_KEY) {
+        // A dense slot no row reached has no rows.
+        if (outKeys.get(g) == DeviceKernels.DEAD_KEY
+            || outSums.get((long) values * capacity + g) == 0.0) {
           continue;
         }
         List<Object> key = Lists.newArrayListWithCapacity(keys);

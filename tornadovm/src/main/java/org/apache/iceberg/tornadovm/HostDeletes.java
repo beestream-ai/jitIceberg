@@ -41,6 +41,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
@@ -348,9 +349,10 @@ final class HostDeletes {
   /**
    * What a scan needs from a Parquet footer: the schema, and for each top-level string column (by
    * field id) the bytes its values decode to, summed over the row groups -- parquet-java's size
-   * statistics, -1 when the writer left them out.
+   * statistics, -1 when the writer left them out; and for each top-level INT32 or INT64 column the
+   * smallest and largest value over the row groups, absent when a row group has no statistics.
    */
-  record Footer(MessageType schema, Map<Integer, Long> stringBytes) {}
+  record Footer(MessageType schema, Map<Integer, Long> stringBytes, Map<Integer, long[]> bounds) {}
 
   private static final com.github.benmanes.caffeine.cache.Cache<String, Footer> FOOTERS =
       com.github.benmanes.caffeine.cache.Caffeine.newBuilder().maximumSize(200_000).build();
@@ -655,10 +657,17 @@ final class HostDeletes {
     return bytes == null ? -1 : bytes;
   }
 
+  /** The smallest and largest value of an INT32 or INT64 column of a data file, or null. */
+  static long[] bounds(String path, int fieldId) {
+    return FOOTERS.get(path, HostDeletes::readFooter).bounds().get(fieldId);
+  }
+
   private static Footer readFooter(String path) {
     try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(Paths.get(path)))) {
       MessageType schema = reader.getFileMetaData().getSchema();
       Map<Integer, Long> bytes = Maps.newHashMap();
+      Map<Integer, long[]> bounds = Maps.newHashMap();
+      java.util.Set<Integer> unbounded = Sets.newHashSet();
       for (org.apache.parquet.hadoop.metadata.BlockMetaData block :
           reader.getFooter().getBlocks()) {
         for (org.apache.parquet.hadoop.metadata.ColumnChunkMetaData chunk : block.getColumns()) {
@@ -667,6 +676,26 @@ final class HostDeletes {
           }
           org.apache.parquet.schema.Type column = schema.getType(chunk.getPath().toArray()[0]);
           if (column.getId() == null || !column.isPrimitive()) {
+            continue;
+          }
+          org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName physical =
+              column.asPrimitiveType().getPrimitiveTypeName();
+          if (physical == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32
+              || physical == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64) {
+            int id = column.getId().intValue();
+            org.apache.parquet.column.statistics.Statistics<?> stats = chunk.getStatistics();
+            if (stats == null || stats.isEmpty()) {
+              unbounded.add(id);
+            } else if (stats.hasNonNullValue()) {
+              long min = ((Number) stats.genericGetMin()).longValue();
+              long max = ((Number) stats.genericGetMax()).longValue();
+              long[] seen = bounds.get(id);
+              bounds.put(
+                  id,
+                  seen == null
+                      ? new long[] {min, max}
+                      : new long[] {Math.min(seen[0], min), Math.max(seen[1], max)});
+            }
             continue;
           }
           org.apache.parquet.column.statistics.SizeStatistics size = chunk.getSizeStatistics();
@@ -683,7 +712,8 @@ final class HostDeletes {
           bytes.put(id, previous < 0 || unencoded.isEmpty() ? -1 : previous + unencoded.get());
         }
       }
-      return new Footer(schema, bytes);
+      unbounded.forEach(bounds::remove);
+      return new Footer(schema, bytes, bounds);
     } catch (IOException e) {
       throw new UncheckedIOException("Cannot read the footer of " + path, e);
     }
