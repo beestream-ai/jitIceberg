@@ -75,7 +75,9 @@ sorts; the host merges the smallest hashes.
 **`rewriteDataFilesSorted()`** is `rewrite_data_files(strategy => 'sort')` with the table's sort
 order: identity fields, either direction and null order, and the order's id on every new file
 (`sort_order_id`, as Spark's writes set it since #15150 and #15832). Each output file is sorted;
-files are not sorted against each other, as with Spark's file groups.
+files are not sorted against each other, as with Spark's file groups. For selective compaction,
+`rewriteGroup(tasks, targetFileBytes)` and `rewriteGroupSorted(...)` rewrite a file group that any
+planner chose (a `where`, a delete-file threshold) and leave the commit to the caller.
 
 ## How a batch runs
 

@@ -1219,6 +1219,98 @@ public class TestDeviceMergeOnRead {
     assertThat(checked).isEqualTo(before.size());
   }
 
+  /**
+   * A sorted file group, as a planner with a filter or a delete threshold picks it: two of three
+   * files are rewritten in the table's sort order and swapped by the caller's {@code RewriteFiles};
+   * the rows are unchanged, the new files sorted and tagged with the order, and the third file is
+   * left as it was.
+   */
+  @Test
+  public void testRewriteGroupSorted() throws IOException {
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "k", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "v1", Types.DoubleType.get()),
+            Types.NestedField.required(4, "v2", Types.DoubleType.get()),
+            Types.NestedField.required(5, "v3", Types.DoubleType.get()),
+            Types.NestedField.required(6, "v4", Types.DoubleType.get()));
+    Table table = MorTables.create(temp.resolve("group").toString(), schema, 3);
+    List<DataFile> files = Lists.newArrayList();
+    for (long f = 0; f < 3; f++) {
+      long index = f;
+      files.add(
+          MorTables.writeDataFile(
+              table,
+              2000,
+              i -> {
+                Record record = row(schema, index, i);
+                record.setField("k", (int) ((i * 7919 + index) % 13) - 6);
+                record.setField("v1", i % 11 == 0 ? null : Math.cos(i + index) * 1e3);
+                return record;
+              }));
+    }
+    MorTables.append(table, files);
+    MorTables.deletePositions(
+        table, files, ImmutableList.of(everyNth(2000, 5), new long[0], everyNth(2000, 4)));
+    table.replaceSortOrder().desc("k").asc("v1", org.apache.iceberg.NullOrder.NULLS_FIRST).commit();
+
+    table.refresh();
+    List<String> before = rows(table);
+    List<org.apache.iceberg.FileScanTask> group = Lists.newArrayList();
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        if (!task.file().location().equals(files.get(1).location())) {
+          group.add(task);
+        }
+      }
+    }
+    assertThat(group).hasSize(2);
+    List<DataFile> written;
+    try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
+      written = device.rewriteGroupSorted(group, 128L << 20);
+    }
+    org.apache.iceberg.RewriteFiles swap =
+        table.newRewrite().validateFromSnapshot(table.currentSnapshot().snapshotId());
+    for (org.apache.iceberg.FileScanTask task : group) {
+      swap.deleteFile(task.file());
+      task.deletes().forEach(swap::deleteFile);
+    }
+    written.forEach(swap::addFile);
+    swap.commit();
+    table.refresh();
+    assertThat(rows(table)).containsExactlyElementsOf(before);
+
+    java.util.Comparator<org.apache.iceberg.StructLike> order =
+        org.apache.iceberg.SortOrderComparators.forSchema(schema, table.sortOrder());
+    java.util.Set<String> locations = new java.util.HashSet<>();
+    try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        locations.add(task.file().location());
+      }
+    }
+    assertThat(locations).contains(files.get(1).location());
+    for (DataFile file : written) {
+      assertThat(file.sortOrderId()).isEqualTo(table.sortOrder().orderId());
+      Record previous = null;
+      try (CloseableIterable<Record> records =
+          org.apache.iceberg.parquet.Parquet.read(table.io().newInputFile(file.location()))
+              .project(schema)
+              .createReaderFunc(
+                  fileSchema ->
+                      org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(
+                          schema, fileSchema))
+              .build()) {
+        for (Record record : records) {
+          if (previous != null) {
+            assertThat(order.compare(previous, record)).isLessThanOrEqualTo(0);
+          }
+          previous = record.copy();
+        }
+      }
+    }
+  }
+
   private static byte[] zorder(int k, Double v1) {
     byte[] key =
         org.apache.iceberg.util.ZOrderByteUtils.intToOrderedBytes(

@@ -757,6 +757,11 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * timestamp or double columns.
    */
   public RewriteResult rewriteDataFilesSorted() {
+    return rewrite(sortedRowOrder());
+  }
+
+  /** The table's sort order as a {@link RowOrder}; refused when the device cannot sort by it. */
+  private RowOrder sortedRowOrder() {
     org.apache.iceberg.SortOrder order = table.sortOrder();
     if (order.isUnsorted()) {
       throw new IllegalStateException("The table has no sort order");
@@ -777,7 +782,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           (field.direction() == org.apache.iceberg.SortDirection.DESC ? 1 : 0)
               | (field.nullOrder() == org.apache.iceberg.NullOrder.NULLS_FIRST ? 2 : 0);
     }
-    return rewrite(new RowOrder(columns, flags, order.orderId(), false));
+    return new RowOrder(columns, flags, order.orderId(), false);
   }
 
   /**
@@ -1231,17 +1236,32 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * is committed: the caller swaps the files. One group at a time; the streams share its batches.
    */
   public List<DataFile> rewriteGroup(List<FileScanTask> tasks, long targetFileBytes) {
+    return rewriteGroup(tasks, targetFileBytes, RowOrder.NONE);
+  }
+
+  /**
+   * {@link #rewriteGroup}, each new file written in the table's sort order with the order's id set,
+   * as {@link #rewriteDataFilesSorted()} writes them: a sort-strategy file group, chosen by
+   * whichever planner picks the files (a {@code where}, a delete-file threshold).
+   */
+  public List<DataFile> rewriteGroupSorted(List<FileScanTask> tasks, long targetFileBytes) {
+    return rewriteGroup(tasks, targetFileBytes, sortedRowOrder());
+  }
+
+  private List<DataFile> rewriteGroup(
+      List<FileScanTask> tasks, long targetFileBytes, RowOrder order) {
     // Before taking this scan's lock: another rewriter frees its regions under its own.
     DeviceMergeOnReadScan previous = LAST_REWRITER.getAndSet(this);
     if (previous != null && previous != this) {
       previous.releaseRewriteRegions();
     }
     synchronized (this) {
-      return rewriteGroupLocked(tasks, targetFileBytes);
+      return rewriteGroupLocked(tasks, targetFileBytes, order);
     }
   }
 
-  private List<DataFile> rewriteGroupLocked(List<FileScanTask> tasks, long targetFileBytes) {
+  private List<DataFile> rewriteGroupLocked(
+      List<FileScanTask> tasks, long targetFileBytes, RowOrder order) {
     metrics = new ScanMetrics();
     long start = System.nanoTime();
     List<DataFile> written = java.util.Collections.synchronizedList(Lists.newArrayList());
@@ -1276,7 +1296,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             planned.layout.fields().size());
       }
       try {
-        write(planned, RowOrder.NONE, written, start, REWRITE_STREAMS);
+        write(planned, order, written, start, REWRITE_STREAMS);
       } catch (RuntimeException e) {
         if (!outOfDeviceMemory(e)) {
           throw e;
@@ -1288,7 +1308,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         evictIdle(null, 0);
         Planned smaller =
             new Planned(null, rewriteColumns(), tasks, Math.max(1, fileRows / 2), false, true);
-        write(smaller, RowOrder.NONE, written, System.nanoTime(), 1);
+        write(smaller, order, written, System.nanoTime(), 1);
       }
     }
     return Lists.newArrayList(written);
