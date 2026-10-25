@@ -45,10 +45,11 @@ for mode in modes:
         f"'write.merge.mode'='{write_mode}', 'write.update.mode'='{write_mode}', "
         f"'write.delete.mode'='{write_mode}') AS SELECT * FROM {source}")
     for r in range(1, rounds + 1):
-        # The same ids in both modes: a seeded sample of existing ids, new values.
+        # The same ids in both modes: a seeded sample of existing ids, new values. MERGE needs a
+        # deterministic source, so the new values are hashes of (id, round), not rand().
+        values = ", ".join(f"pmod(hash(id, {r}, {j}), 1000000) / 1000000.0 AS v{j}" for j in range(1, 5))
         spark.sql(
-            f"SELECT id, k, rand({r}) AS v1, rand({r + 1000}) AS v2, rand({r + 2000}) AS v3, "
-            f"rand({r + 3000}) AS v4 FROM {source} WHERE pmod(hash(id, {r}), {rows}) < {upserts}"
+            f"SELECT id, k, {values} FROM {source} WHERE pmod(hash(id, {r}), {rows}) < {upserts}"
         ).createOrReplaceTempView("updates")
         start = time.perf_counter()
         spark.sql(f"MERGE INTO {table} t USING updates s ON t.id = s.id "
