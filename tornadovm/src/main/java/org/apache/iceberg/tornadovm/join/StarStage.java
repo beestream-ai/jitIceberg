@@ -513,7 +513,7 @@ final class StarStage implements GroupedStage {
       DoubleArray buildSums) {
     probeSpec.set(0, probe.parts().size());
     probeSpec.set(1, probe.rows());
-    probeSpec.set(2, probe.comparison().ordinal());
+    probeSpec.set(2, probe.comparison().code());
     if (probe.column() != null) {
       GroupedStage.Column column = context.column(probe.column());
       probeSpec.set(3, column.kind());

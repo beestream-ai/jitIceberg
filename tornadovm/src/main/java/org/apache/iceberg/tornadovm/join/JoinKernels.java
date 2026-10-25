@@ -127,8 +127,8 @@ final class JoinKernels {
    * dimension attribute (kind 1: the code of the row's foreign key), and its weight the number of
    * build rows with that key whose value passes the comparison with the row's value column (0 any,
    * 1 row < build, 2 row <= build, 3 row = build, 4 row > build, 5 row >= build). A row of weight 0
-   * is dropped; the others count {@code weight} times ({@link #applyWeights}). The build keys are
-   * binary searched; a key's rows are few.
+   * is dropped; the others count as many times as their weight ({@link #applyWeights}). The build
+   * keys are binary searched; a key's rows are few.
    */
   @SuppressWarnings("checkstyle:CyclomaticComplexity")
   static void probeWeights(

@@ -35,12 +35,23 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 public final class DeviceProbe {
   /** How the fact row's column compares with a build row's value. */
   public enum Comparison {
-    ANY,
-    LESS,
-    LESS_EQUAL,
-    EQUAL,
-    GREATER,
-    GREATER_EQUAL
+    ANY(0),
+    LESS(1),
+    LESS_EQUAL(2),
+    EQUAL(3),
+    GREATER(4),
+    GREATER_EQUAL(5);
+
+    private final int code;
+
+    Comparison(int code) {
+      this.code = code;
+    }
+
+    /** The comparison's code in {@code JoinKernels.probeWeights}. */
+    int code() {
+      return code;
+    }
   }
 
   /**

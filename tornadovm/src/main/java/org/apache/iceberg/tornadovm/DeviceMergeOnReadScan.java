@@ -1090,7 +1090,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     for (FileScanTask task : tasks) {
       for (DeleteFile delete : task.deletes()) {
         if (delete.content() == FileContent.EQUALITY_DELETES) {
-          continue;
+          // Their hits are in the vectors written here; the caller names the files in removed.
         } else if (org.apache.iceberg.util.ContentFileUtil.isDV(delete)
             || org.apache.iceberg.util.ContentFileUtil.referencedDataFile(delete) != null) {
           replaced.add(delete);
