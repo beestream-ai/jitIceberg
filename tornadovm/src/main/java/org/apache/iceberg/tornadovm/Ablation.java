@@ -32,7 +32,9 @@ import java.util.stream.Collectors;
  *   <li>{@code nullcounts} -- null counts unknown: every optional column's validity is copied;
  *   <li>{@code bounds} -- column bounds unknown: no device sum can be proven exact;
  *   <li>{@code density} -- dense keys not checked from statistics at planning time, only when the
- *       dimension has been built (a non-dense key then fails after the work, not before it).
+ *       dimension has been built (a non-dense key then fails after the work, not before it);
+ *   <li>{@code dense} -- footer bounds not used to group by a key of few values without a hash
+ *       table: every group-by goes to cuDF's hash group-by.
  * </ul>
  */
 public final class Ablation {

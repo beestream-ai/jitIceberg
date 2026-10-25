@@ -91,7 +91,9 @@ planner chose (a `where`, a delete-file threshold) and leave the commit to the c
    - TornadoVM kernels fold position deletes, deletion vectors, equality hits and Iceberg's null
      rules into one live mask;
    - then one consumer runs: a cuDF group-by, a gather of live rows, a Parquet write, or the
-     positions of dropped rows.
+     positions of dropped rows. A group-by on one int/long key whose Parquet footer bounds span
+     at most 4096 values (a store, a month, a status code) skips cuDF's hash table: rows add
+     into 32 copies of a slot array with atomics, and a second kernel sums the copies.
    Nothing returns to the host between these steps. `iceberg.tornadovm.streams` batches (3 by
    default) run at once, each on its own CUDA stream.
 4. **Commit** through Iceberg: `RewriteFiles` for compaction, `RowDelta` for deletion vectors.
@@ -99,7 +101,8 @@ planner chose (a `where`, a delete-file threshold) and leave the commit to the c
 **Object stores** (S3, GCS, ADLS) go through the table's `FileIO`. cuDF opens files by path, so a
 scan fetches only the column chunks it reads, each with one ranged read, into a sparse local copy
 that cuDF opens as the original file. Delete files and rewrites fetch whole files. The cache is
-`iceberg.tornadovm.cacheDir` (64 GB by default, least recently used first).
+`iceberg.tornadovm.cacheDir`, up to `iceberg.tornadovm.cacheBytes` (64 GB by default), least
+recently used first.
 
 ## What the device takes
 
@@ -142,9 +145,9 @@ The benchmarks print each answer's row count and checksum, and every engine must
 
 1. **libcudf** from NVIDIA's wheels (about 1.3 GB, once; no conda): `source tornadovm/cudf-env.sh`.
    `CUDF_PACKAGE=libcudf-cu13` selects the CUDA 13 build.
-2. **TornadoVM with the cuDF shim**, built with the CUDA backend (released SDKs don't ship the
-   shim): branch `iceberg-bench` of `mikepapadim/TornadoVM`, which is master plus three changes
-   in review upstream (beehive-lab/TornadoVM #1276, #1277, #1278).
+2. **TornadoVM 7.3.1 or later with the cuDF shim**: the released CUDA SDK
+   (`tornadovm-7.3.1-jdk21-cuda-linux-amd64`), whose native libraries need glibc 2.38
+   (beehive-lab/TornadoVM#1282, fix in #1283), or, on older systems, built from source:
    ```bash
    make BACKEND=cuda && source setvars.sh      # with CUDF_HOME from step 1; JDK 21
    ```
@@ -162,7 +165,13 @@ MAIN=org.apache.iceberg.tornadovm.bench.ConvertBench tornadovm/run.sh gpu /data/
 MAIN=org.apache.iceberg.tornadovm.bench.NewOpsBench tornadovm/run.sh gpu /data/wh deletekeys 3 none 1000 1000000
 MAIN=org.apache.iceberg.tornadovm.bench.NewOpsBench tornadovm/run.sh gpu /data/wh convertv2 3 eq1m eq10m
 MAIN=org.apache.iceberg.tornadovm.bench.StatsBench tornadovm/run.sh gpu /data/wh id,k,v1,v2 3 none eq1m
+MAIN=org.apache.iceberg.tornadovm.bench.TpcdsBench tornadovm/run.sh gpu /data/tpcds agg 4 ss_pos ss_dv ss_eq
 ```
+
+TPC-DS `store_sales` in three delete layouts comes from `tpcds_partitioned_setup.py` (Spark) and
+`AddPartitionedEqualityDeletes`; `TpcdsBench` runs sales by store (`agg`), equality-delete
+removal (`convert`) and sorted compaction (`sorted`), and `tpcds_partitioned_bench.py` the same
+through Spark. Maintenance runs report the bytes they write and are rolled back.
 
 The Spark baselines run the same operations through Spark 3.5 and Iceberg's procedures:
 `BENCH_SCRIPT=spark_delete_keys.py` (`MERGE ... WHEN MATCHED THEN DELETE`) and
@@ -174,6 +183,10 @@ The Spark baselines run the same operations through Spark 3.5 and Iceberg's proc
 | `iceberg.tornadovm.streams` | 3 | batches in flight, one CUDA stream each |
 | `iceberg.tornadovm.deleteKeys.inLimit` | 1000 | up to this many keys prune by `IN`, more by range |
 | `iceberg.tornadovm.positionWriters` | 0 (auto: one per 32k positions, up to a core each) | v2 position-delete writers |
+| `iceberg.tornadovm.rewriteBatchBytes` | 768 MB | decoded bytes a compaction batch holds on each stream |
+| `iceberg.tornadovm.write-codec` | the table's `write.parquet.compression-codec` | `zstd`, `snappy` or `none` for the device writer |
+| `iceberg.tornadovm.ablate` | none | switches off a metadata-driven choice, for measuring (`Ablation`); `dense`: always cuDF's hash group-by |
+| `LIBCUDF_HOST_DECOMPRESSION` (env) | `HYBRID` in `run.sh` | the largest ZSTD pages (a big dictionary page) decompress on host threads; `OFF` keeps all on the GPU |
 | `tornado.cuda.sched` | `yield` | `blocking`: waiting threads sleep; less host CPU, a little slower (TornadoVM #1277) |
 
 To run everything on a new machine with one command (checks, build, tables, every suite,
