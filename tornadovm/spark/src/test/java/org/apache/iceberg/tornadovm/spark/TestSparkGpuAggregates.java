@@ -131,9 +131,9 @@ public class TestSparkGpuAggregates {
 
   private static void assertSameAnswer(List<Row> gpu, List<Row> cpu) {
     assertThat(gpu).hasSameSizeAs(cpu);
-    for (int r = 0; r < cpu.size(); r++) {
-      Row expected = cpu.get(r);
-      Row actual = gpu.get(r);
+    for (int index = 0; index < cpu.size(); index++) {
+      Row expected = cpu.get(index);
+      Row actual = gpu.get(index);
       assertThat(actual.size()).isEqualTo(expected.size());
       for (int c = 0; c < expected.size(); c++) {
         Object want = expected.get(c);
@@ -278,6 +278,7 @@ public class TestSparkGpuAggregates {
    * the device and runs on the CPU.
    */
   @Test
+  @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:MethodLength"})
   public void testStarAggregates() {
     Schema sales =
         new Schema(
@@ -294,15 +295,15 @@ public class TestSparkGpuAggregates {
         3,
         30_000,
         id -> {
-          GenericRecord r = GenericRecord.create(sales);
-          r.setField("id", id);
-          r.setField("date_sk", id % 97 == 0 ? null : 2_415_022L + (id * 31) % 420);
-          r.setField("item_sk", (int) (1 + (id * 17) % 230)); // items 201..230 are not in item
-          r.setField("store_sk", 1 + id % 12);
-          r.setField("qty", id % 13 == 0 ? null : (int) (id % 40));
-          r.setField("price", java.math.BigDecimal.valueOf((id * 7919) % 99_999, 2));
-          r.setField("amount", (id % 1000) * 0.5);
-          return r;
+          GenericRecord record = GenericRecord.create(sales);
+          record.setField("id", id);
+          record.setField("date_sk", id % 97 == 0 ? null : 2_415_022L + (id * 31) % 420);
+          record.setField("item_sk", (int) (1 + (id * 17) % 230)); // items 201..230 are not in item
+          record.setField("store_sk", 1 + id % 12);
+          record.setField("qty", id % 13 == 0 ? null : (int) (id % 40));
+          record.setField("price", java.math.BigDecimal.valueOf((id * 7919) % 99_999, 2));
+          record.setField("amount", (id % 1000) * 0.5);
+          return record;
         });
     Schema dates =
         new Schema(
@@ -315,11 +316,11 @@ public class TestSparkGpuAggregates {
         1,
         400,
         k -> {
-          GenericRecord r = GenericRecord.create(dates);
-          r.setField("d_date_sk", 2_415_022L + k);
-          r.setField("d_year", 2000L + k / 120);
-          r.setField("d_moy", (int) (1 + (k / 10) % 12));
-          return r;
+          GenericRecord record = GenericRecord.create(dates);
+          record.setField("d_date_sk", 2_415_022L + k);
+          record.setField("d_year", 2000L + k / 120);
+          record.setField("d_moy", (int) (1 + (k / 10) % 12));
+          return record;
         });
     Schema items =
         new Schema(
@@ -334,13 +335,13 @@ public class TestSparkGpuAggregates {
         1,
         200,
         k -> {
-          GenericRecord r = GenericRecord.create(items);
-          r.setField("i_item_sk", (int) (1 + k));
-          r.setField("i_brand", "brand #" + (k % 9));
-          r.setField("i_class", "class " + (k % 4));
-          r.setField("i_category", k % 11 == 0 ? null : "category " + (k % 3));
-          r.setField("i_product_name", "a product name longer than eight bytes " + (k % 50));
-          return r;
+          GenericRecord record = GenericRecord.create(items);
+          record.setField("i_item_sk", (int) (1 + k));
+          record.setField("i_brand", "brand #" + (k % 9));
+          record.setField("i_class", "class " + (k % 4));
+          record.setField("i_category", k % 11 == 0 ? null : "category " + (k % 3));
+          record.setField("i_product_name", "a product name longer than eight bytes " + (k % 50));
+          return record;
         });
     Schema stores =
         new Schema(
@@ -352,10 +353,10 @@ public class TestSparkGpuAggregates {
         1,
         10, // stores 11 and 12 are not in store
         k -> {
-          GenericRecord r = GenericRecord.create(stores);
-          r.setField("s_store_sk", 1 + k);
-          r.setField("s_state", k % 3 == 0 ? "TN" : "GA");
-          return r;
+          GenericRecord record = GenericRecord.create(stores);
+          record.setField("s_store_sk", 1 + k);
+          record.setField("s_state", k % 3 == 0 ? "TN" : "GA");
+          return record;
         });
     Schema returns =
         new Schema(
@@ -368,11 +369,12 @@ public class TestSparkGpuAggregates {
         1,
         2_000,
         k -> {
-          GenericRecord r = GenericRecord.create(returns);
-          r.setField("r_id", k * 13); // every 13th sale returned, ids up to 26K
-          r.setField("r_amt", k % 9 == 0 ? null : java.math.BigDecimal.valueOf(k * 7 % 5000, 2));
-          r.setField("r_loss", java.math.BigDecimal.valueOf(k % 300, 2));
-          return r;
+          GenericRecord record = GenericRecord.create(returns);
+          record.setField("r_id", k * 13); // every 13th sale returned, ids up to 26K
+          record.setField(
+              "r_amt", k % 9 == 0 ? null : java.math.BigDecimal.valueOf(k * 7 % 5000, 2));
+          record.setField("r_loss", java.math.BigDecimal.valueOf(k % 300, 2));
+          return record;
         });
     view(
         "item_twice",
@@ -380,10 +382,10 @@ public class TestSparkGpuAggregates {
         1,
         40,
         k -> {
-          GenericRecord r = GenericRecord.create(items);
-          r.setField("i_item_sk", (int) (1 + k % 20));
-          r.setField("i_brand", "brand #" + (k % 2));
-          return r;
+          GenericRecord record = GenericRecord.create(items);
+          record.setField("i_item_sk", (int) (1 + k % 20));
+          record.setField("i_brand", "brand #" + (k % 2));
+          return record;
         });
 
     List<String> onDevice =
@@ -529,11 +531,11 @@ public class TestSparkGpuAggregates {
         2,
         1_000,
         id -> {
-          GenericRecord r = GenericRecord.create(facts);
-          r.setField("id", id);
-          r.setField("k", (int) (id % 10));
-          r.setField("v", (int) id);
-          return r;
+          GenericRecord record = GenericRecord.create(facts);
+          record.setField("id", id);
+          record.setField("k", (int) (id % 10));
+          record.setField("v", (int) id);
+          return record;
         });
     Schema dims =
         new Schema(
@@ -545,10 +547,10 @@ public class TestSparkGpuAggregates {
         1,
         10,
         id -> {
-          GenericRecord r = GenericRecord.create(dims);
-          r.setField("k", (int) id);
-          r.setField("name", "n" + id);
-          return r;
+          GenericRecord record = GenericRecord.create(dims);
+          record.setField("k", (int) id);
+          record.setField("name", "n" + id);
+          return record;
         });
     org.apache.spark.sql.catalyst.plans.logical.LogicalPlan agg =
         spark
@@ -619,12 +621,12 @@ public class TestSparkGpuAggregates {
         2,
         40_000,
         id -> {
-          GenericRecord r = GenericRecord.create(stock);
-          r.setField("inv_date_sk", 1000L + 7 * ((id / 400) % 30)); // one row a week
-          r.setField("inv_item_sk", 1 + (id % 100));
-          r.setField("inv_wh_sk", 1 + (id / 100) % 4);
-          r.setField("inv_qoh", id % 17 == 0 ? null : (int) ((id * 7) % 50));
-          return r;
+          GenericRecord record = GenericRecord.create(stock);
+          record.setField("inv_date_sk", 1000L + 7 * ((id / 400) % 30)); // one row a week
+          record.setField("inv_item_sk", 1 + (id % 100));
+          record.setField("inv_wh_sk", 1 + (id / 100) % 4);
+          record.setField("inv_qoh", id % 17 == 0 ? null : (int) ((id * 7) % 50));
+          return record;
         });
     Schema sales =
         new Schema(
@@ -639,14 +641,14 @@ public class TestSparkGpuAggregates {
         1,
         3_000,
         id -> {
-          GenericRecord r = GenericRecord.create(sales);
+          GenericRecord record = GenericRecord.create(sales);
           long sold = 1000 + (id * 13) % 210;
-          r.setField("cs_sold_date_sk", sold);
-          r.setField("cs_ship_date_sk", sold + (id % 9));
-          r.setField("cs_item_sk", 1 + (id * 31) % 120); // items 101..120 have no stock
-          r.setField("cs_qty", 1 + (id % 60));
-          r.setField("cs_promo_sk", id % 5 == 0 ? null : 1 + id % 7);
-          return r;
+          record.setField("cs_sold_date_sk", sold);
+          record.setField("cs_ship_date_sk", sold + (id % 9));
+          record.setField("cs_item_sk", 1 + (id * 31) % 120); // items 101..120 have no stock
+          record.setField("cs_qty", 1 + (id % 60));
+          record.setField("cs_promo_sk", id % 5 == 0 ? null : 1 + id % 7);
+          return record;
         });
     Schema dates =
         new Schema(
@@ -660,12 +662,12 @@ public class TestSparkGpuAggregates {
         1,
         400,
         k -> {
-          GenericRecord r = GenericRecord.create(dates);
-          r.setField("dd_sk", 1000 + k);
-          r.setField("dd_week", 5000 + k / 7);
-          r.setField("dd_year", 2000 + k / 100);
-          r.setField("dd_day", (int) k);
-          return r;
+          GenericRecord record = GenericRecord.create(dates);
+          record.setField("dd_sk", 1000 + k);
+          record.setField("dd_week", 5000 + k / 7);
+          record.setField("dd_year", 2000 + k / 100);
+          record.setField("dd_day", (int) k);
+          return record;
         });
     Schema items =
         new Schema(
@@ -677,10 +679,10 @@ public class TestSparkGpuAggregates {
         1,
         100,
         k -> {
-          GenericRecord r = GenericRecord.create(items);
-          r.setField("it_sk", 1 + k);
-          r.setField("it_desc", "item description " + (k % 37));
-          return r;
+          GenericRecord record = GenericRecord.create(items);
+          record.setField("it_sk", 1 + k);
+          record.setField("it_desc", "item description " + (k % 37));
+          return record;
         });
     Schema warehouses =
         new Schema(
@@ -692,10 +694,10 @@ public class TestSparkGpuAggregates {
         1,
         4,
         k -> {
-          GenericRecord r = GenericRecord.create(warehouses);
-          r.setField("wh_sk", 1 + k);
-          r.setField("wh_name", "warehouse " + k);
-          return r;
+          GenericRecord record = GenericRecord.create(warehouses);
+          record.setField("wh_sk", 1 + k);
+          record.setField("wh_name", "warehouse " + k);
+          return record;
         });
     Schema promotions = new Schema(Types.NestedField.required(1, "p_sk", Types.LongType.get()));
     view(
@@ -704,9 +706,9 @@ public class TestSparkGpuAggregates {
         1,
         6,
         k -> {
-          GenericRecord r = GenericRecord.create(promotions);
-          r.setField("p_sk", 1 + k);
-          return r;
+          GenericRecord record = GenericRecord.create(promotions);
+          record.setField("p_sk", 1 + k);
+          return record;
         });
 
     String sql =

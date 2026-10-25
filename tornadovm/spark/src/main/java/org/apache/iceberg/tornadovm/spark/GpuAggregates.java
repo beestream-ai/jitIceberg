@@ -20,7 +20,6 @@ package org.apache.iceberg.tornadovm.spark;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +28,7 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
@@ -65,7 +65,7 @@ public final class GpuAggregates {
       };
 
   // Scans dropped from SCANS, to close outside its lock (guarded by SCANS).
-  private static final List<DeviceMergeOnReadScan> EVICTED = new ArrayList<>();
+  private static final List<DeviceMergeOnReadScan> EVICTED = Lists.newArrayList();
 
   /**
    * Runs {@code work} on the kept scan of a table snapshot and filter, holding that scan only:
@@ -102,7 +102,7 @@ public final class GpuAggregates {
   private static void closeEvicted() {
     List<DeviceMergeOnReadScan> closing;
     synchronized (SCANS) {
-      closing = new ArrayList<>(EVICTED);
+      closing = Lists.newArrayList(EVICTED);
       EVICTED.clear();
     }
     for (DeviceMergeOnReadScan scan : closing) {
@@ -165,9 +165,9 @@ public final class GpuAggregates {
       return groupsHere(table, filter, groupColumns, bucketColumn, buckets, sumColumns, values);
     }
     Table shipped = SerializableTableWithSize.copyOf(table);
-    List<String> groupBy = new ArrayList<>(groupColumns);
-    List<String> sums = new ArrayList<>(sumColumns);
-    List<DeviceValue> sumValues = new ArrayList<>(values);
+    List<String> groupBy = Lists.newArrayList(groupColumns);
+    List<String> sums = Lists.newArrayList(sumColumns);
+    List<DeviceValue> sumValues = Lists.newArrayList(values);
     return JavaSparkContext.fromSparkContext(spark.sparkContext())
         .parallelize(List.of(0), 1)
         .map(
@@ -189,8 +189,8 @@ public final class GpuAggregates {
             ? aggregateByBucket(table, filter, bucketColumn, buckets, sumColumns)
             : aggregate(table, filter, groupColumns, values).groups();
     // Serializable keys and map, for the trip back from an executor.
-    LinkedHashMap<List<Object>, double[]> copy = new LinkedHashMap<>();
-    groups.forEach((key, totals) -> copy.put(new ArrayList<>(key), totals));
+    Map<List<Object>, double[]> copy = new LinkedHashMap<>();
+    groups.forEach((key, totals) -> copy.put(Lists.newArrayList(key), totals));
     return copy;
   }
 
@@ -266,11 +266,11 @@ public final class GpuAggregates {
         .groups()
         .forEach(
             (bucket, group) -> {
-              int n = sumColumns.size();
-              double[] totals = java.util.Arrays.copyOf(group.sums(), 2 * n + 1);
-              totals[n] = group.count();
+              int sumCount = sumColumns.size();
+              double[] totals = java.util.Arrays.copyOf(group.sums(), 2 * sumCount + 1);
+              totals[sumCount] = group.count();
               // The summed columns are null-free (the strategy checks): each counts every row.
-              java.util.Arrays.fill(totals, n + 1, 2 * n + 1, group.count());
+              java.util.Arrays.fill(totals, sumCount + 1, 2 * sumCount + 1, (double) group.count());
               groups.put(List.of((long) bucket), totals);
             });
     return groups;

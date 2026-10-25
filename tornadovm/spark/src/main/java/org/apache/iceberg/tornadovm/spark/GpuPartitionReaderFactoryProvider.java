@@ -139,6 +139,7 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
    * A device reader for the task group, or null to leave it to Iceberg's reader; {@code cpu} makes
    * Iceberg's reader for a group the device refuses once it plans it.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   static PartitionReader<ColumnarBatch> reader(
       Table table,
       ScanTaskGroup<FileScanTask> taskGroup,

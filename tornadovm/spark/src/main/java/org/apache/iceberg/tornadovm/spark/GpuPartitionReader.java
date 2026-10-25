@@ -116,15 +116,15 @@ final class GpuPartitionReader implements PartitionReader<ColumnarBatch> {
       }
       TASKS.incrementAndGet();
       if (DEBUG) {
-        System.err.printf(
-            "[gpu-spark] t=%d..%d %d files, %d live rows, %d batches in %.1f ms (to Spark %.1f) | %s%n",
+        LOG.info(
+            "[gpu-spark] t={}..{} {} files, {} live rows, {} batches in {} ms (to Spark {}) | {}",
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(start) % 100_000,
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) % 100_000,
             tasks.size(),
             rows,
             read.size(),
-            (System.nanoTime() - start) / 1e6,
-            convert.get() / 1e6,
+            String.format(java.util.Locale.ROOT, "%.1f", (System.nanoTime() - start) / 1e6),
+            String.format(java.util.Locale.ROOT, "%.1f", convert.get() / 1e6),
             scan.metrics());
       }
       batches = read.iterator();

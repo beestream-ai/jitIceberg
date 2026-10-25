@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.tornadovm.spark;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,6 +28,7 @@ import org.apache.iceberg.actions.FileRewriteRunner;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
 import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.actions.FileRewriteRunnerProvider;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
@@ -145,7 +145,7 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
         written = rewriteHere(table, group.fileScanTasks(), group.maxOutputFileSize());
       } else {
         Table shipped = SerializableTableWithSize.copyOf(table);
-        List<FileScanTask> tasks = new ArrayList<>(group.fileScanTasks());
+        List<FileScanTask> tasks = Lists.newArrayList(group.fileScanTasks());
         long maxOutputFileSize = group.maxOutputFileSize();
         written =
             JavaSparkContext.fromSparkContext(spark.sparkContext())
@@ -162,7 +162,7 @@ public class GpuFileRewriteRunnerProvider implements FileRewriteRunnerProvider {
         Table table, List<FileScanTask> tasks, long maxOutputFileSize) {
       // The aggregates' kept scans hold device memory a rewrite needs; they rebuild when next used.
       GpuAggregates.releaseAll();
-      List<DataFile> written = new ArrayList<>();
+      List<DataFile> written = Lists.newArrayList();
       for (DataFile file : GpuScans.rewriteScan(table).rewriteGroup(tasks, maxOutputFileSize)) {
         written.add(file.copy());
       }

@@ -19,8 +19,8 @@
 package org.apache.iceberg.tornadovm.spark;
 
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 
 /**
@@ -28,7 +28,7 @@ import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
  * Spark tasks and queries, the way a warm Spark JVM keeps its generated code. Closed at exit.
  */
 final class GpuScans {
-  private static final Map<String, DeviceMergeOnReadScan> SCANS = new ConcurrentHashMap<>();
+  private static final Map<String, DeviceMergeOnReadScan> SCANS = Maps.newConcurrentMap();
 
   static {
     ExitCleanup.register(() -> SCANS.values().forEach(DeviceMergeOnReadScan::close));
