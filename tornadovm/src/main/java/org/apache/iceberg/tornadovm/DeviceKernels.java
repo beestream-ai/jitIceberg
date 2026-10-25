@@ -1140,8 +1140,8 @@ final class DeviceKernels {
   /**
    * Groups live rows by Iceberg's {@code bucket[N]} partition transform of a long column: Murmur3
    * x86 32-bit of the value's 8 little-endian bytes, seed 0, made non-negative and taken modulo N
-   * -- the function of {@code org.apache.iceberg.util.BucketUtil}, so a row lands in the bucket
-   * Iceberg would write it to. Deleted and padding rows get {@link #DEAD_GROUP}.
+   * -- the function of {@code BucketUtil}, so a row lands in the bucket Iceberg would write it to.
+   * Deleted and padding rows get {@link #DEAD_GROUP}.
    */
   static void bucketGroupKeys(
       KernelContext context,

@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
@@ -78,7 +80,7 @@ public final class StarQ72 {
 
   /** A dimension's rows as maps of key to the named columns. */
   private static Map<Long, Record> rows(String warehouse, String table, String... columns)
-      throws java.io.IOException {
+      throws IOException {
     Map<Long, Record> rows = Maps.newHashMap();
     try (CloseableIterable<Record> records =
         IcebergGenerics.read(MorTables.load(warehouse + "/" + table)).select(columns).build()) {
@@ -295,8 +297,7 @@ public final class StarQ72 {
   }
 
   /** A code a key from 0, over the rows' key range. */
-  private static int[] codes(
-      Map<Long, Record> rows, java.util.function.ToIntFunction<Record> code) {
+  private static int[] codes(Map<Long, Record> rows, ToIntFunction<Record> code) {
     long first = rows.keySet().stream().mapToLong(Long::longValue).min().orElse(0);
     long last = rows.keySet().stream().mapToLong(Long::longValue).max().orElse(0);
     int[] codes = new int[(int) (last - first + 1)];

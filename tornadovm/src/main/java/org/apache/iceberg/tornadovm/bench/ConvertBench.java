@@ -18,8 +18,11 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.io.File;
+import java.lang.management.ManagementFactory;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
@@ -56,8 +59,7 @@ public final class ConvertBench {
   private ConvertBench() {}
 
   private static final com.sun.management.OperatingSystemMXBean PROCESS =
-      (com.sun.management.OperatingSystemMXBean)
-          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+      (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
   @SuppressWarnings("checkstyle:CyclomaticComplexity")
   public static void main(String[] args) throws Exception {
@@ -154,12 +156,12 @@ public final class ConvertBench {
   /** The v3 twin of a v2 table: its data files, then its equality-delete files, in two commits. */
   private static Table twin(String warehouse, String name) throws Exception {
     String location = warehouse + "/" + name + "_v3";
-    if (new java.io.File(location, "metadata").isDirectory()) {
+    if (new File(location, "metadata").isDirectory()) {
       return MorTables.load(location);
     }
     Table source = MorTables.load(warehouse + "/" + name);
     List<DataFile> data = Lists.newArrayList();
-    java.util.Set<DeleteFile> equality = Sets.newLinkedHashSet();
+    Set<DeleteFile> equality = Sets.newLinkedHashSet();
     try (CloseableIterable<FileScanTask> tasks = source.newScan().planFiles()) {
       for (FileScanTask task : tasks) {
         data.add(task.file());

@@ -19,9 +19,17 @@
 package org.apache.iceberg.tornadovm.bench;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.Set;
+import java.util.stream.Stream;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
@@ -29,6 +37,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.tornadovm.AggregateResult;
 import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
@@ -57,8 +66,7 @@ public final class CdcBench {
   private CdcBench() {}
 
   private static final com.sun.management.OperatingSystemMXBean PROCESS =
-      (com.sun.management.OperatingSystemMXBean)
-          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+      (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
   public static void main(String[] args) throws Exception {
     String warehouse = args[0];
@@ -90,7 +98,7 @@ public final class CdcBench {
       for (int round = 1; round <= rounds; round++) {
         Random random = new Random(round);
         // Distinct ids: an upsert commit holds one new version a key.
-        java.util.Set<Object> distinct = new java.util.LinkedHashSet<>();
+        Set<Object> distinct = Sets.newLinkedHashSet();
         while (distinct.size() < upserts) {
           distinct.add((long) (random.nextDouble() * rows));
         }
@@ -137,12 +145,8 @@ public final class CdcBench {
   private static Table fresh(String location, Table base, List<DataFile> data) throws Exception {
     File dir = new File(location);
     if (dir.exists()) {
-      try (java.util.stream.Stream<java.nio.file.Path> paths =
-          java.nio.file.Files.walk(dir.toPath())) {
-        paths
-            .sorted(java.util.Comparator.reverseOrder())
-            .map(java.nio.file.Path::toFile)
-            .forEach(File::delete);
+      try (Stream<Path> paths = Files.walk(dir.toPath())) {
+        paths.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
       }
     }
     Table table = MorTables.create(location, base.schema(), 3);
@@ -200,7 +204,7 @@ public final class CdcBench {
     }
     long equalityFiles = 0;
     try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
-      java.util.Set<String> seen = new java.util.HashSet<>();
+      Set<String> seen = Sets.newHashSet();
       for (FileScanTask task : tasks) {
         for (DeleteFile delete : task.deletes()) {
           if (delete.content() == org.apache.iceberg.FileContent.EQUALITY_DELETES
@@ -209,8 +213,8 @@ public final class CdcBench {
           }
         }
       }
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException(e);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
     System.out.printf(
         Locale.ROOT,

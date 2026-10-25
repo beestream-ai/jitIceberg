@@ -18,27 +18,39 @@
  */
 package org.apache.iceberg.tornadovm;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.RangeReadable;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -128,7 +140,7 @@ final class LocalFiles {
 
   // Cached copies that hold only some columns, by local path: the field ids fetched so far. A copy
   // not in this map holds the whole file.
-  private static final Map<Path, java.util.Set<Integer>> PARTIAL = Maps.newConcurrentMap();
+  private static final Map<Path, Set<Integer>> PARTIAL = Maps.newConcurrentMap();
 
   /** How much of a file's end one read takes, to get its footer in a single request. */
   private static final int TAIL = 64 << 10;
@@ -144,7 +156,7 @@ final class LocalFiles {
    * what a reader of those columns touches -- so cuDF opens it as the original file. A copy that
    * already holds some columns gets the missing ones.
    */
-  static void prefetch(Collection<String> locations, FileIO io, java.util.Set<Integer> fieldIds) {
+  static void prefetch(Collection<String> locations, FileIO io, Set<Integer> fieldIds) {
     List<CompletableFuture<String>> fetches = Lists.newArrayList();
     for (String location : locations) {
       if (!isLocal(location)) {
@@ -160,11 +172,10 @@ final class LocalFiles {
     fetches.forEach(CompletableFuture::join);
   }
 
-  private static String pathWithColumns(
-      String location, FileIO io, java.util.Set<Integer> fieldIds) {
+  private static String pathWithColumns(String location, FileIO io, Set<Integer> fieldIds) {
     Path local = CACHE.resolve(digest(location) + suffix(location));
     synchronized (FETCHING.computeIfAbsent(location, ignored -> new Object())) {
-      java.util.Set<Integer> held;
+      Set<Integer> held;
       synchronized (CACHED) {
         boolean cached = CACHED.containsKey(local) && Files.exists(local);
         held = cached ? PARTIAL.get(local) : null;
@@ -173,17 +184,14 @@ final class LocalFiles {
         }
       }
       try {
-        org.apache.iceberg.io.InputFile remote = io.newInputFile(location);
+        InputFile remote = io.newInputFile(location);
         long length = remote.getLength();
         Files.createDirectories(CACHE);
         long fetched = 0;
         // One stream for the file; every read is a bounded range read (one ranged GET on S3).
-        try (org.apache.iceberg.io.SeekableInputStream in = remote.newStream();
-            java.nio.channels.FileChannel out =
-                java.nio.channels.FileChannel.open(
-                    local,
-                    java.nio.file.StandardOpenOption.CREATE,
-                    java.nio.file.StandardOpenOption.WRITE)) {
+        try (SeekableInputStream in = remote.newStream();
+            FileChannel out =
+                FileChannel.open(local, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
           if (held == null) {
             // A new copy: the magic and the footer, at the end of a sparse file of the file's
             // length. One read of the tail usually holds the whole footer.
@@ -191,9 +199,7 @@ final class LocalFiles {
             int tailLength = (int) Math.min(length, TAIL);
             byte[] tail = read(in, length - tailLength, tailLength);
             int footerLength =
-                java.nio.ByteBuffer.wrap(tail, tailLength - 8, 4)
-                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                    .getInt();
+                ByteBuffer.wrap(tail, tailLength - 8, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
             long footerStart = length - 8 - footerLength;
             if (footerStart < length - tailLength) {
               tail = read(in, footerStart, footerLength + 8);
@@ -202,9 +208,9 @@ final class LocalFiles {
             write(out, length - tailLength, tail);
             write(out, 0, read(in, 0, 4));
             fetched += tailLength + 4L;
-            held = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            held = ConcurrentHashMap.newKeySet();
           }
-          java.util.Set<Integer> missing = Sets.newHashSet(fieldIds);
+          Set<Integer> missing = Sets.newHashSet(fieldIds);
           missing.removeAll(held);
           for (long[] range : coalesce(columnRanges(local, missing))) {
             write(out, range[0], read(in, range[0], (int) (range[1] - range[0])));
@@ -222,8 +228,7 @@ final class LocalFiles {
   }
 
   /** The byte ranges of the given columns' chunks and page indexes, from the copy's footer. */
-  private static List<long[]> columnRanges(Path local, java.util.Set<Integer> fieldIds)
-      throws IOException {
+  private static List<long[]> columnRanges(Path local, Set<Integer> fieldIds) throws IOException {
     List<long[]> ranges = Lists.newArrayList();
     try (org.apache.parquet.hadoop.ParquetFileReader reader =
         org.apache.parquet.hadoop.ParquetFileReader.open(
@@ -254,7 +259,7 @@ final class LocalFiles {
 
   /** The ranges sorted, with those closer than {@link #COALESCE} merged. */
   private static List<long[]> coalesce(List<long[]> ranges) {
-    ranges.sort(java.util.Comparator.comparingLong(range -> range[0]));
+    ranges.sort(Comparator.comparingLong(range -> range[0]));
     List<long[]> merged = Lists.newArrayList();
     for (long[] range : ranges) {
       long[] last = merged.isEmpty() ? null : merged.get(merged.size() - 1);
@@ -268,10 +273,9 @@ final class LocalFiles {
   }
 
   /** Bytes of the stream at an offset: a ranged read where the stream offers one (S3, GCS). */
-  private static byte[] read(org.apache.iceberg.io.SeekableInputStream in, long offset, int length)
-      throws IOException {
+  private static byte[] read(SeekableInputStream in, long offset, int length) throws IOException {
     byte[] bytes = new byte[length];
-    if (in instanceof org.apache.iceberg.io.RangeReadable ranged) {
+    if (in instanceof RangeReadable ranged) {
       ranged.readFully(offset, bytes, 0, length);
       return bytes;
     }
@@ -280,16 +284,15 @@ final class LocalFiles {
     while (done < length) {
       int count = in.read(bytes, done, length - done);
       if (count < 0) {
-        throw new java.io.EOFException("Short read at " + offset);
+        throw new EOFException("Short read at " + offset);
       }
       done += count;
     }
     return bytes;
   }
 
-  private static void write(java.nio.channels.FileChannel out, long offset, byte[] bytes)
-      throws IOException {
-    java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+  private static void write(FileChannel out, long offset, byte[] bytes) throws IOException {
+    ByteBuffer buffer = ByteBuffer.wrap(bytes);
     long position = offset;
     while (buffer.hasRemaining()) {
       position += out.write(buffer, position);
@@ -364,7 +367,7 @@ final class LocalFiles {
     synchronized (CACHED) {
       Long previous = CACHED.put(local, bytes);
       cachedBytes += bytes - (previous == null ? 0 : previous);
-      java.util.Iterator<Map.Entry<Path, Long>> eldest = CACHED.entrySet().iterator();
+      Iterator<Map.Entry<Path, Long>> eldest = CACHED.entrySet().iterator();
       while (cachedBytes > LIMIT && eldest.hasNext()) {
         Map.Entry<Path, Long> entry = eldest.next();
         if (entry.getKey().equals(local)) {

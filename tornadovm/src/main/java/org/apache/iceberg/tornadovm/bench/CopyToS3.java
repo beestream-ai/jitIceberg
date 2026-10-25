@@ -20,6 +20,7 @@ package org.apache.iceberg.tornadovm.bench;
 
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.List;
@@ -127,7 +128,7 @@ public final class CopyToS3 {
   }
 
   private static String upload(Table copy, String local, String path) throws Exception {
-    String file = local.startsWith("file:") ? java.net.URI.create(local).getPath() : local;
+    String file = local.startsWith("file:") ? URI.create(local).getPath() : local;
     try (InputStream in = Files.newInputStream(Paths.get(file));
         OutputStream out = copy.io().newOutputFile(path).createOrOverwrite()) {
       in.transferTo(out);

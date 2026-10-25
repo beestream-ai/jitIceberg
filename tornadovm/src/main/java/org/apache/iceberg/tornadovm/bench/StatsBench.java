@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.lang.management.ManagementFactory;
 import java.util.Locale;
 import java.util.Map;
 import org.apache.iceberg.Table;
@@ -36,8 +37,7 @@ public final class StatsBench {
   private StatsBench() {}
 
   private static final com.sun.management.OperatingSystemMXBean PROCESS =
-      (com.sun.management.OperatingSystemMXBean)
-          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+      (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
   public static void main(String[] args) throws Exception {
     String[] columns = args[1].split(",");

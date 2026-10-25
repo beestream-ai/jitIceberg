@@ -18,6 +18,10 @@
  */
 package org.apache.iceberg.tornadovm;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.types.Types;
@@ -137,17 +141,16 @@ public final class HostBatch implements LiveRows {
     int source = strings.compacted().get(row);
     int from = strings.offsets().get(stringIndex * (stride + 1) + source);
     int to = strings.offsets().get(stringIndex * (stride + 1) + source + 1);
-    return new String(
-        strings.chars()[stringIndex], from, to - from, java.nio.charset.StandardCharsets.UTF_8);
+    return new String(strings.chars()[stringIndex], from, to - from, StandardCharsets.UTF_8);
   }
 
   // Bulk copies: one native-to-heap copy a column instead of a call a value.
 
   @Override
   public void copyInts(int column, int[] into) {
-    java.lang.foreign.MemorySegment.copy(
+    MemorySegment.copy(
         ints.getSegment(),
-        java.lang.foreign.ValueLayout.JAVA_INT,
+        ValueLayout.JAVA_INT,
         (long) base(column, CudfType.INT32) * Integer.BYTES,
         into,
         0,
@@ -156,9 +159,9 @@ public final class HostBatch implements LiveRows {
 
   @Override
   public void copyLongs(int column, long[] into) {
-    java.lang.foreign.MemorySegment.copy(
+    MemorySegment.copy(
         longs.getSegment(),
-        java.lang.foreign.ValueLayout.JAVA_LONG,
+        ValueLayout.JAVA_LONG,
         (long) base(column, CudfType.INT64) * Long.BYTES,
         into,
         0,
@@ -167,9 +170,9 @@ public final class HostBatch implements LiveRows {
 
   @Override
   public void copyDoubles(int column, double[] into) {
-    java.lang.foreign.MemorySegment.copy(
+    MemorySegment.copy(
         doubles.getSegment(),
-        java.lang.foreign.ValueLayout.JAVA_DOUBLE,
+        ValueLayout.JAVA_DOUBLE,
         (long) base(column, CudfType.FLOAT64) * Double.BYTES,
         into,
         0,
@@ -182,13 +185,8 @@ public final class HostBatch implements LiveRows {
       return false;
     }
     byte[] flags = new byte[rows];
-    java.lang.foreign.MemorySegment.copy(
-        valid.getSegment(),
-        java.lang.foreign.ValueLayout.JAVA_BYTE,
-        (long) column * stride,
-        flags,
-        0,
-        rows);
+    MemorySegment.copy(
+        valid.getSegment(), ValueLayout.JAVA_BYTE, (long) column * stride, flags, 0, rows);
     boolean any = false;
     for (int r = 0; r < rows; r++) {
       into[r] = flags[r] == 0;
@@ -206,13 +204,8 @@ public final class HostBatch implements LiveRows {
     int[] starts = new int[rows];
     int[] lengths = new int[rows];
     int[] compacted = new int[rows];
-    java.lang.foreign.MemorySegment.copy(
-        strings.compacted().getSegment(),
-        java.lang.foreign.ValueLayout.JAVA_INT,
-        0,
-        compacted,
-        0,
-        rows);
+    MemorySegment.copy(
+        strings.compacted().getSegment(), ValueLayout.JAVA_INT, 0, compacted, 0, rows);
     long base = (long) stringIndex * (stride + 1);
     for (int r = 0; r < rows; r++) {
       int from = strings.offsets().get((int) (base + compacted[r]));
@@ -223,7 +216,7 @@ public final class HostBatch implements LiveRows {
   }
 
   @Override
-  public java.nio.ByteBuffer getUtf8(int column, int row) {
+  public ByteBuffer getUtf8(int column, int row) {
     int stringIndex = column - layout.numericCount();
     if (strings == null || stringIndex < 0) {
       throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
@@ -234,6 +227,6 @@ public final class HostBatch implements LiveRows {
     int source = strings.compacted().get(row);
     int from = strings.offsets().get(stringIndex * (stride + 1) + source);
     int to = strings.offsets().get(stringIndex * (stride + 1) + source + 1);
-    return java.nio.ByteBuffer.wrap(strings.chars()[stringIndex], from, to - from);
+    return ByteBuffer.wrap(strings.chars()[stringIndex], from, to - from);
   }
 }

@@ -18,7 +18,9 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.io.File;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,12 +57,12 @@ public final class SplitTable {
       tasks.sort(Comparator.comparing(task -> task.file().location()));
       for (int part = 0; part < parts; part++) {
         String location = warehouse + "/" + args[t] + "_part" + part;
-        if (new java.io.File(location, "metadata").isDirectory()) {
+        if (new File(location, "metadata").isDirectory()) {
           System.out.println(location + " exists");
           continue;
         }
         List<DataFile> data = Lists.newArrayList();
-        Map<String, DeleteFile> deletes = new java.util.LinkedHashMap<>();
+        Map<String, DeleteFile> deletes = new LinkedHashMap<>();
         for (int f = part; f < tasks.size(); f += parts) {
           data.add(tasks.get(f).file());
           tasks.get(f).deletes().forEach(delete -> deletes.putIfAbsent(delete.location(), delete));

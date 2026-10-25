@@ -19,6 +19,9 @@
 package org.apache.iceberg.tornadovm.bench;
 
 import java.io.File;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.DataFile;
@@ -55,8 +58,8 @@ public final class JmhShapeProbe {
       table = MorTables.load(location);
     } else {
       table = MorTables.create(location, schema, 2);
-      java.time.LocalDate date = java.time.LocalDate.of(2026, 10, 10);
-      java.time.OffsetDateTime time = date.atStartOfDay().atOffset(java.time.ZoneOffset.UTC);
+      LocalDate date = LocalDate.of(2026, 10, 10);
+      OffsetDateTime time = date.atStartOfDay().atOffset(ZoneOffset.UTC);
       GenericRecord template = GenericRecord.create(schema);
       DataFile file =
           MorTables.writeDataFile(

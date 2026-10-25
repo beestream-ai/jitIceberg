@@ -18,15 +18,19 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.io.File;
+import java.lang.management.ManagementFactory;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.Set;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 
@@ -49,8 +53,7 @@ public final class NewOpsBench {
   private NewOpsBench() {}
 
   private static final com.sun.management.OperatingSystemMXBean PROCESS =
-      (com.sun.management.OperatingSystemMXBean)
-          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+      (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
   public static void main(String[] args) throws Exception {
     String warehouse = args[0];
@@ -68,7 +71,7 @@ public final class NewOpsBench {
           int count = Integer.parseInt(args[k]);
           for (int run = 0; run < runs; run++) {
             Random random = new Random(count * 31L + run);
-            java.util.Set<Long> keys = new java.util.LinkedHashSet<>();
+            Set<Long> keys = Sets.newLinkedHashSet();
             while (keys.size() < count) {
               keys.add((long) (random.nextDouble() * rows));
             }
@@ -168,7 +171,7 @@ public final class NewOpsBench {
   /** A v3 table over the base table's data files, made once. */
   private static Table twin(String warehouse, String name) throws Exception {
     String location = warehouse + "/" + name + "_v3keys";
-    if (new java.io.File(location, "metadata").isDirectory()) {
+    if (new File(location, "metadata").isDirectory()) {
       return MorTables.load(location);
     }
     Table source = MorTables.load(warehouse + "/" + name);

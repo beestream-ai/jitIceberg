@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.tornadovm;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.Schema;
@@ -86,7 +87,7 @@ public final class GpuBenchmarks {
               }
               default -> {
                 for (int r = 0; r < rows; r++) {
-                  java.nio.ByteBuffer utf8 = batch.getUtf8(column, r);
+                  ByteBuffer utf8 = batch.getUtf8(column, r);
                   part = part * 17 + (utf8 == null ? 31 : utf8Hash(utf8));
                 }
               }
@@ -98,7 +99,7 @@ public final class GpuBenchmarks {
   }
 
   /** Every byte of a string, without decoding it -- as Spark reads a UTF8String. */
-  private static long utf8Hash(java.nio.ByteBuffer bytes) {
+  private static long utf8Hash(ByteBuffer bytes) {
     long hash = 0;
     for (int i = bytes.position(); i < bytes.limit(); i++) {
       hash = hash * 31 + bytes.get(i);

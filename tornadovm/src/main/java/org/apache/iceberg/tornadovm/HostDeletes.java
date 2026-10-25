@@ -21,10 +21,16 @@ package org.apache.iceberg.tornadovm;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
@@ -45,6 +51,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ContentFileUtil;
+import org.apache.iceberg.util.DateTimeUtil;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.io.LocalInputFile;
 import org.apache.parquet.schema.MessageType;
@@ -669,7 +676,7 @@ final class HostDeletes {
       MessageType schema = reader.getFileMetaData().getSchema();
       Map<Integer, Long> bytes = Maps.newHashMap();
       Map<Integer, long[]> bounds = Maps.newHashMap();
-      java.util.Set<Integer> unbounded = Sets.newHashSet();
+      Set<Integer> unbounded = Sets.newHashSet();
       for (org.apache.parquet.hadoop.metadata.BlockMetaData block :
           reader.getFooter().getBlocks()) {
         for (org.apache.parquet.hadoop.metadata.ColumnChunkMetaData chunk : block.getColumns()) {
@@ -701,9 +708,9 @@ final class HostDeletes {
             continue;
           }
           org.apache.parquet.column.statistics.SizeStatistics size = chunk.getSizeStatistics();
-          java.util.Optional<Long> unencoded =
+          Optional<Long> unencoded =
               size == null || !size.isValid()
-                  ? java.util.Optional.empty()
+                  ? Optional.empty()
                   : size.getUnencodedByteArrayDataBytes();
           if (column.asPrimitiveType().getPrimitiveTypeName()
               != org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
@@ -760,11 +767,9 @@ final class HostDeletes {
               isNull = 0;
               widened =
                   switch (value) {
-                    case java.time.LocalDate date -> date.toEpochDay();
-                    case java.time.LocalDateTime time ->
-                        org.apache.iceberg.util.DateTimeUtil.microsFromTimestamp(time);
-                    case java.time.OffsetDateTime time ->
-                        org.apache.iceberg.util.DateTimeUtil.microsFromTimestamptz(time);
+                    case LocalDate date -> date.toEpochDay();
+                    case LocalDateTime time -> DateTimeUtil.microsFromTimestamp(time);
+                    case OffsetDateTime time -> DateTimeUtil.microsFromTimestamptz(time);
                     default -> ((Number) value).longValue();
                   };
             }
@@ -790,13 +795,12 @@ final class HostDeletes {
    * {@code deleteKeys} probes. Read in place of a file, merged with any real equality-delete files
    * that apply too.
    */
-  private static final Map<String, long[]> PROVIDED =
-      new java.util.concurrent.ConcurrentHashMap<>();
+  private static final Map<String, long[]> PROVIDED = Maps.newConcurrentMap();
 
   static final String PROVIDED_PREFIX = "memory://iceberg-tornadovm/keys/";
 
   static String provide(long[] keys) {
-    String location = PROVIDED_PREFIX + java.util.UUID.randomUUID();
+    String location = PROVIDED_PREFIX + UUID.randomUUID();
     PROVIDED.put(location, keys);
     return location;
   }

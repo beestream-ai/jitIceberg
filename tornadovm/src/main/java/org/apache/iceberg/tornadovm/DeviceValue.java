@@ -18,8 +18,11 @@
  */
 package org.apache.iceberg.tornadovm;
 
+import java.io.Serializable;
 import java.util.List;
+import java.util.function.ToDoubleFunction;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 /**
  * A value to sum per group, evaluated on the device row by row: a product of factors {@code (a + b
@@ -27,7 +30,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
  * TPC-H's pricing queries, {@code l_extendedprice * (1 - l_discount) * (1 + l_tax)} for one. A row
  * where any factor's column is null contributes 0, as SQL's SUM skips a null product.
  */
-public final class DeviceValue implements java.io.Serializable {
+public final class DeviceValue implements Serializable {
   /** Most factors in one value. */
   public static final int MAX_FACTORS = 4;
 
@@ -40,7 +43,7 @@ public final class DeviceValue implements java.io.Serializable {
    * {@code coefficient}) when the coefficient is not zero, multiplying the current term otherwise.
    */
   public record Factor(String column, double offset, double scale, double coefficient)
-      implements java.io.Serializable {}
+      implements Serializable {}
 
   private final List<Factor> factors;
 
@@ -150,7 +153,7 @@ public final class DeviceValue implements java.io.Serializable {
 
   /** The columns the value reads. */
   public List<String> columns() {
-    List<String> columns = new java.util.ArrayList<>();
+    List<String> columns = Lists.newArrayList();
     for (Factor f : factors) {
       if (!columns.contains(f.column())) {
         columns.add(f.column());
@@ -163,7 +166,7 @@ public final class DeviceValue implements java.io.Serializable {
    * The largest magnitude one row's value can have, given each column's largest magnitude: the sum
    * over terms of the product of each factor's {@code |offset| + |scale| * largest}.
    */
-  public double bound(java.util.function.ToDoubleFunction<String> largest) {
+  public double bound(ToDoubleFunction<String> largest) {
     if (part != WHOLE) {
       // A part of an integer below 2^53: high below 2^13 in magnitude, middle and low below 2^20.
       return part == HIGH ? 0x1p13 : 0x1p20;
@@ -172,7 +175,7 @@ public final class DeviceValue implements java.io.Serializable {
   }
 
   /** The largest magnitude one row's whole value can have (a part's row value included). */
-  public double rowBound(java.util.function.ToDoubleFunction<String> largest) {
+  public double rowBound(ToDoubleFunction<String> largest) {
     double bound = 0;
     double term = 0;
     for (Factor f : factors) {

@@ -20,12 +20,16 @@ package org.apache.iceberg.tornadovm;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import org.apache.iceberg.BaseCombinedScanTask;
 import org.apache.iceberg.CombinedScanTask;
 import org.apache.iceberg.DataFile;
@@ -36,13 +40,16 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.arrow.vectorized.ArrowReader;
 import org.apache.iceberg.arrow.vectorized.ColumnVector;
 import org.apache.iceberg.arrow.vectorized.ColumnarBatch;
+import org.apache.iceberg.deletes.BaseDVFileWriter;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
+import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.BucketUtil;
 import uk.ac.manchester.tornado.cudf.enums.CudfType;
@@ -144,9 +151,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
    * every visitor once all files have been read. Returns the live row count.
    */
   public <V extends RowVisitor> long visit(
-      List<String> columns,
-      java.util.function.Function<Map<String, Integer>, V> perFile,
-      Consumer<List<V>> finish) {
+      List<String> columns, Function<Map<String, Integer>, V> perFile, Consumer<List<V>> finish) {
     return run(
         columns,
         (file, columnIndex) -> new VisitorSink<>(perFile.apply(columnIndex)),
@@ -186,10 +191,8 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     table.refresh();
     long snapshotId = table.currentSnapshot().snapshotId();
     List<String> keys = Lists.newArrayList();
-    java.util.Set<DeleteFile> equality =
-        org.apache.iceberg.relocated.com.google.common.collect.Sets.newHashSet();
-    java.util.Set<DeleteFile> replaced =
-        org.apache.iceberg.relocated.com.google.common.collect.Sets.newHashSet();
+    Set<DeleteFile> equality = Sets.newHashSet();
+    Set<DeleteFile> replaced = Sets.newHashSet();
     try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
       for (FileScanTask task : planned) {
         for (DeleteFile delete : task.deletes()) {
@@ -207,12 +210,11 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
-    org.apache.iceberg.io.OutputFileFactory files =
-        org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, System.nanoTime())
+    OutputFileFactory files =
+        OutputFileFactory.builderFor(table, 1, System.nanoTime())
             .format(org.apache.iceberg.FileFormat.PUFFIN)
             .build();
-    org.apache.iceberg.deletes.BaseDVFileWriter writer =
-        new org.apache.iceberg.deletes.BaseDVFileWriter(files, path -> null);
+    BaseDVFileWriter writer = new BaseDVFileWriter(files, path -> null);
     long[] dead = new long[1];
     int[] converted = new int[1];
     run(
@@ -279,7 +281,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
     @Override
     public void deleted(long position) {
       if (count == positions.length) {
-        positions = java.util.Arrays.copyOf(positions, count * 2);
+        positions = Arrays.copyOf(positions, count * 2);
       }
       positions[count++] = position;
     }
@@ -315,7 +317,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       List<String> projection,
       SinkFactory<S> factory,
       Consumer<List<S>> finish,
-      java.util.function.Predicate<FileScanTask> include) {
+      Predicate<FileScanTask> include) {
     metrics = new ScanMetrics();
     long start = System.nanoTime();
     List<FileScanTask> tasks = Lists.newArrayList();
@@ -621,8 +623,8 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       }
       int groupIndex = groups.indexOf(key);
       if (groupIndex == counts.length) {
-        counts = java.util.Arrays.copyOf(counts, counts.length * 2);
-        sums = java.util.Arrays.copyOf(sums, sums.length * 2);
+        counts = Arrays.copyOf(counts, counts.length * 2);
+        sums = Arrays.copyOf(sums, sums.length * 2);
       }
       counts[groupIndex]++;
       for (int c = 0; c < sumColumns.length; c++) {

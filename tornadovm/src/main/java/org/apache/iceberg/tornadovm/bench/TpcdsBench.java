@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.lang.management.ManagementFactory;
 import java.util.List;
 import java.util.Locale;
 import org.apache.iceberg.DataFile;
@@ -29,6 +30,7 @@ import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
+import org.apache.iceberg.types.Types;
 
 /**
  * TPC-DS store_sales operations on the tables of {@code tpcds_partitioned_setup.py}, each run
@@ -48,8 +50,7 @@ public final class TpcdsBench {
   private TpcdsBench() {}
 
   private static final com.sun.management.OperatingSystemMXBean PROCESS =
-      (com.sun.management.OperatingSystemMXBean)
-          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+      (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
   public static void main(String[] args) throws Exception {
     String warehouse = args[0];
@@ -141,10 +142,7 @@ public final class TpcdsBench {
     double[] unit = new double[SUMS.size()];
     for (int v = 0; v < unit.length; v++) {
       org.apache.iceberg.types.Type type = table.schema().findType(SUMS.get(v));
-      unit[v] =
-          type instanceof org.apache.iceberg.types.Types.DecimalType decimal
-              ? Math.pow(10, -decimal.scale())
-              : 1;
+      unit[v] = type instanceof Types.DecimalType decimal ? Math.pow(10, -decimal.scale()) : 1;
     }
     double checksum = 0;
     for (double[] totals : result.groups().values()) {

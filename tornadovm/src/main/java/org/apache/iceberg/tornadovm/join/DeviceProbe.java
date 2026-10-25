@@ -20,6 +20,7 @@ package org.apache.iceberg.tornadovm.join;
 
 import java.util.List;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 /**
  * An inner join of a star aggregate's fact rows with a small table the caller has already reduced
@@ -111,7 +112,7 @@ public final class DeviceProbe {
     int[] order = sortedOrder(keys);
     long[] sortedKeys = new long[keys.length];
     long[] sortedValues = new long[keys.length];
-    List<double[]> sortedSums = new java.util.ArrayList<>();
+    List<double[]> sortedSums = Lists.newArrayList();
     columns.forEach(c -> sortedSums.add(new double[keys.length]));
     for (int i = 0; i < order.length; i++) {
       sortedKeys[i] = keys[order[i]];

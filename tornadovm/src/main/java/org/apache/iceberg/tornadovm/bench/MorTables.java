@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.tornadovm.bench;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
@@ -36,6 +37,8 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.deletes.BaseDVFileWriter;
@@ -47,9 +50,11 @@ import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.OutputFileFactory;
+import org.apache.iceberg.jdbc.JdbcCatalog;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 
 /**
@@ -111,9 +116,9 @@ public final class MorTables {
     return location.startsWith("s3://") || location.startsWith("s3a://");
   }
 
-  private static org.apache.iceberg.catalog.TableIdentifier identifier(String location) {
+  private static TableIdentifier identifier(String location) {
     String path = location.substring(location.indexOf("://") + 3).replaceAll("[^A-Za-z0-9_]", "_");
-    return org.apache.iceberg.catalog.TableIdentifier.of("s3", path);
+    return TableIdentifier.of("s3", path);
   }
 
   /**
@@ -122,10 +127,10 @@ public final class MorTables {
    * {@code s3.*} and {@code client.*} system properties ({@code -Ds3.endpoint=...} for an
    * S3-compatible server such as SeaweedFS or MinIO).
    */
-  private static final org.apache.iceberg.jdbc.JdbcCatalog S3_CATALOG = s3Catalog();
+  private static final JdbcCatalog S3_CATALOG = s3Catalog();
 
-  private static org.apache.iceberg.jdbc.JdbcCatalog s3Catalog() {
-    Map<String, String> props = new java.util.HashMap<>();
+  private static JdbcCatalog s3Catalog() {
+    Map<String, String> props = Maps.newHashMap();
     for (String name : System.getProperties().stringPropertyNames()) {
       if (name.startsWith("s3.") || name.startsWith("client.")) {
         props.put(name, System.getProperty(name));
@@ -138,10 +143,10 @@ public final class MorTables {
     String db =
         System.getProperty(
             "bench.catalog", System.getProperty("user.home") + "/.iceberg-tornadovm/s3-catalog.db");
-    new java.io.File(db).getParentFile().mkdirs();
+    new File(db).getParentFile().mkdirs();
     props.put(org.apache.iceberg.CatalogProperties.URI, "jdbc:sqlite:" + db);
     props.put(org.apache.iceberg.CatalogProperties.WAREHOUSE_LOCATION, "s3://iceberg/catalog");
-    org.apache.iceberg.jdbc.JdbcCatalog catalog = new org.apache.iceberg.jdbc.JdbcCatalog();
+    JdbcCatalog catalog = new JdbcCatalog();
     catalog.initialize("s3", props);
     return catalog;
   }
@@ -292,8 +297,7 @@ public final class MorTables {
               .equalityFieldIds(field.fieldId())
               .overwrite()
               .buildEqualityWriter();
-      org.apache.iceberg.data.GenericRecord record =
-          org.apache.iceberg.data.GenericRecord.create(keySchema);
+      GenericRecord record = GenericRecord.create(keySchema);
       try (EqualityDeleteWriter<Record> closing = writer) {
         for (Object key : keys) {
           closing.write(record.copy(column, key));
@@ -325,11 +329,10 @@ public final class MorTables {
               .equalityFieldIds(ids)
               .overwrite()
               .buildEqualityWriter();
-      org.apache.iceberg.data.GenericRecord record =
-          org.apache.iceberg.data.GenericRecord.create(keySchema);
+      GenericRecord record = GenericRecord.create(keySchema);
       try (EqualityDeleteWriter<Record> closing = writer) {
         for (Object[] key : keys) {
-          org.apache.iceberg.data.GenericRecord row = record.copy();
+          GenericRecord row = record.copy();
           for (int c = 0; c < key.length; c++) {
             row.set(c, key[c]);
           }

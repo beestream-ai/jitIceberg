@@ -23,6 +23,7 @@ import java.util.Set;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.BoundPredicate;
+import org.apache.iceberg.expressions.BoundReference;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.ExpressionVisitors;
 import org.apache.iceberg.expressions.UnboundPredicate;
@@ -265,7 +266,7 @@ final class DevicePredicate {
 
     @Override
     public <T> List<Term> predicate(BoundPredicate<T> pred) {
-      if (!(pred.term() instanceof org.apache.iceberg.expressions.BoundReference)) {
+      if (!(pred.term() instanceof BoundReference)) {
         throw new UnsupportedOperationException("Only plain column references: " + pred);
       }
       Types.NestedField field = pred.ref().field();

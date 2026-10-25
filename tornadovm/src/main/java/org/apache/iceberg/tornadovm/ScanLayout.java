@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.tornadovm;
 
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.Schema;
@@ -141,7 +143,7 @@ final class ScanLayout {
    * value at the column's scale (exactly, or not at all), any other number as itself.
    */
   static long deviceLong(Types.NestedField field, Object value) {
-    if (value instanceof java.math.BigDecimal decimal) {
+    if (value instanceof BigDecimal decimal) {
       int scale = ((Types.DecimalType) field.type()).scale();
       return decimal.setScale(scale).unscaledValue().longValueExact();
     }
@@ -181,7 +183,7 @@ final class ScanLayout {
    * would compare wrongly once cut.
    */
   static long packString(CharSequence value) {
-    byte[] bytes = value.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
     if (bytes.length > 8) {
       throw new UnsupportedOperationException(
           "Strings of more than 8 bytes are not supported on the device: " + value);
@@ -204,7 +206,7 @@ final class ScanLayout {
         length = b + 1;
       }
     }
-    return new String(bytes, 0, length, java.nio.charset.StandardCharsets.UTF_8);
+    return new String(bytes, 0, length, StandardCharsets.UTF_8);
   }
 
   int slots(CudfType type) {

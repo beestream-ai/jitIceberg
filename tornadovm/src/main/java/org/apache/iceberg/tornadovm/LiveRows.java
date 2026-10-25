@@ -18,6 +18,10 @@
  */
 package org.apache.iceberg.tornadovm;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+
 /** The live rows of one data file after merge-on-read, column by name. */
 public interface LiveRows {
   int rows();
@@ -40,11 +44,9 @@ public interface LiveRows {
    * A string column's value as its UTF-8 bytes, without decoding or copying them -- what Spark's
    * UTF8String holds; null when the row's value is null.
    */
-  default java.nio.ByteBuffer getUtf8(int column, int row) {
+  default ByteBuffer getUtf8(int column, int row) {
     String value = getString(column, row);
-    return value == null
-        ? null
-        : java.nio.ByteBuffer.wrap(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    return value == null ? null : ByteBuffer.wrap(value.getBytes(StandardCharsets.UTF_8));
   }
 
   default boolean isNull(String column, int row) {
@@ -103,11 +105,11 @@ public interface LiveRows {
 
   /** A string column's values, without a String a row. */
   default Utf8Column utf8Column(int column) {
-    java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     int[] starts = new int[rows()];
     int[] lengths = new int[rows()];
     for (int r = 0; r < rows(); r++) {
-      java.nio.ByteBuffer value = getUtf8(column, r);
+      ByteBuffer value = getUtf8(column, r);
       starts[r] = bytes.size();
       if (value != null) {
         lengths[r] = value.remaining();

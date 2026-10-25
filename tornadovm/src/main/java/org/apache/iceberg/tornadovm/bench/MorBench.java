@@ -19,8 +19,11 @@
 package org.apache.iceberg.tornadovm.bench;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.management.ManagementFactory;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.iceberg.Table;
@@ -31,12 +34,14 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.tornadovm.AggregateResult;
 import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
 import org.apache.iceberg.tornadovm.MergeOnReadScan;
+import org.apache.iceberg.util.BucketUtil;
 
 /**
  * Runs one engine and one query over benchmark tables and prints one CSV line a run.
@@ -127,8 +132,7 @@ public final class MorBench {
   }
 
   private static final com.sun.management.OperatingSystemMXBean PROCESS =
-      (com.sun.management.OperatingSystemMXBean)
-          java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+      (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
   /**
    * Runs {@code -Dbench.beforeRun=<command>} before each timed run, outside the timing -- dropping
@@ -149,8 +153,8 @@ public final class MorBench {
       if (status != 0) {
         throw new IllegalStateException("bench.beforeRun failed: " + status);
       }
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException(e);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IllegalStateException(e);
@@ -335,7 +339,7 @@ public final class MorBench {
                     : ImmutableList.of("id", "k", "v1", "v2", "v3", "v4");
     long rows = 0;
     double checksum = 0;
-    java.util.Set<Integer> groups = new java.util.HashSet<>();
+    Set<Integer> groups = Sets.newHashSet();
     try (CloseableIterable<Record> records =
         IcebergGenerics.read(table).select(columns).where(filterOf(query)).build()) {
       for (Record record : records) {
@@ -344,7 +348,7 @@ public final class MorBench {
           case "q1" -> checksum += (Double) record.getField("v1");
           case "q4" -> {
             long id = (Long) record.getField("id");
-            groups.add((org.apache.iceberg.util.BucketUtil.hash(id) & Integer.MAX_VALUE) % 16);
+            groups.add((BucketUtil.hash(id) & Integer.MAX_VALUE) % 16);
             checksum += (Double) record.getField("v1");
           }
           case "q5" -> {

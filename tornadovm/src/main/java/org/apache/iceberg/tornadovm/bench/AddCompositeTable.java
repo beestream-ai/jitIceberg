@@ -19,6 +19,7 @@
 package org.apache.iceberg.tornadovm.bench;
 
 import java.io.File;
+import java.util.Arrays;
 import java.util.List;
 import java.util.SplittableRandom;
 import org.apache.iceberg.DataFile;
@@ -52,7 +53,7 @@ public final class AddCompositeTable {
     for (int j = 0; j < pairs; j++) {
       ids[j] = pick.nextLong(files * rowsPerFile);
     }
-    java.util.Arrays.sort(ids);
+    Arrays.sort(ids);
     List<Object[]> keys = Lists.newArrayListWithCapacity(pairs);
     int next = 0;
     for (int f = 0; f < files && next < pairs; f++) {

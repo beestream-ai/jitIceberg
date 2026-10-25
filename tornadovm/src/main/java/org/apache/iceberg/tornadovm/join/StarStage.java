@@ -19,6 +19,7 @@
 package org.apache.iceberg.tornadovm.join;
 
 import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
@@ -96,7 +97,7 @@ final class StarStage implements GroupedStage {
         break;
       }
       int[] codes = dimensions.get(key.dimension()).attributes().get(key.attribute());
-      cardinalities[k] = 1 + java.util.Arrays.stream(codes).max().orElse(0);
+      cardinalities[k] = 1 + Arrays.stream(codes).max().orElse(0);
       multipliers[k] = (int) Math.min(groups, Integer.MAX_VALUE);
       groups *= cardinalities[k];
       if (groups > MAX_DENSE_GROUPS) {

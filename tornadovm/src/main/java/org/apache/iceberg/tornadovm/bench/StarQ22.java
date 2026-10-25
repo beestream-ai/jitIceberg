@@ -33,9 +33,11 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
+import org.apache.iceberg.tornadovm.join.CpuStarAggregation;
 import org.apache.iceberg.tornadovm.join.DeviceDimension;
 import org.apache.iceberg.tornadovm.join.StarAggregation;
 
@@ -131,8 +133,8 @@ public final class StarQ22 {
         groups =
             star && Boolean.getBoolean("star.cpu")
                 // The same star on the CPU (CpuStarAggregation), every core: what the GPU adds.
-                ? org.apache.iceberg.tornadovm.join.CpuStarAggregation.run(
-                    org.apache.iceberg.tornadovm.CpuMergeOnReadScan.of(
+                ? CpuStarAggregation.run(
+                    CpuMergeOnReadScan.of(
                         MorTables.load(warehouse + "/inventory"),
                         Integer.getInteger(
                             "star.threads", Runtime.getRuntime().availableProcessors())),
