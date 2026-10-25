@@ -36,8 +36,11 @@ tables = sys.argv[4:]
 namespace = os.path.basename(warehouse.rstrip("/"))
 spark = SparkSession.builder.appName(f"tpcds-partitioned-{operation}").getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
-options = ("'rewrite-all','true','remove-dangling-deletes','true','max-file-group-size-bytes','268435456',"
-           "'max-concurrent-file-group-rewrites','32','target-file-size-bytes','134217728'")
+# REWRITE_OPTIONS overrides, e.g. one output file a group (group size = target size) for a per-file sort.
+options = os.environ.get(
+    "REWRITE_OPTIONS",
+    "'rewrite-all','true','remove-dangling-deletes','true','max-file-group-size-bytes','268435456',"
+    "'max-concurrent-file-group-rewrites','32','target-file-size-bytes','134217728'")
 print("table,engine,operation,run,warmup,ms,live_rows,checksum,cpu_s,detail", flush=True)
 
 
