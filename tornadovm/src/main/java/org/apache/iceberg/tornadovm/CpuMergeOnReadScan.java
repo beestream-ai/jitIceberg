@@ -256,7 +256,8 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
             .newRowDelta()
             .validateFromSnapshot(snapshotId)
             .validateNoConflictingDeleteFiles()
-            .validateDeletedFiles();
+            .validateDeletedFiles()
+            .validateDataFilesExist(DeviceMergeOnReadScan.referencedDataFiles(vectors));
     equality.forEach(delta::removeDeletes);
     replaced.forEach(delta::removeDeletes);
     vectors.forEach(delta::addDeletes);

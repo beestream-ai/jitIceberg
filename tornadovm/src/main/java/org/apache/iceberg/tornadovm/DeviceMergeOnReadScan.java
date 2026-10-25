@@ -1165,7 +1165,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
             .newRowDelta()
             .validateFromSnapshot(snapshotId)
             .validateNoConflictingDeleteFiles()
-            .validateDeletedFiles();
+            .validateDeletedFiles()
+            .validateDataFilesExist(referencedDataFiles(vectors));
     validate.accept(delta);
     removed.forEach(delta::removeDeletes);
     replaced.forEach(delta::removeDeletes);
@@ -1176,6 +1177,18 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     metrics.total((System.nanoTime() - start) / 1e6);
     return new ConversionResult(
         tasks.size(), removed.size(), replaced.size(), vectors.size(), dead);
+  }
+
+  /** The data files the new deletes point at, which a concurrent rewrite must not have removed. */
+  static List<CharSequence> referencedDataFiles(List<DeleteFile> deletes) {
+    List<CharSequence> files = Lists.newArrayList();
+    for (DeleteFile delete : deletes) {
+      CharSequence file = ContentFileUtil.referencedDataFile(delete);
+      if (file != null) {
+        files.add(file);
+      }
+    }
+    return files;
   }
 
   /**

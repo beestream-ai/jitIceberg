@@ -19,9 +19,12 @@
 package org.apache.iceberg.tornadovm;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -29,15 +32,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.LongStream;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DataOperations;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -1463,6 +1472,78 @@ public class TestDeviceMergeOnRead {
       }
     }
     assertMatchesIceberg(table);
+  }
+
+  /**
+   * A compaction that commits while a conversion runs removes a data file the conversion wrote a
+   * deletion vector for: the conversion's commit fails rather than point a vector at a file that is
+   * gone, on the device and on the CPU twin.
+   */
+  @Test
+  public void testConversionFailsAfterConcurrentRewrite() {
+    for (boolean onDevice : new boolean[] {true, false}) {
+      Table table = equalityDeletesToConvert(onDevice ? "eq-to-dv-race" : "eq-to-dv-race-cpu");
+      Table racing = rewriteBeforeRowDelta(table);
+      if (onDevice) {
+        assertThatThrownBy(
+                () -> {
+                  try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(racing)) {
+                    device.convertEqualityDeletes();
+                  }
+                })
+            .isInstanceOf(ValidationException.class)
+            .hasMessageContaining("missing data files");
+      } else {
+        assertThatThrownBy(() -> CpuMergeOnReadScan.of(racing, 4).convertEqualityDeletes())
+            .isInstanceOf(ValidationException.class)
+            .hasMessageContaining("missing data files");
+      }
+      table.refresh();
+      assertThat(table.currentSnapshot().operation()).isEqualTo(DataOperations.REPLACE);
+    }
+  }
+
+  /**
+   * The table, except that its first {@code newRowDelta()} first commits a rewrite of a data file
+   * that equality deletes apply to: a compaction landing between a conversion's plan and its
+   * commit.
+   */
+  private static Table rewriteBeforeRowDelta(Table table) {
+    AtomicBoolean rewritten = new AtomicBoolean();
+    return (Table)
+        Proxy.newProxyInstance(
+            Table.class.getClassLoader(),
+            new Class<?>[] {Table.class, HasTableOperations.class},
+            (proxy, method, args) -> {
+              if ("newRowDelta".equals(method.getName()) && rewritten.compareAndSet(false, true)) {
+                DataFile victim = null;
+                try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+                  for (FileScanTask task : tasks) {
+                    if (task.deletes().stream()
+                        .anyMatch(d -> d.content() == FileContent.EQUALITY_DELETES)) {
+                      victim = task.file();
+                      break;
+                    }
+                  }
+                }
+                DataFile copy =
+                    DataFiles.builder(table.spec())
+                        .copy(victim)
+                        .withPath(victim.location() + ".rewritten.parquet")
+                        .build();
+                table
+                    .newRewrite()
+                    .validateFromSnapshot(table.currentSnapshot().snapshotId())
+                    .deleteFile(victim)
+                    .addFile(copy)
+                    .commit();
+              }
+              try {
+                return method.invoke(table, args);
+              } catch (InvocationTargetException e) {
+                throw e.getCause();
+              }
+            });
   }
 
   /** Position deletes, two equality deletes, and a file appended between them: v3. */

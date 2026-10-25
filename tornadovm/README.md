@@ -94,7 +94,7 @@ planner chose (a `where`, a delete-file threshold) and leave the commit to the c
      positions of dropped rows. A group-by on one int/long key whose Parquet footer bounds span
      at most 4096 values (a store, a month, a status code) skips cuDF's hash table: rows add
      into 32 copies of a slot array with atomics, and a second kernel sums the copies.
-   Nothing returns to the host between these steps. `iceberg.tornadovm.streams` batches (3 by
+   Nothing returns to the host between these steps. `iceberg.tornadovm.streams` batches (4 by
    default) run at once, each on its own CUDA stream.
 4. **Commit** through Iceberg: `RewriteFiles` for compaction, `RowDelta` for deletion vectors.
 
@@ -180,7 +180,7 @@ The Spark baselines run the same operations through Spark 3.5 and Iceberg's proc
 | Property | Default | |
 |---|---|---|
 | `iceberg.tornadovm.batch-rows` | 8M | rows a batch |
-| `iceberg.tornadovm.streams` | 3 | batches in flight, one CUDA stream each |
+| `iceberg.tornadovm.streams` | 4 | batches in flight, one CUDA stream each |
 | `iceberg.tornadovm.deleteKeys.inLimit` | 1000 | up to this many keys prune by `IN`, more by range |
 | `iceberg.tornadovm.positionWriters` | 0 (auto: one per 32k positions, up to a core each) | v2 position-delete writers |
 | `iceberg.tornadovm.rewriteBatchBytes` | 768 MB | decoded bytes a compaction batch holds on each stream |
