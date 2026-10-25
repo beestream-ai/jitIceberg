@@ -25,8 +25,8 @@ final class PrimitiveHash {
   private PrimitiveHash() {}
 
   static int mix(long key) {
-    long h = key * 0x9E3779B97F4A7C15L;
-    return (int) (h ^ (h >>> 32));
+    long hash = key * 0x9E3779B97F4A7C15L;
+    return (int) (hash ^ (hash >>> 32));
   }
 
   /** A set of longs, built once and then only probed. */
@@ -51,26 +51,26 @@ final class PrimitiveHash {
         containsEmpty = true;
         return;
       }
-      int i = mix(key) & mask;
-      while (slots[i] != EMPTY) {
-        if (slots[i] == key) {
+      int slot = mix(key) & mask;
+      while (slots[slot] != EMPTY) {
+        if (slots[slot] == key) {
           return;
         }
-        i = (i + 1) & mask;
+        slot = (slot + 1) & mask;
       }
-      slots[i] = key;
+      slots[slot] = key;
     }
 
     boolean contains(long key) {
       if (key == EMPTY) {
         return containsEmpty;
       }
-      int i = mix(key) & mask;
-      while (slots[i] != EMPTY) {
-        if (slots[i] == key) {
+      int slot = mix(key) & mask;
+      while (slots[slot] != EMPTY) {
+        if (slots[slot] == key) {
           return true;
         }
-        i = (i + 1) & mask;
+        slot = (slot + 1) & mask;
       }
       return false;
     }
@@ -85,16 +85,16 @@ final class PrimitiveHash {
 
     int indexOf(int key) {
       int mask = keys.length - 1;
-      int i = mix(key) & mask;
-      while (used[i]) {
-        if (keys[i] == key) {
-          return values[i];
+      int slot = mix(key) & mask;
+      while (used[slot]) {
+        if (keys[slot] == key) {
+          return values[slot];
         }
-        i = (i + 1) & mask;
+        slot = (slot + 1) & mask;
       }
-      used[i] = true;
-      keys[i] = key;
-      values[i] = size;
+      used[slot] = true;
+      keys[slot] = key;
+      values[slot] = size;
       size++;
       if (size * 2 > keys.length) {
         grow();
@@ -112,13 +112,13 @@ final class PrimitiveHash {
       int mask = keys.length - 1;
       for (int j = 0; j < oldKeys.length; j++) {
         if (oldUsed[j]) {
-          int i = mix(oldKeys[j]) & mask;
-          while (used[i]) {
-            i = (i + 1) & mask;
+          int slot = mix(oldKeys[j]) & mask;
+          while (used[slot]) {
+            slot = (slot + 1) & mask;
           }
-          used[i] = true;
-          keys[i] = oldKeys[j];
-          values[i] = oldValues[j];
+          used[slot] = true;
+          keys[slot] = oldKeys[j];
+          values[slot] = oldValues[j];
         }
       }
     }

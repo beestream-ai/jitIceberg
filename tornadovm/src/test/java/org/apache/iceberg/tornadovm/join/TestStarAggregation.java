@@ -60,13 +60,13 @@ public class TestStarAggregation {
         .isTrue();
   }
 
-  private static Record row(Schema schema, long fileIndex, long i) {
+  private static Record row(Schema schema, long fileIndex, long rowIndex) {
     GenericRecord record = GenericRecord.create(schema);
-    record.setField("id", fileIndex * 1_000_000L + i);
-    record.setField("k", (int) (i % 7));
-    record.setField("v1", i * 0.25);
-    record.setField("v2", (double) -i);
-    record.setField("v3", (double) (i % 3));
+    record.setField("id", fileIndex * 1_000_000L + rowIndex);
+    record.setField("k", (int) (rowIndex % 7));
+    record.setField("v1", rowIndex * 0.25);
+    record.setField("v2", (double) -rowIndex);
+    record.setField("v3", (double) (rowIndex % 3));
     record.setField("v4", 1.0);
     return record;
   }
@@ -81,8 +81,8 @@ public class TestStarAggregation {
     return files;
   }
 
-  private static long[] everyNth(long rows, int n) {
-    return LongStream.range(0, rows).filter(i -> i % n == 0).toArray();
+  private static long[] everyNth(long rows, int every) {
+    return LongStream.range(0, rows).filter(i -> i % every == 0).toArray();
   }
 
   private static long[] randomPositions(long rows, double fraction, long seed) {
@@ -173,18 +173,18 @@ public class TestStarAggregation {
     Map<List<Object>, double[]> expected = Maps.newHashMap();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record record : records) {
-        int k = (Integer) record.getField("k");
-        long key = parity[k] * 10L + k;
+        int kValue = (Integer) record.getField("k");
+        long key = parity[kValue] * 10L + kValue;
         int weight = 0;
         for (int b = 0; b < keys.length; b++) {
-          if (keys[b] == key && k < values[b]) {
+          if (keys[b] == key && kValue < values[b]) {
             weight++;
           }
         }
         if (weight > 0) {
           double[] totals =
               expected.computeIfAbsent(
-                  ImmutableList.of((long) parity[k]), ignored -> new double[2]);
+                  ImmutableList.of((long) parity[kValue]), ignored -> new double[2]);
           totals[0] += weight * (Double) record.getField("v1");
           totals[1] += weight;
         }
@@ -231,11 +231,11 @@ public class TestStarAggregation {
     Map<List<Object>, double[]> expected = Maps.newHashMap();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record record : records) {
-        int k = (Integer) record.getField("k");
-        int weight = k == 2 ? 2 : k == 4 ? 3 : 0;
+        int kValue = (Integer) record.getField("k");
+        int weight = kValue == 2 ? 2 : kValue == 4 ? 3 : 0;
         if (weight > 0) {
           double[] totals =
-              expected.computeIfAbsent(ImmutableList.of((long) k), ignored -> new double[2]);
+              expected.computeIfAbsent(ImmutableList.of((long) kValue), ignored -> new double[2]);
           totals[0] += weight * (Double) record.getField("v1");
           totals[1] += weight;
         }
@@ -285,10 +285,10 @@ public class TestStarAggregation {
     Map<List<Object>, double[]> expected = Maps.newHashMap();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record record : records) {
-        int k = (Integer) record.getField("k");
-        if (k == 2 || k == 4) {
+        int kValue = (Integer) record.getField("k");
+        if (kValue == 2 || kValue == 4) {
           double[] totals =
-              expected.computeIfAbsent(ImmutableList.of((long) k), ignored -> new double[2]);
+              expected.computeIfAbsent(ImmutableList.of((long) kValue), ignored -> new double[2]);
           totals[0] += (Double) record.getField("v1");
           totals[1] += 1;
         }
@@ -336,12 +336,12 @@ public class TestStarAggregation {
     Map<List<Object>, double[]> expected = Maps.newHashMap();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record record : records) {
-        int k = (Integer) record.getField("k");
+        int kValue = (Integer) record.getField("k");
         int weight = 0;
         double sum = 0;
         int nonNull = 0;
         for (int b = 0; b < keys.length; b++) {
-          if (keys[b] == k) {
+          if (keys[b] == kValue) {
             weight++;
             if (!Double.isNaN(amounts[b])) {
               sum += amounts[b];
@@ -350,13 +350,13 @@ public class TestStarAggregation {
           }
         }
         if (weight > 0) {
-          double[] t =
+          double[] totals =
               expected.computeIfAbsent(
-                  ImmutableList.of((long) parity[k]), ignored -> new double[4]);
-          t[0] += weight * (Double) record.getField("v1");
-          t[1] += sum;
-          t[2] += weight;
-          t[3] += nonNull;
+                  ImmutableList.of((long) parity[kValue]), ignored -> new double[4]);
+          totals[0] += weight * (Double) record.getField("v1");
+          totals[1] += sum;
+          totals[2] += weight;
+          totals[3] += nonNull;
         }
       }
     }
@@ -401,20 +401,21 @@ public class TestStarAggregation {
     Map<List<Object>, double[]> expected = Maps.newHashMap();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record r : records) {
-        int k = (Integer) r.getField("k");
+        int kValue = (Integer) r.getField("k");
         int weight = 0;
         double sum = 0;
         for (int b = 0; b < keys.length; b++) {
-          if (keys[b] == k) {
+          if (keys[b] == kValue) {
             weight++;
             sum += Double.isNaN(amounts[b]) ? 0 : amounts[b];
           }
         }
-        double[] t =
-            expected.computeIfAbsent(ImmutableList.of((long) parity[k]), ignored -> new double[3]);
-        t[0] += Math.max(1, weight) * (Double) r.getField("v1");
-        t[1] += sum;
-        t[2] += Math.max(1, weight);
+        double[] totals =
+            expected.computeIfAbsent(
+                ImmutableList.of((long) parity[kValue]), ignored -> new double[3]);
+        totals[0] += Math.max(1, weight) * (Double) r.getField("v1");
+        totals[1] += sum;
+        totals[2] += Math.max(1, weight);
       }
     }
     try (DeviceMergeOnReadScan device =
@@ -449,12 +450,12 @@ public class TestStarAggregation {
     Map<List<Object>, double[]> expected = Maps.newHashMap();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record record : records) {
-        int k = (Integer) record.getField("k");
-        if (joins.test(k)) {
+        int kValue = (Integer) record.getField("k");
+        if (joins.test(kValue)) {
           List<Object> key =
               factKey
-                  ? ImmutableList.of((long) attribute.applyAsInt(k), (long) k)
-                  : ImmutableList.of((long) attribute.applyAsInt(k));
+                  ? ImmutableList.of((long) attribute.applyAsInt(kValue), (long) kValue)
+                  : ImmutableList.of((long) attribute.applyAsInt(kValue));
           double[] totals = expected.computeIfAbsent(key, ignored -> new double[2]);
           totals[0] += (Double) record.getField("v1");
           totals[1] += 1;

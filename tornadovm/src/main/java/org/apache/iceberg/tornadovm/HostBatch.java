@@ -127,17 +127,18 @@ public final class HostBatch implements LiveRows {
 
   @Override
   public String getString(int column, int row) {
-    int s = column - layout.numericCount();
-    if (strings == null || s < 0) {
+    int stringIndex = column - layout.numericCount();
+    if (strings == null || stringIndex < 0) {
       throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
     }
     if (isNull(column, row)) {
       return null;
     }
     int source = strings.compacted().get(row);
-    int from = strings.offsets().get(s * (stride + 1) + source);
-    int to = strings.offsets().get(s * (stride + 1) + source + 1);
-    return new String(strings.chars()[s], from, to - from, java.nio.charset.StandardCharsets.UTF_8);
+    int from = strings.offsets().get(stringIndex * (stride + 1) + source);
+    int to = strings.offsets().get(stringIndex * (stride + 1) + source + 1);
+    return new String(
+        strings.chars()[stringIndex], from, to - from, java.nio.charset.StandardCharsets.UTF_8);
   }
 
   // Bulk copies: one native-to-heap copy a column instead of a call a value.
@@ -198,8 +199,8 @@ public final class HostBatch implements LiveRows {
 
   @Override
   public Utf8Column utf8Column(int column) {
-    int s = column - layout.numericCount();
-    if (strings == null || s < 0) {
+    int stringIndex = column - layout.numericCount();
+    if (strings == null || stringIndex < 0) {
       throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
     }
     int[] starts = new int[rows];
@@ -212,27 +213,27 @@ public final class HostBatch implements LiveRows {
         compacted,
         0,
         rows);
-    long base = (long) s * (stride + 1);
+    long base = (long) stringIndex * (stride + 1);
     for (int r = 0; r < rows; r++) {
       int from = strings.offsets().get((int) (base + compacted[r]));
       starts[r] = from;
       lengths[r] = strings.offsets().get((int) (base + compacted[r] + 1)) - from;
     }
-    return new Utf8Column(strings.chars()[s], starts, lengths);
+    return new Utf8Column(strings.chars()[stringIndex], starts, lengths);
   }
 
   @Override
   public java.nio.ByteBuffer getUtf8(int column, int row) {
-    int s = column - layout.numericCount();
-    if (strings == null || s < 0) {
+    int stringIndex = column - layout.numericCount();
+    if (strings == null || stringIndex < 0) {
       throw new IllegalArgumentException(layout.fields().get(column).name() + " is not a string");
     }
     if (isNull(column, row)) {
       return null;
     }
     int source = strings.compacted().get(row);
-    int from = strings.offsets().get(s * (stride + 1) + source);
-    int to = strings.offsets().get(s * (stride + 1) + source + 1);
-    return java.nio.ByteBuffer.wrap(strings.chars()[s], from, to - from);
+    int from = strings.offsets().get(stringIndex * (stride + 1) + source);
+    int to = strings.offsets().get(stringIndex * (stride + 1) + source + 1);
+    return java.nio.ByteBuffer.wrap(strings.chars()[stringIndex], from, to - from);
   }
 }

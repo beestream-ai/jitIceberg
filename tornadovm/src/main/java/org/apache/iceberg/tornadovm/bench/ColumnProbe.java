@@ -27,8 +27,11 @@ import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 
 /**
- * Device time of one grouped aggregate per column set, to see what a column costs to read: {@code
- * ColumnProbe <table> <runs> <group,columns|-> <value,columns> [<group|-> <values>]...}.
+ * Device time of one grouped aggregate per column set, to see what a column costs to read:
+ *
+ * <pre>
+ *   ColumnProbe &lt;table&gt; &lt;runs&gt; &lt;group,columns|-&gt; &lt;value,columns&gt; [&lt;group|-&gt; &lt;values&gt;]...
+ * </pre>
  */
 public final class ColumnProbe {
   private ColumnProbe() {}

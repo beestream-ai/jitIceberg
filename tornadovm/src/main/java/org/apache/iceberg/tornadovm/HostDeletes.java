@@ -471,6 +471,7 @@ final class HostDeletes {
    * (batches are formed that way), and their projected columns must sit at the same Parquet
    * indices, since one read resolves them once.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   FilePrep prepare(List<FileScanTask> batch) {
     long start = System.nanoTime();
     FilePrep prep = new FilePrep();
@@ -662,6 +663,7 @@ final class HostDeletes {
     return FOOTERS.get(path, HostDeletes::readFooter).bounds().get(fieldId);
   }
 
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   private static Footer readFooter(String path) {
     try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(Paths.get(path)))) {
       MessageType schema = reader.getFileMetaData().getSchema();

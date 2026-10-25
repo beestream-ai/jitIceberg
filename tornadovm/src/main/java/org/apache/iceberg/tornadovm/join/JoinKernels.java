@@ -54,21 +54,21 @@ final class JoinKernels {
       ByteArray valid,
       int stride,
       ByteArray live) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (live.get(i) == 1) {
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (live.get(row) == 1) {
         boolean keep = true;
         for (int j = 0; j < joins; j++) {
           int base = j * JOIN_SPEC_INTS;
           int slot = spec.get(base + 1);
           int validSlot = spec.get(base + 2);
-          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+          if (validSlot >= 0 && valid.get(validSlot * stride + row) == 0) {
             keep = false;
           } else {
             long key =
                 spec.get(base) == 0
-                    ? ints.get(slot * stride + i)
-                    : longs.get((long) slot * stride + i);
+                    ? ints.get(slot * stride + row)
+                    : longs.get((long) slot * stride + row);
             long index = key - spec.get(base + 3);
             if (index < 0
                 || index >= spec.get(base + 4)
@@ -78,7 +78,7 @@ final class JoinKernels {
           }
         }
         if (!keep) {
-          live.set(i, (byte) 0);
+          live.set(row, (byte) 0);
         }
       }
     }
@@ -98,12 +98,12 @@ final class JoinKernels {
       ByteArray live,
       int stride,
       LongArray keys) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (live.get(i) == 1) {
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (live.get(row) == 1) {
         for (int g = 0; g < gathers; g++) {
           int base = g * GATHER_SPEC_INTS;
-          long at = (long) spec.get(base) * stride + i;
+          long at = (long) spec.get(base) * stride + row;
           int index = (int) (keys.get(at) - spec.get(base + 1));
           keys.set(at, dimensions.get(spec.get(base + 3) + index));
         }
@@ -130,6 +130,7 @@ final class JoinKernels {
    * is dropped; the others count {@code weight} times ({@link #applyWeights}). The build keys are
    * binary searched; a key's rows are few.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   static void probeWeights(
       KernelContext context,
       IntArray spec,
@@ -144,16 +145,16 @@ final class JoinKernels {
       DoubleArray weights,
       DoubleArray buildSums,
       DoubleArray rowSums) {
-    int i = context.globalIdx;
-    if (i < stride) {
+    int row = context.globalIdx;
+    if (row < stride) {
       double weight = 0.0;
       int sums = spec.get(6);
       int buildCapacity = spec.get(7);
       for (int k = 0; k < sums; k++) {
-        rowSums.set((2L * k) * stride + i, 0.0);
-        rowSums.set((2L * k + 1) * stride + i, 0.0);
+        rowSums.set((2L * k) * stride + row, 0.0);
+        rowSums.set((2L * k + 1) * stride + row, 0.0);
       }
-      if (live.get(i) == 1) {
+      if (live.get(row) == 1) {
         int parts = spec.get(0);
         int rows = spec.get(1);
         int comparison = spec.get(2);
@@ -164,8 +165,8 @@ final class JoinKernels {
           int slot = spec.get(base + 2);
           long value =
               spec.get(base + 1) == 0
-                  ? ints.get(slot * stride + i)
-                  : longs.get((long) slot * stride + i);
+                  ? ints.get(slot * stride + row)
+                  : longs.get((long) slot * stride + row);
           if (spec.get(base) == 1) {
             value = dimensions.get(spec.get(base + 4) + (int) (value - spec.get(base + 3)));
           }
@@ -181,9 +182,11 @@ final class JoinKernels {
         if (comparison != 0) {
           int slot = spec.get(4);
           int validSlot = spec.get(5);
-          rowNull = validSlot >= 0 && valid.get(validSlot * stride + i) == 0;
+          rowNull = validSlot >= 0 && valid.get(validSlot * stride + row) == 0;
           rowValue =
-              spec.get(3) == 0 ? ints.get(slot * stride + i) : longs.get((long) slot * stride + i);
+              spec.get(3) == 0
+                  ? ints.get(slot * stride + row)
+                  : longs.get((long) slot * stride + row);
         }
         int low = 0;
         int high = inRange ? rows : 0;
@@ -196,30 +199,30 @@ final class JoinKernels {
           }
         }
         for (int j = low; j < rows && buildKeys.get(j) == key; j++) {
-          long b = buildValues.get(j);
+          long buildValue = buildValues.get(j);
           boolean pass;
           if (comparison == 0) {
             pass = true;
           } else if (rowNull) {
             pass = false;
           } else if (comparison == 1) {
-            pass = rowValue < b;
+            pass = rowValue < buildValue;
           } else if (comparison == 2) {
-            pass = rowValue <= b;
+            pass = rowValue <= buildValue;
           } else if (comparison == 3) {
-            pass = rowValue == b;
+            pass = rowValue == buildValue;
           } else if (comparison == 4) {
-            pass = rowValue > b;
+            pass = rowValue > buildValue;
           } else {
-            pass = rowValue >= b;
+            pass = rowValue >= buildValue;
           }
           if (pass) {
             weight += 1.0;
             for (int k = 0; k < sums; k++) {
-              double v = buildSums.get((long) k * buildCapacity + j);
-              if (Math.abs(v) <= Double.MAX_VALUE) { // not NaN: a null build value
-                long at = (2L * k) * stride + i;
-                rowSums.set(at, rowSums.get(at) + v);
+              double buildSum = buildSums.get((long) k * buildCapacity + j);
+              if (Math.abs(buildSum) <= Double.MAX_VALUE) { // not NaN: a null build value
+                long at = (2L * k) * stride + row;
+                rowSums.set(at, rowSums.get(at) + buildSum);
                 rowSums.set(at + stride, rowSums.get(at + stride) + 1.0);
               }
             }
@@ -230,11 +233,11 @@ final class JoinKernels {
           if (spec.get(8) == 1) {
             weight = 1.0;
           } else {
-            live.set(i, (byte) 0);
+            live.set(row, (byte) 0);
           }
         }
       }
-      weights.set(i, weight);
+      weights.set(row, weight);
     }
   }
 
@@ -242,33 +245,36 @@ final class JoinKernels {
   static final int PROBE_VALUE_INTS = 4;
 
   /**
-   * A probe's build-side values as value columns: for each of {@code n} probe values ({@code spec}:
-   * its value column, its build column, its non-null count column, and the count column of a fact
-   * value it is masked by or -1), the sum of the build rows' values a row joined and how many were
-   * not null -- 0 and 0 where the masking fact value is null, as SQL's {@code a - COALESCE(b, 0)}
-   * is null when {@code a} is. After {@link #applyWeights}, which these must not be multiplied by.
+   * A probe's build-side values as value columns: for each of {@code probes} probe values ({@code
+   * spec}: its value column, its build column, its non-null count column, and the count column of a
+   * fact value it is masked by or -1), the sum of the build rows' values a row joined and how many
+   * were not null -- 0 and 0 where the masking fact value is null, as SQL's {@code a - COALESCE(b,
+   * 0)} is null when {@code a} is. After {@link #applyWeights}, which these must not be multiplied
+   * by.
    */
   static void probeValues(
       KernelContext context,
       IntArray spec,
-      int n,
+      int probes,
       DoubleArray rowSums,
       int values,
       int stride,
       DoubleArray valueData) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      for (int v = 0; v < n; v++) {
+    int row = context.globalIdx;
+    if (row < stride) {
+      for (int v = 0; v < probes; v++) {
         int base = v * PROBE_VALUE_INTS;
         int column = spec.get(base);
-        int k = spec.get(base + 1);
+        int buildColumn = spec.get(base + 1);
         int count = spec.get(base + 2);
         int mask = spec.get(base + 3);
-        boolean kept = mask < 0 || valueData.get((long) (values + 1 + mask) * stride + i) != 0.0;
-        valueData.set((long) column * stride + i, kept ? rowSums.get(2L * k * stride + i) : 0.0);
+        boolean kept = mask < 0 || valueData.get((long) (values + 1 + mask) * stride + row) != 0.0;
         valueData.set(
-            (long) (values + 1 + count) * stride + i,
-            kept ? rowSums.get((2L * k + 1) * stride + i) : 0.0);
+            (long) column * stride + row,
+            kept ? rowSums.get(2L * buildColumn * stride + row) : 0.0);
+        valueData.set(
+            (long) (values + 1 + count) * stride + row,
+            kept ? rowSums.get((2L * buildColumn + 1) * stride + row) : 0.0);
       }
     }
   }
@@ -276,11 +282,11 @@ final class JoinKernels {
   /** Multiplies each of a row's {@code columns} value columns by its join weight. */
   static void applyWeights(
       KernelContext context, DoubleArray weights, int columns, int stride, DoubleArray values) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      double weight = weights.get(i);
+    int row = context.globalIdx;
+    if (row < stride) {
+      double weight = weights.get(row);
       for (int c = 0; c < columns; c++) {
-        long at = (long) c * stride + i;
+        long at = (long) c * stride + row;
         values.set(at, values.get(at) * weight);
       }
     }
@@ -291,9 +297,9 @@ final class JoinKernels {
    * index, so a grid over the batch clears an array of any size.
    */
   static void denseClear(KernelContext context, int size, int stride, DoubleArray out) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      for (int j = i; j < size; j += stride) {
+    int row = context.globalIdx;
+    if (row < stride) {
+      for (int j = row; j < size; j += stride) {
         out.set(j, 0.0);
       }
     }
@@ -317,15 +323,15 @@ final class JoinKernels {
       int stride,
       int groups,
       DoubleArray out) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (live.get(i) == 1) {
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (live.get(row) == 1) {
         int group = 0;
         for (int k = 0; k < keys; k++) {
-          group += (int) keyColumns.get((long) k * stride + i) * spec.get(k);
+          group += (int) keyColumns.get((long) k * stride + row) * spec.get(k);
         }
         for (int c = 0; c < columns; c++) {
-          context.atomicAdd(out, c * groups + group, values.get((long) c * stride + i));
+          context.atomicAdd(out, c * groups + group, values.get((long) c * stride + row));
         }
       }
     }

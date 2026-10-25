@@ -21,9 +21,7 @@ package org.apache.iceberg.tornadovm.bench;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -33,6 +31,8 @@ import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
 import org.apache.iceberg.tornadovm.GroupedAggregate;
@@ -51,6 +51,11 @@ import org.apache.iceberg.tornadovm.join.StarAggregation;
 public final class StarQ22 {
   private StarQ22() {}
 
+  @SuppressWarnings({
+    "checkstyle:CyclomaticComplexity",
+    "checkstyle:MethodLength",
+    "checkstyle:NestedForDepth"
+  })
   public static void main(String[] args) throws IOException {
     String warehouse = args[0];
     int runs = Integer.parseInt(args[1]);
@@ -63,7 +68,7 @@ public final class StarQ22 {
     for (int run = 0; run < runs; run++) {
       long t0 = System.nanoTime();
       // Dimensions on the host: small, read once a query.
-      List<Object> dates = new ArrayList<>();
+      List<Object> dates = Lists.newArrayList();
       try (CloseableIterable<Record> rows =
           IcebergGenerics.read(MorTables.load(warehouse + "/date_dim"))
               .select("d_date_sk", "d_month_seq")
@@ -79,7 +84,7 @@ public final class StarQ22 {
           }
         }
       }
-      List<Object> warehouses = new ArrayList<>();
+      List<Object> warehouses = Lists.newArrayList();
       try (CloseableIterable<Record> rows =
           IcebergGenerics.read(MorTables.load(warehouse + "/warehouse"))
               .select("w_warehouse_sk")
@@ -88,7 +93,7 @@ public final class StarQ22 {
           warehouses.add(r.getField("w_warehouse_sk"));
         }
       }
-      Map<Long, String[]> items = new HashMap<>();
+      Map<Long, String[]> items = Maps.newHashMap();
       try (CloseableIterable<Record> rows =
           IcebergGenerics.read(MorTables.load(warehouse + "/item"))
               .select("i_item_sk", "i_product_name", "i_brand", "i_class", "i_category")
@@ -109,7 +114,7 @@ public final class StarQ22 {
           ImmutableList.of(
               dimension("inv_date_sk", dates),
               dimension("inv_warehouse_sk", warehouses),
-              dimension("inv_item_sk", new ArrayList<>(items.keySet())));
+              dimension("inv_item_sk", Lists.newArrayList(items.keySet())));
 
       // The fact on the device: deletes applied, joins as key filters, grouped by the item key.
       Expression filter =
@@ -157,7 +162,7 @@ public final class StarQ22 {
 
       // ROLLUP(product_name, brand, class, category) of AVG(qoh) = SUM / COUNT(non-null), on the
       // host.
-      Map<List<String>, double[]> rollup = new HashMap<>();
+      Map<List<String>, double[]> rollup = Maps.newHashMap();
       long factRows = 0;
       for (Map.Entry<List<Object>, double[]> e : groups.groups().entrySet()) {
         Object key = e.getKey().get(0);
@@ -168,32 +173,33 @@ public final class StarQ22 {
         double[] totals = e.getValue(); // sum, rows, non-null count
         factRows += (long) totals[1];
         for (int level = 4; level >= 0; level--) {
-          List<String> k = new ArrayList<>(4);
+          List<String> rollupKey = Lists.newArrayListWithCapacity(4);
           for (int c = 0; c < 4; c++) {
-            k.add(c < level ? item[c] : null);
+            rollupKey.add(c < level ? item[c] : null);
           }
-          k.add(Integer.toString(level)); // grouping level keeps NULL attributes apart from levels
-          double[] acc = rollup.computeIfAbsent(k, ignored -> new double[2]);
+          // grouping level keeps NULL attributes apart from levels
+          rollupKey.add(Integer.toString(level));
+          double[] acc = rollup.computeIfAbsent(rollupKey, ignored -> new double[2]);
           acc[0] += totals[0];
           acc[1] += totals[2];
         }
       }
-      List<Object[]> result = new ArrayList<>();
+      List<Object[]> result = Lists.newArrayList();
       for (Map.Entry<List<String>, double[]> e : rollup.entrySet()) {
         double[] acc = e.getValue();
         Double avg = acc[1] == 0 ? null : acc[0] / acc[1];
-        List<String> k = e.getKey();
-        result.add(new Object[] {k.get(0), k.get(1), k.get(2), k.get(3), avg});
+        List<String> key = e.getKey();
+        result.add(new Object[] {key.get(0), key.get(1), key.get(2), key.get(3), avg});
       }
       Comparator<Object> nullsFirst =
           Comparator.nullsFirst((a, b) -> ((Comparable) a).compareTo(b));
       result.sort(
           (a, b) -> {
-            int c = nullsFirst.compare(a[4], b[4]);
-            for (int i = 0; c == 0 && i < 4; i++) {
-              c = nullsFirst.compare(a[i], b[i]);
+            int cmp = nullsFirst.compare(a[4], b[4]);
+            for (int i = 0; cmp == 0 && i < 4; i++) {
+              cmp = nullsFirst.compare(a[i], b[i]);
             }
-            return c;
+            return cmp;
           });
       List<Object[]> top = result.subList(0, Math.min(100, result.size()));
       long t3 = System.nanoTime();

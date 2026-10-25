@@ -63,8 +63,8 @@ public class TestDeviceEvolutionAndStorage {
     assumeThat(DeviceMergeOnReadScan.isAvailable()).as("TornadoVM with the cuDF shim").isTrue();
   }
 
-  private static long[] everyNth(long rows, int n) {
-    return LongStream.range(0, rows).filter(i -> i % n == 0).toArray();
+  private static long[] everyNth(long rows, int every) {
+    return LongStream.range(0, rows).filter(i -> i % every == 0).toArray();
   }
 
   /** Iceberg's rows, as strings of the given columns, sorted. */
@@ -232,10 +232,10 @@ public class TestDeviceEvolutionAndStorage {
     List<DataFile> files = Lists.newArrayList();
     for (int region = 0; region < 3; region++) {
       for (int f = 0; f < 2; f++) {
-        int r = region;
+        int regionId = region;
         long base = (region * 10L + f) * 1_000_000L;
         GenericRecord sample = GenericRecord.create(schema);
-        sample.setField("region", r);
+        sample.setField("region", regionId);
         PartitionKey key = new PartitionKey(spec, schema);
         key.partition(sample);
         files.add(
@@ -246,9 +246,9 @@ public class TestDeviceEvolutionAndStorage {
                 i -> {
                   GenericRecord record = GenericRecord.create(schema);
                   record.setField("id", base + i);
-                  record.setField("region", r);
+                  record.setField("region", regionId);
                   record.setField("amount", java.math.BigDecimal.valueOf(i * 37 % 100_000, 2));
-                  record.setField("note", i % 5 == 0 ? null : "region " + r + " row " + i);
+                  record.setField("note", i % 5 == 0 ? null : "region " + regionId + " row " + i);
                   return record;
                 }));
       }
@@ -315,9 +315,9 @@ public class TestDeviceEvolutionAndStorage {
     List<DataFile> files = Lists.newArrayList();
     List<PartitionKey> keys = Lists.newArrayList();
     for (int region = 0; region < 3; region++) {
-      int r = region;
+      int regionId = region;
       GenericRecord sample = GenericRecord.create(schema);
-      sample.setField("region", r);
+      sample.setField("region", regionId);
       PartitionKey key = new PartitionKey(spec, schema);
       key.partition(sample);
       keys.add(key);
@@ -331,7 +331,7 @@ public class TestDeviceEvolutionAndStorage {
                 i -> {
                   GenericRecord record = GenericRecord.create(schema);
                   record.setField("id", base + i);
-                  record.setField("region", r);
+                  record.setField("region", regionId);
                   record.setField("amount", i % 7 == 0 ? null : i * 0.5);
                   return record;
                 }));

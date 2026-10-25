@@ -44,6 +44,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import uk.ac.manchester.tornado.api.DataRange;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.KernelContext;
@@ -101,6 +103,8 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
   /** The longest string the device packs into an INT64. */
   static final int STRING_BYTES = 8;
 
+  private static final Logger LOG = LoggerFactory.getLogger(DeviceMergeOnReadScan.class);
+
   private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.debug");
 
   /**
@@ -133,6 +137,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * The bytes of the one device buffer a batch's string columns share; tests lower it to batch
    * files apart, or to have the device refuse a file, without writing gigabytes.
    */
+  @SuppressWarnings("checkstyle:VisibilityModifier")
   public static long stringBuffer =
       Long.getLong("iceberg.tornadovm.string-buffer", Integer.MAX_VALUE);
 
@@ -289,6 +294,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * the aggregate's: the results hold the aggregate's values, then the stage's. The scan's device
    * buffers are kept per aggregate and stage shape, so later runs of a shape reuse them.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   public GroupedAggregate aggregate(
       List<String> groupColumns, List<DeviceValue> values, GroupedStage stage) {
     if (groupColumns.size() > 4 || (values.isEmpty() && (stage == null || stage.values() == 0))) {
@@ -616,7 +622,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       }
     }
 
-    private void loop(Region region, java.util.concurrent.LinkedBlockingQueue<Work> queue) {
+    private void loop(Region region, java.util.concurrent.LinkedBlockingQueue<Work> workQueue) {
       TornadoExecutionPlan executionPlan;
       RuntimeException broken = null;
       try {
@@ -629,7 +635,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       while (true) {
         Work work;
         try {
-          work = queue.take();
+          work = workQueue.take();
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           return;
@@ -913,6 +919,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * against the planned snapshot, fails on concurrent deletes and on data files added since that
    * could hold one of the keys. Equality-delete files already in the table stay as they are.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   public ConversionResult deleteKeys(String column, java.util.Collection<?> keys) {
     if (filter.op() != Expression.Operation.TRUE) {
       throw new UnsupportedOperationException("A delete on a filtered scan is not supported");
@@ -1181,7 +1188,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
                 "Statistics of " + field.type() + " columns are not supported on the device");
       }
     }
-    List<java.util.TreeSet<Long>> smallest = Lists.newArrayList();
+    List<java.util.NavigableSet<Long>> smallest = Lists.newArrayList();
     fields.forEach(field -> smallest.add(new java.util.TreeSet<>()));
     List<Region> streams =
         reuse(
@@ -1297,9 +1304,9 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       evictIdle(null, 0);
       Planned planned = new Planned(null, rewriteColumns(), tasks, fileRows, false, true);
       if (DEBUG) {
-        System.err.printf(
-            "[mor] rewrite group: %d files, %d rows, target %d bytes -> %d rows a file; capacity %d,"
-                + " %d batches, positions %d, set %d, %d fields%n",
+        LOG.info(
+            "[mor] rewrite group: {} files, {} rows, target {} bytes -> {} rows a file; capacity {},"
+                + " {} batches, positions {}, set {}, {} fields",
             tasks.size(),
             rows,
             targetFileBytes,
@@ -1540,13 +1547,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       Region region,
       TornadoExecutionPlan executionPlan,
       Planned planned,
-      int i,
+      int batchIndex,
       HostDeletes.FilePrep prep,
       java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch,
       ScanMetrics into) {
     DEVICE_PLANS.readLock().lock();
     try {
-      return executeBatchLocked(region, executionPlan, planned, i, prep, perBatch, into);
+      return executeBatchLocked(region, executionPlan, planned, batchIndex, prep, perBatch, into);
     } finally {
       DEVICE_PLANS.readLock().unlock();
     }
@@ -1556,17 +1563,17 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       Region region,
       TornadoExecutionPlan executionPlan,
       Planned planned,
-      int i,
+      int batchIndex,
       HostDeletes.FilePrep prep,
       java.util.function.ToLongBiFunction<Region, TornadoExecutionResult> perBatch,
       ScanMetrics into) {
     into.deleteLoad(prep.hostNanos() / 1e6);
-    region.nullFree = nullFree(region.layout, planned.batches.get(i));
+    region.nullFree = nullFree(region.layout, planned.batches.get(batchIndex));
     region.stage(executionPlan, prep, planned.keyNullable);
     if (region.filtered) {
       planned
           .batchFilters
-          .get(i)
+          .get(batchIndex)
           .encode(
               region.layout,
               table.schema(),
@@ -1581,9 +1588,13 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     long copyStart = System.nanoTime();
     long rows = perBatch.applyAsLong(region, executed);
     if (DEBUG) {
-      System.err.printf(
-          "[mor] batch %d region %d files %d rows %d live %d%n",
-          i, System.identityHashCode(region), prep.files(), prep.rows(), rows);
+      LOG.info(
+          "[mor] batch {} region {} files {} rows {} live {}",
+          batchIndex,
+          System.identityHashCode(region),
+          prep.files(),
+          prep.rows(),
+          rows);
     }
     long end = System.nanoTime();
     into.device((copyStart - deviceStart) / 1e6);
@@ -1593,6 +1604,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     return rows;
   }
 
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   private long run(
       List<Region> streams,
       Planned planned,
@@ -1735,6 +1747,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * their sizes are rounded up for the next caller's tasks -- a reader's; a rewrite plans its
      * whole group up front and sizes the device to it exactly.
      */
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:MethodLength"})
     Planned(
         String groupColumn,
         List<String> projection,
@@ -1951,10 +1964,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     /** Each string column's decoded bytes in one file, as {@link #stringStride} counts them. */
-    private long[] stringBytes(FileScanTask task, ScanLayout layout, long rows) {
-      long[] bytes = new long[layout.stringCount()];
+    private long[] stringBytes(FileScanTask task, ScanLayout scanLayout, long rows) {
+      long[] bytes = new long[scanLayout.stringCount()];
       for (int s = 0; s < bytes.length; s++) {
-        int fieldId = layout.fields().get(layout.numericCount() + s).fieldId();
+        int fieldId = scanLayout.fields().get(scanLayout.numericCount() + s).fieldId();
         long file =
             HostDeletes.stringBytes(LocalFiles.path(task.file().location(), table.io()), fieldId);
         bytes[s] = file < 0 ? 16L * rows : file;
@@ -1967,14 +1980,15 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * (parquet-java records them); a writer that left them out gets 16 bytes a row, and a batch
      * that needs more is refused rather than truncated.
      */
-    private long stringStride(List<List<FileScanTask>> batches, ScanLayout layout, int rows) {
-      if (layout.stringCount() == 0) {
+    private long stringStride(
+        List<List<FileScanTask>> fileBatches, ScanLayout scanLayout, int rows) {
+      if (scanLayout.stringCount() == 0) {
         return 1;
       }
       long most = 0;
-      for (List<FileScanTask> batch : batches) {
-        for (int s = 0; s < layout.stringCount(); s++) {
-          int fieldId = layout.fields().get(layout.numericCount() + s).fieldId();
+      for (List<FileScanTask> batch : fileBatches) {
+        for (int s = 0; s < scanLayout.stringCount(); s++) {
+          int fieldId = scanLayout.fields().get(scanLayout.numericCount() + s).fieldId();
           long bytes = 0;
           for (FileScanTask task : batch) {
             long file =
@@ -1990,7 +2004,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         }
       }
       long stride = (most + 1023) / 1024 * 1024 + 1024;
-      if (stride * layout.stringCount() > stringBuffer) {
+      if (stride * scanLayout.stringCount() > stringBuffer) {
         throw new UnsupportedOperationException(
             "String columns of " + stride + " bytes a batch are beyond one device buffer");
       }
@@ -2022,6 +2036,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
    * The device buffers, host holders and execution plan of one query shape: read, delete
    * application and live-row kernel, which every shape shares, plus what the shape adds.
    */
+  @SuppressWarnings("checkstyle:VisibilityModifier")
   private abstract static class Region implements AutoCloseable {
     /**
      * Where this region's host buffers live, freed when the region closes. TornadoVM's own arrays
@@ -2165,6 +2180,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
               return worker;
             });
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     Region(Planned planned) {
       this.signature = planned.signature();
       this.filtered = planned.filtered;
@@ -2307,6 +2323,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
       return plan;
     }
 
+    @SuppressWarnings("checkstyle:MethodLength")
     private TaskGraph shared() {
       boolean equality = equalityKeyId != null;
       TaskGraph graph =
@@ -2607,27 +2624,31 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     /** Puts a host-loaded multi-column set on the device, for this execution to sort. */
     private void uploadKeySet(TornadoExecutionPlan executionPlan, HostDeletes.KeySet set) {
-      int m = set.size();
+      int entries = set.size();
       MemorySegment.copy(
-          MemorySegment.ofArray(set.hashes()), 0, rawHashes.getSegment(), 0, (long) m * Long.BYTES);
+          MemorySegment.ofArray(set.hashes()),
+          0,
+          rawHashes.getSegment(),
+          0,
+          (long) entries * Long.BYTES);
       for (int c = 0; c < keyColumns; c++) {
         MemorySegment.copy(
             MemorySegment.ofArray(set.keys()),
-            (long) c * m * Long.BYTES,
+            (long) c * entries * Long.BYTES,
             rawKeys.getSegment(),
             (long) c * equalityCapacity * Long.BYTES,
-            (long) m * Long.BYTES);
+            (long) entries * Long.BYTES);
         MemorySegment.copy(
             MemorySegment.ofArray(set.nulls()),
-            (long) c * m,
+            (long) c * entries,
             rawNulls.getSegment(),
             (long) c * equalityCapacity,
-            m);
+            entries);
       }
       executionPlan.transferToDevice(rawHashes, rawKeys, rawNulls);
-      keySortSize[0] = m;
+      keySortSize[0] = entries;
       keySetChanged.set(0, 1);
-      setSize.set(0, m);
+      setSize.set(0, entries);
     }
 
     /** Puts a host-loaded equality-delete set on the device. */
@@ -3041,6 +3062,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     private final DoubleArray copies;
     private final IntArray misses = hostInts(1);
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     GroupedRegion(
         Planned planned, List<String> groupColumns, List<DeviceValue> sums, GroupedStage stage) {
       super(planned);
@@ -3083,10 +3105,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
           valueSpec.set(base + 2 + 3 * f, layout.slot(field.fieldId()));
           valueSpec.set(
               base + 3 + 3 * f, field.isOptional() ? layout.readIndex(field.fieldId()) : -1);
-          int c = 3 * (v * DeviceValue.MAX_FACTORS + f);
-          valueConstants.set(c, factor.offset());
-          valueConstants.set(c + 1, factor.scale());
-          valueConstants.set(c + 2, factor.coefficient());
+          int factorBase = 3 * (v * DeviceValue.MAX_FACTORS + f);
+          valueConstants.set(factorBase, factor.offset());
+          valueConstants.set(factorBase + 1, factor.scale());
+          valueConstants.set(factorBase + 2, factor.coefficient());
         }
       }
       this.counts = nullable;
@@ -3340,6 +3362,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
     }
 
     /** Copies back one batch's groups and merges them; returns the batch's live rows. */
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     long collect(TornadoExecutionResult executed, GroupedAggregate result) {
       if (stage != null && stage.groups()) {
         return stage.collect(executed, result);
@@ -3433,6 +3456,7 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
      * {@code lineage}: a v3 table's rewrite, which also writes each row's {@code _row_id} and
      * {@code _last_updated_sequence_number}, as two INT64 columns after the table's.
      */
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     RewriteRegion(Planned planned, boolean lineage, RowOrder order) {
       super(planned, lineage ? 2 : 0);
       this.lineage = lineage;
@@ -3867,27 +3891,25 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
         private DeleteFile write(String path, FilePositions file) throws IOException {
           org.apache.iceberg.deletes.PositionDelete<org.apache.iceberg.data.Record> row =
               org.apache.iceberg.deletes.PositionDelete.create();
-          {
-            // Full bounds on file_path (forPositionDelete) are what mark the file as scoped to
-            // one data file.
-            org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record> writer =
-                org.apache.iceberg.formats.FormatModelRegistry
-                    .<org.apache.iceberg.data.Record>positionDeleteWriteBuilder(
-                        org.apache.iceberg.FileFormat.PARQUET,
-                        files.newOutputFile(file.spec, file.partition))
-                    .spec(file.spec)
-                    .partition(file.partition)
-                    .metricsConfig(org.apache.iceberg.MetricsConfig.forPositionDelete())
-                    .build();
-            try (org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record>
-                closing = writer) {
-              java.util.Arrays.sort(file.positions, 0, file.count);
-              for (int i = 0; i < file.count; i++) {
-                closing.write(row.set(path, file.positions[i]));
-              }
+          // Full bounds on file_path (forPositionDelete) are what mark the file as scoped to
+          // one data file.
+          org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record> writer =
+              org.apache.iceberg.formats.FormatModelRegistry
+                  .<org.apache.iceberg.data.Record>positionDeleteWriteBuilder(
+                      org.apache.iceberg.FileFormat.PARQUET,
+                      files.newOutputFile(file.spec, file.partition))
+                  .spec(file.spec)
+                  .partition(file.partition)
+                  .metricsConfig(org.apache.iceberg.MetricsConfig.forPositionDelete())
+                  .build();
+          try (org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record>
+              closing = writer) {
+            java.util.Arrays.sort(file.positions, 0, file.count);
+            for (int i = 0; i < file.count; i++) {
+              closing.write(row.set(path, file.positions[i]));
             }
-            return writer.toDeleteFile();
           }
+          return writer.toDeleteFile();
         }
       };
     }
@@ -4022,10 +4044,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
     /** Folds the batch's smallest distinct hashes into each column's running set. */
     long collect(
-        TornadoExecutionResult executed, List<java.util.TreeSet<Long>> smallest, int limit) {
+        TornadoExecutionResult executed, List<java.util.NavigableSet<Long>> smallest, int limit) {
       for (int c = 0; c < statsColumns; c++) {
         executed.transferToHost(kept[c]);
-        java.util.TreeSet<Long> set = smallest.get(c);
+        java.util.NavigableSet<Long> set = smallest.get(c);
         synchronized (set) {
           for (int j = 0; j < keep; j++) {
             long hash = kept[c].get(j);

@@ -36,11 +36,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 
 /**
@@ -64,7 +64,7 @@ final class LocalFiles {
 
   // Cached files by local path, least recently used first, with their sizes.
   private static final Map<Path, Long> CACHED = new LinkedHashMap<>(16, 0.75f, true);
-  private static final Map<String, Object> FETCHING = new ConcurrentHashMap<>();
+  private static final Map<String, Object> FETCHING = Maps.newConcurrentMap();
   private static long cachedBytes = 0;
 
   private static final ExecutorService POOL =
@@ -128,7 +128,7 @@ final class LocalFiles {
 
   // Cached copies that hold only some columns, by local path: the field ids fetched so far. A copy
   // not in this map holds the whole file.
-  private static final Map<Path, java.util.Set<Integer>> PARTIAL = new ConcurrentHashMap<>();
+  private static final Map<Path, java.util.Set<Integer>> PARTIAL = Maps.newConcurrentMap();
 
   /** How much of a file's end one read takes, to get its footer in a single request. */
   private static final int TAIL = 64 << 10;
@@ -278,11 +278,11 @@ final class LocalFiles {
     in.seek(offset);
     int done = 0;
     while (done < length) {
-      int n = in.read(bytes, done, length - done);
-      if (n < 0) {
+      int count = in.read(bytes, done, length - done);
+      if (count < 0) {
         throw new java.io.EOFException("Short read at " + offset);
       }
-      done += n;
+      done += count;
     }
     return bytes;
   }

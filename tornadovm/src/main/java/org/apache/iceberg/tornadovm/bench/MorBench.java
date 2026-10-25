@@ -217,12 +217,12 @@ public final class MorBench {
                 ImmutableList.of("id", "k", "v1"),
                 batch -> {
                   int id = batch.column("id");
-                  int k = batch.column("k");
+                  int kColumn = batch.column("k");
                   int v1 = batch.column("v1");
                   long idSum = 0;
                   double v1Sum = 0;
                   for (int r = 0; r < batch.rows(); r++) {
-                    idSum += batch.getLong(id, r) + batch.getInt(k, r);
+                    idSum += batch.getLong(id, r) + batch.getInt(kColumn, r);
                     v1Sum += batch.getDouble(v1, r);
                   }
                   ids.add(idSum);

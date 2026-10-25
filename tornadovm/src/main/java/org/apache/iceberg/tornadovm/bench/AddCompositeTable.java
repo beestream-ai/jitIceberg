@@ -60,14 +60,15 @@ public final class AddCompositeTable {
       SplittableRandom random = new SplittableRandom(1000 + f);
       long first = f * rowsPerFile;
       for (long i = 0; i < rowsPerFile && next < pairs; i++) {
-        int k = random.nextInt(1000);
+        int kValue = random.nextInt(1000);
         random.nextDouble();
         random.nextDouble();
         random.nextDouble();
         random.nextDouble();
         while (next < pairs && ids[next] == first + i) {
           boolean exists = (next & 1) == 0;
-          keys.add(new Object[] {ids[next], exists ? k : (k + 1 + pick.nextInt(998)) % 1000});
+          keys.add(
+              new Object[] {ids[next], exists ? kValue : (kValue + 1 + pick.nextInt(998)) % 1000});
           next++;
         }
       }

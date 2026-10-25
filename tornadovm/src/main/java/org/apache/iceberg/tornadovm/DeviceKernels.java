@@ -93,28 +93,28 @@ final class DeviceKernels {
       ByteArray valid,
       int keyValidOffset,
       ByteArray live) {
-    int i = context.globalIdx;
-    if (i < live.getSize()) {
+    int row = context.globalIdx;
+    if (row < live.getSize()) {
       byte keep = 0;
-      if (i < meta.get(META_ROWS)) {
+      if (row < meta.get(META_ROWS)) {
         keep = 1;
         if (meta.get(META_HAS_POSITION_DELETES) == 1
-            && ((positionBits.get(i >> 3) >> (i & 7)) & 1) == 1) {
+            && ((positionBits.get(row >> 3) >> (row & 7)) & 1) == 1) {
           keep = 0;
         }
         if (meta.get(META_HAS_EQUALITY_DELETES) == 1) {
           boolean keyIsNull =
-              meta.get(META_KEY_NULLABLE) == 1 && valid.get(keyValidOffset + i) == 0;
+              meta.get(META_KEY_NULLABLE) == 1 && valid.get(keyValidOffset + row) == 0;
           if (keyIsNull) {
             if (meta.get(META_EQUALITY_SET_HAS_NULL) == 1) {
               keep = 0;
             }
-          } else if (inEqualitySet.get(i) == 1) {
+          } else if (inEqualitySet.get(row) == 1) {
             keep = 0;
           }
         }
       }
-      live.set(i, keep);
+      live.set(row, keep);
     }
   }
 
@@ -148,27 +148,27 @@ final class DeviceKernels {
       IntArray spec,
       int capacity,
       LongArray out) {
-    int i = context.globalIdx;
-    if (i < capacity) {
+    int row = context.globalIdx;
+    if (row < capacity) {
       long hash = Long.MAX_VALUE;
       int validIndex = spec.get(2);
       boolean present =
-          i < meta.get(META_ROWS)
-              && live.get(i) == 1
-              && (validIndex < 0 || valid.get(validIndex * capacity + i) == 1);
+          row < meta.get(META_ROWS)
+              && live.get(row) == 1
+              && (validIndex < 0 || valid.get(validIndex * capacity + row) == 1);
       if (present) {
         int type = spec.get(0);
         int slot = spec.get(1);
         long k1;
         long length;
         if (type == STATS_INT) {
-          k1 = ints.get(slot * capacity + i) & 0xFFFFFFFFL;
+          k1 = ints.get(slot * capacity + row) & 0xFFFFFFFFL;
           length = 4;
         } else if (type == STATS_LONG) {
-          k1 = longs.get(slot * capacity + i);
+          k1 = longs.get(slot * capacity + row);
           length = 8;
         } else {
-          k1 = Double.doubleToRawLongBits(doubles.get(slot * capacity + i));
+          k1 = Double.doubleToRawLongBits(doubles.get(slot * capacity + row));
           length = 8;
         }
         // MurmurHash3 x64 128 of fewer than 16 bytes: the tail's first 8 bytes only.
@@ -195,7 +195,7 @@ final class DeviceKernels {
         h1 += h2;
         hash = h1 >>> 1;
       }
-      out.set(i, hash);
+      out.set(row, hash);
     }
   }
 
@@ -203,11 +203,12 @@ final class DeviceKernels {
    * {@code mark[i] = 1} for the first of each run of equal sorted hashes, other than the filler.
    */
   static void firstOfRuns(KernelContext context, LongArray sorted, int capacity, ByteArray mark) {
-    int i = context.globalIdx;
-    if (i < capacity) {
-      long value = sorted.get(i);
+    int row = context.globalIdx;
+    if (row < capacity) {
+      long value = sorted.get(row);
       mark.set(
-          i, (byte) (value != Long.MAX_VALUE && (i == 0 || sorted.get(i - 1) != value) ? 1 : 0));
+          row,
+          (byte) (value != Long.MAX_VALUE && (row == 0 || sorted.get(row - 1) != value) ? 1 : 0));
     }
   }
 
@@ -219,9 +220,9 @@ final class DeviceKernels {
       LongArray sorted,
       int keep,
       LongArray out) {
-    int j = context.globalIdx;
-    if (j < keep) {
-      out.set(j, j < count.get(0) ? sorted.get(firsts.get(j)) : Long.MAX_VALUE);
+    int index = context.globalIdx;
+    if (index < keep) {
+      out.set(index, index < count.get(0) ? sorted.get(firsts.get(index)) : Long.MAX_VALUE);
     }
   }
 
@@ -230,9 +231,9 @@ final class DeviceKernels {
    * byte is 0, and 0 past the rows read -- the rows a deletion vector of the batch's files keeps.
    */
   static void deadRows(KernelContext context, IntArray meta, ByteArray live, ByteArray dead) {
-    int i = context.globalIdx;
-    if (i < dead.getSize()) {
-      dead.set(i, (byte) (i < meta.get(META_ROWS) && live.get(i) == 0 ? 1 : 0));
+    int row = context.globalIdx;
+    if (row < dead.getSize()) {
+      dead.set(row, (byte) (row < meta.get(META_ROWS) && live.get(row) == 0 ? 1 : 0));
     }
   }
 
@@ -252,15 +253,15 @@ final class DeviceKernels {
       IntArray segmentStarts,
       IntArray segmentOffsets,
       ByteArray live) {
-    int j = context.globalIdx;
-    if (j < positions.getSize()) {
-      if (j < meta.get(META_POSITION_ROWS)) {
+    int entry = context.globalIdx;
+    if (entry < positions.getSize()) {
+      if (entry < meta.get(META_POSITION_ROWS)) {
         int segments = meta.get(META_POSITION_SEGMENTS);
-        int s = 0;
-        while (s + 1 < segments && segmentStarts.get(s + 1) <= j) {
-          s++;
+        int segment = 0;
+        while (segment + 1 < segments && segmentStarts.get(segment + 1) <= entry) {
+          segment++;
         }
-        long row = segmentOffsets.get(s) + positions.get(j);
+        long row = segmentOffsets.get(segment) + positions.get(entry);
         live.set((int) row, (byte) 0);
       }
     }
@@ -271,6 +272,7 @@ final class DeviceKernels {
    * DevicePredicate}), each a column compared with constants. A row stays live only if every term
    * holds. Nulls follow Iceberg's row evaluator, which orders them first.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   static void filterRows(
       KernelContext context,
       IntArray terms,
@@ -282,9 +284,9 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       ByteArray live) {
-    int i = context.globalIdx;
-    if (i < live.getSize()) {
-      if (live.get(i) == 1) {
+    int row = context.globalIdx;
+    if (row < live.getSize()) {
+      if (live.get(row) == 1) {
         int count = terms.get(0);
         boolean keep = true;
         for (int t = 0; t < count; t++) {
@@ -295,7 +297,7 @@ final class DeviceKernels {
           int validColumn = terms.get(base + 3);
           int first = terms.get(base + 4);
           int constants = terms.get(base + 5);
-          boolean isNull = validColumn >= 0 && valid.get(validColumn * stride + i) == 0;
+          boolean isNull = validColumn >= 0 && valid.get(validColumn * stride + row) == 0;
           boolean pass;
           if (op == DevicePredicate.OP_FALSE) {
             pass = false;
@@ -310,16 +312,16 @@ final class DeviceKernels {
                     || op == DevicePredicate.OP_LT_EQ
                     || op == DevicePredicate.OP_NOT_EQ;
           } else if (kind == 2) {
-            pass = compareDouble(doubles.get(offset + i), op, doubleConstants, first, constants);
+            pass = compareDouble(doubles.get(offset + row), op, doubleConstants, first, constants);
           } else if (kind == 1) {
-            pass = compareLong(longs.get(offset + i), op, longConstants, first, constants);
+            pass = compareLong(longs.get(offset + row), op, longConstants, first, constants);
           } else {
-            pass = compareLong(ints.get(offset + i), op, longConstants, first, constants);
+            pass = compareLong(ints.get(offset + row), op, longConstants, first, constants);
           }
           keep = keep && pass;
         }
         if (!keep) {
-          live.set(i, (byte) 0);
+          live.set(row, (byte) 0);
         }
       }
     }
@@ -390,9 +392,9 @@ final class DeviceKernels {
    */
   static void probeSortedLongs(
       KernelContext context, LongArray sorted, IntArray size, LongArray keys, ByteArray found) {
-    int i = context.globalIdx;
-    if (i < found.getSize()) {
-      long key = keys.get(i);
+    int row = context.globalIdx;
+    if (row < found.getSize()) {
+      long key = keys.get(row);
       int low = 0;
       int high = size.get(0) - 1;
       byte hit = 0;
@@ -408,16 +410,16 @@ final class DeviceKernels {
           low = high + 1;
         }
       }
-      found.set(i, hit);
+      found.set(row, hit);
     }
   }
 
   /** {@link #probeSortedLongs} for INT32 keys. */
   static void probeSortedInts(
       KernelContext context, IntArray sorted, IntArray size, IntArray keys, ByteArray found) {
-    int i = context.globalIdx;
-    if (i < found.getSize()) {
-      int key = keys.get(i);
+    int row = context.globalIdx;
+    if (row < found.getSize()) {
+      int key = keys.get(row);
       int low = 0;
       int high = size.get(0) - 1;
       byte hit = 0;
@@ -433,7 +435,7 @@ final class DeviceKernels {
           low = high + 1;
         }
       }
-      found.set(i, hit);
+      found.set(row, hit);
     }
   }
 
@@ -443,13 +445,13 @@ final class DeviceKernels {
    */
   static void groupKeys(
       KernelContext context, ByteArray live, IntArray ints, int keyOffset, IntArray groups) {
-    int i = context.globalIdx;
-    if (i < groups.getSize()) {
+    int row = context.globalIdx;
+    if (row < groups.getSize()) {
       int key = DEAD_GROUP;
-      if (live.get(i) == 1) {
-        key = keyOffset < 0 ? 0 : ints.get(keyOffset + i);
+      if (live.get(row) == 1) {
+        key = keyOffset < 0 ? 0 : ints.get(keyOffset + row);
       }
-      groups.set(i, key);
+      groups.set(row, key);
     }
   }
 
@@ -466,12 +468,12 @@ final class DeviceKernels {
       IntArray validColumn,
       int slots,
       int stride) {
-    int i = context.globalIdx;
-    if (i < stride) {
+    int row = context.globalIdx;
+    if (row < stride) {
       for (int s = 0; s < slots; s++) {
         int column = validColumn.get(s);
-        if (column >= 0 && valid.get(column * stride + i) == 0) {
-          doubles.set(s * stride + i, 0.0);
+        if (column >= 0 && valid.get(column * stride + row) == 0) {
+          doubles.set(s * stride + row, 0.0);
         }
       }
     }
@@ -486,12 +488,12 @@ final class DeviceKernels {
       int slots,
       int stride,
       IntArray target) {
-    int j = context.globalIdx;
-    if (j < stride) {
-      if (j < count.get(0)) {
-        int row = positions.get(j);
+    int index = context.globalIdx;
+    if (index < stride) {
+      if (index < count.get(0)) {
+        int row = positions.get(index);
         for (int s = 0; s < slots; s++) {
-          target.set(s * stride + j, source.get(s * stride + row));
+          target.set(s * stride + index, source.get(s * stride + row));
         }
       }
     }
@@ -515,17 +517,17 @@ final class DeviceKernels {
       int slot,
       int stride,
       LongArray target) {
-    int j = context.globalIdx;
-    if (j < stride) {
-      if (j < count.get(0)) {
-        int row = positions.get(j);
-        int n = files.get(0);
-        int f = 0;
-        while (f + 1 < n && fileStarts.get(f + 1) <= row) {
-          f++;
+    int index = context.globalIdx;
+    if (index < stride) {
+      if (index < count.get(0)) {
+        int row = positions.get(index);
+        int fileCount = files.get(0);
+        int file = 0;
+        while (file + 1 < fileCount && fileStarts.get(file + 1) <= row) {
+          file++;
         }
-        target.set(slot * stride + j, firstRowIds.get(f) + (row - fileStarts.get(f)));
-        target.set((slot + 1) * stride + j, sequences.get(f));
+        target.set(slot * stride + index, firstRowIds.get(file) + (row - fileStarts.get(file)));
+        target.set((slot + 1) * stride + index, sequences.get(file));
       }
     }
   }
@@ -537,11 +539,11 @@ final class DeviceKernels {
    * comparison, never a wrong row.
    */
   static long keyHash(long hash, long value, int isNull) {
-    long x = hash ^ (isNull == 1 ? 0x7F4A7C159E3779B9L : value);
-    x += 0x9E3779B97F4A7C15L;
-    x = (x ^ (x >>> 30)) * 0xBF58476D1CE4E5B9L;
-    x = (x ^ (x >>> 27)) * 0x94D049BB133111EBL;
-    return x ^ (x >>> 31);
+    long mixed = hash ^ (isNull == 1 ? 0x7F4A7C159E3779B9L : value);
+    mixed += 0x9E3779B97F4A7C15L;
+    mixed = (mixed ^ (mixed >>> 30)) * 0xBF58476D1CE4E5B9L;
+    mixed = (mixed ^ (mixed >>> 27)) * 0x94D049BB133111EBL;
+    return mixed ^ (mixed >>> 31);
   }
 
   static final long KEY_HASH_SEED = 0x2545F4914F6CDD1DL;
@@ -564,14 +566,14 @@ final class DeviceKernels {
       LongArray sortedHashes,
       LongArray sortedKeys,
       ByteArray sortedNulls) {
-    int j = context.globalIdx;
-    if (j < stride) {
-      if (changed.get(0) == 1 && j < size.get(0)) {
-        int from = order.get(j);
-        sortedHashes.set(j, hashes.get(from));
+    int index = context.globalIdx;
+    if (index < stride) {
+      if (changed.get(0) == 1 && index < size.get(0)) {
+        int from = order.get(index);
+        sortedHashes.set(index, hashes.get(from));
         for (int c = 0; c < columns; c++) {
-          sortedKeys.set((long) c * stride + j, keys.get((long) c * stride + from));
-          sortedNulls.set(c * stride + j, nulls.get(c * stride + from));
+          sortedKeys.set((long) c * stride + index, keys.get((long) c * stride + from));
+          sortedNulls.set(c * stride + index, nulls.get(c * stride + from));
         }
       }
     }
@@ -585,6 +587,7 @@ final class DeviceKernels {
    * <p>{@code spec} holds, a key column, its kind (0 INT32 or DATE, 1 INT64 or TIMESTAMP), its slot
    * and its validity slot, or -1 when it cannot be null.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   static void probeKeySet(
       KernelContext context,
       IntArray spec,
@@ -599,15 +602,15 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       ByteArray found) {
-    int i = context.globalIdx;
-    if (i < stride) {
+    int row = context.globalIdx;
+    if (row < stride) {
       long hash = KEY_HASH_SEED;
       for (int c = 0; c < columns; c++) {
         hash =
             keyHash(
                 hash,
-                keyValue(spec, c, i, ints, longs, stride),
-                keyNull(spec, c, i, valid, stride));
+                keyValue(spec, c, row, ints, longs, stride),
+                keyNull(spec, c, row, valid, stride));
       }
       int lo = 0;
       int hi = size.get(0);
@@ -623,12 +626,12 @@ final class DeviceKernels {
       for (int j = lo; j < size.get(0) && hit == 0 && sortedHashes.get(j) == hash; j++) {
         int same = 1;
         for (int c = 0; c < columns; c++) {
-          int isNull = keyNull(spec, c, i, valid, stride);
+          int isNull = keyNull(spec, c, row, valid, stride);
           if (sortedNulls.get(c * setStride + j) != isNull) {
             same = 0;
           } else if (isNull == 0
               && sortedKeys.get((long) c * setStride + j)
-                  != keyValue(spec, c, i, ints, longs, stride)) {
+                  != keyValue(spec, c, row, ints, longs, stride)) {
             same = 0;
           }
         }
@@ -636,19 +639,21 @@ final class DeviceKernels {
           hit = 1;
         }
       }
-      found.set(i, hit);
+      found.set(row, hit);
     }
   }
 
   private static long keyValue(
-      IntArray spec, int c, int i, IntArray ints, LongArray longs, int stride) {
-    int slot = spec.get(3 * c + 1);
-    return spec.get(3 * c) == 0 ? (long) ints.get(slot * stride + i) : longs.get(slot * stride + i);
+      IntArray spec, int column, int row, IntArray ints, LongArray longs, int stride) {
+    int slot = spec.get(3 * column + 1);
+    return spec.get(3 * column) == 0
+        ? (long) ints.get(slot * stride + row)
+        : longs.get(slot * stride + row);
   }
 
-  private static int keyNull(IntArray spec, int c, int i, ByteArray valid, int stride) {
-    int validSlot = spec.get(3 * c + 2);
-    return validSlot >= 0 && valid.get(validSlot * stride + i) == 0 ? 1 : 0;
+  private static int keyNull(IntArray spec, int column, int row, ByteArray valid, int stride) {
+    int validSlot = spec.get(3 * column + 2);
+    return validSlot >= 0 && valid.get(validSlot * stride + row) == 0 ? 1 : 0;
   }
 
   /**
@@ -670,12 +675,12 @@ final class DeviceKernels {
       int charsStride,
       LongArray longs,
       IntArray errors) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (i < meta.get(META_ROWS)) {
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (row < meta.get(META_ROWS)) {
         for (int s = 0; s < strings; s++) {
-          int from = offsets.get(s * (stride + 1) + i);
-          int length = offsets.get(s * (stride + 1) + i + 1) - from;
+          int from = offsets.get(s * (stride + 1) + row);
+          int length = offsets.get(s * (stride + 1) + row + 1) - from;
           long packed = 0L;
           if (length > 8) {
             errors.set(s, 1);
@@ -686,7 +691,7 @@ final class DeviceKernels {
               packed = (packed << 8) | next;
             }
           }
-          longs.set((long) (firstSlot + s) * stride + i, packed ^ Long.MIN_VALUE);
+          longs.set((long) (firstSlot + s) * stride + row, packed ^ Long.MIN_VALUE);
         }
       }
     }
@@ -714,28 +719,28 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       LongArray out) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (live.get(i) == 0) {
-        out.set(i, DEAD_KEY);
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (live.get(row) == 0) {
+        out.set(row, DEAD_KEY);
         for (int k = 1; k < keys; k++) {
-          out.set((long) k * stride + i, 0L);
+          out.set((long) k * stride + row, 0L);
         }
       } else if (keys == 0) {
-        out.set(i, 0L);
+        out.set(row, 0L);
       } else {
         for (int k = 0; k < keys; k++) {
           int slot = spec.get(3 * k + 1);
           int validSlot = spec.get(3 * k + 2);
           long value;
-          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+          if (validSlot >= 0 && valid.get(validSlot * stride + row) == 0) {
             value = NULL_KEY;
           } else if (spec.get(3 * k) == 0) {
-            value = ints.get(slot * stride + i);
+            value = ints.get(slot * stride + row);
           } else {
-            value = longs.get((long) slot * stride + i);
+            value = longs.get((long) slot * stride + row);
           }
-          out.set((long) k * stride + i, value);
+          out.set((long) k * stride + row, value);
         }
       }
     }
@@ -767,18 +772,18 @@ final class DeviceKernels {
       int columns,
       DoubleArray copies,
       IntArray misses) {
-    int i = context.globalIdx;
-    if (i < stride && dense.get(0) != 0 && live.get(i) != 0) {
+    int row = context.globalIdx;
+    if (row < stride && dense.get(0) != 0 && live.get(row) != 0) {
       int slots = (int) dense.get(2);
       int validSlot = spec.get(2);
       long slot;
-      if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+      if (validSlot >= 0 && valid.get(validSlot * stride + row) == 0) {
         slot = slots - 1L;
       } else if (spec.get(0) == 0) {
-        slot = ints.get(spec.get(1) * stride + i) - dense.get(1);
+        slot = ints.get(spec.get(1) * stride + row) - dense.get(1);
         slot = slot < slots - 1 ? slot : -1;
       } else {
-        slot = longs.get((long) spec.get(1) * stride + i) - dense.get(1);
+        slot = longs.get((long) spec.get(1) * stride + row) - dense.get(1);
         slot = slot < slots - 1 ? slot : -1;
       }
       if (slot < 0) {
@@ -786,7 +791,7 @@ final class DeviceKernels {
       } else {
         int base = ((context.groupIdx % DENSE_COPIES) * (DENSE_SLOTS + 1) + (int) slot) * columns;
         for (int c = 0; c < columns; c++) {
-          double value = values.get((long) c * stride + i);
+          double value = values.get((long) c * stride + row);
           if (value != 0.0) {
             context.atomicAdd(copies, base + c, value);
           }
@@ -813,15 +818,15 @@ final class DeviceKernels {
       int slots = (int) dense.get(2);
       for (int t = context.globalIdx; t < slots * columns; t += context.globalGroupSizeX) {
         int slot = t / columns;
-        int c = t - slot * columns;
+        int column = t - slot * columns;
         double total = 0.0;
         for (int copy = 0; copy < DENSE_COPIES; copy++) {
-          int at = (copy * (DENSE_SLOTS + 1) + slot) * columns + c;
+          int at = (copy * (DENSE_SLOTS + 1) + slot) * columns + column;
           total += copies.get(at);
           copies.set(at, 0.0);
         }
-        sums.set((long) c * stride + slot, total);
-        if (c == 0) {
+        sums.set((long) column * stride + slot, total);
+        if (column == 0) {
           keys.set(slot, slot == slots - 1 ? NULL_KEY : dense.get(1) + slot);
         }
       }
@@ -847,6 +852,7 @@ final class DeviceKernels {
    * SQL's SUM skips it. A dropped row gets 0 everywhere. {@code constants} holds offset and scale a
    * factor, {@code 2 * MAX_FACTORS} a value.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   static void valueColumns(
       KernelContext context,
       IntArray spec,
@@ -859,9 +865,9 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       DoubleArray out) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      int alive = live.get(i);
+    int row = context.globalIdx;
+    if (row < stride) {
+      int alive = live.get(row);
       for (int v = 0; v < values; v++) {
         int base = v * VALUE_SPEC_INTS;
         // A sum of terms, each a product of factors: a factor with a non-zero coefficient starts a
@@ -873,24 +879,24 @@ final class DeviceKernels {
           int kind = spec.get(base + 1 + 3 * f);
           int slot = spec.get(base + 2 + 3 * f);
           int validSlot = spec.get(base + 3 + 3 * f);
-          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+          if (validSlot >= 0 && valid.get(validSlot * stride + row) == 0) {
             isNull = 1;
           }
-          double x;
+          double operand;
           if (kind == 0) {
-            x = ints.get(slot * stride + i);
+            operand = ints.get(slot * stride + row);
           } else if (kind == 1) {
-            x = longs.get((long) slot * stride + i);
+            operand = longs.get((long) slot * stride + row);
           } else {
-            x = doubles.get((long) slot * stride + i);
+            operand = doubles.get((long) slot * stride + row);
           }
-          int c = 3 * (v * DeviceValue.MAX_FACTORS + f);
-          double coefficient = constants.get(c + 2);
+          int factorBase = 3 * (v * DeviceValue.MAX_FACTORS + f);
+          double coefficient = constants.get(factorBase + 2);
           if (coefficient != 0.0) {
             total += product;
             product = coefficient;
           }
-          product = product * (constants.get(c) + constants.get(c + 1) * x);
+          product = product * (constants.get(factorBase) + constants.get(factorBase + 1) * operand);
         }
         total += product;
         // A part of the (integer) value: high * 2^40 + middle * 2^20 + low, exact in doubles.
@@ -907,15 +913,15 @@ final class DeviceKernels {
             total = rest - middle * 1048576.0;
           }
         }
-        out.set((long) v * stride + i, alive == 1 && isNull == 0 ? total : 0.0);
+        out.set((long) v * stride + row, alive == 1 && isNull == 0 ? total : 0.0);
         int countColumn = spec.get(base + VALUE_SPEC_INTS - 1);
         if (countColumn >= 0) {
           out.set(
-              (long) (values + 1 + countColumn) * stride + i,
+              (long) (values + 1 + countColumn) * stride + row,
               alive == 1 && isNull == 0 ? 1.0 : 0.0);
         }
       }
-      out.set((long) values * stride + i, alive == 1 ? 1.0 : 0.0);
+      out.set((long) values * stride + row, alive == 1 ? 1.0 : 0.0);
     }
   }
 
@@ -948,29 +954,29 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       LongArray keys) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (live.get(i) == 0) {
-        keys.set(i, 1L);
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (live.get(row) == 0) {
+        keys.set(row, 1L);
         for (int w = 1; w <= columns; w++) {
-          keys.set((long) w * stride + i, Long.MAX_VALUE);
+          keys.set((long) w * stride + row, Long.MAX_VALUE);
         }
       } else {
-        keys.set(i, 0L);
-        long u0 = orderedBits(spec, 0, columns, i, ints, longs, doubles, valid, stride);
-        long u1 = orderedBits(spec, 1, columns, i, ints, longs, doubles, valid, stride);
-        long u2 = orderedBits(spec, 2, columns, i, ints, longs, doubles, valid, stride);
-        long u3 = orderedBits(spec, 3, columns, i, ints, longs, doubles, valid, stride);
+        keys.set(row, 0L);
+        long u0 = orderedBits(spec, 0, columns, row, ints, longs, doubles, valid, stride);
+        long u1 = orderedBits(spec, 1, columns, row, ints, longs, doubles, valid, stride);
+        long u2 = orderedBits(spec, 2, columns, row, ints, longs, doubles, valid, stride);
+        long u3 = orderedBits(spec, 3, columns, row, ints, longs, doubles, valid, stride);
         long word = 0L;
         int filled = 0;
         int out = 1;
         for (int b = 63; b >= 0; b--) {
           for (int c = 0; c < columns; c++) {
-            long u = c == 0 ? u0 : c == 1 ? u1 : c == 2 ? u2 : u3;
-            word = word | (((u >>> b) & 1L) << (63 - filled));
+            long bits = c == 0 ? u0 : c == 1 ? u1 : c == 2 ? u2 : u3;
+            word = word | (((bits >>> b) & 1L) << (63 - filled));
             filled++;
             if (filled == 64) {
-              keys.set((long) out * stride + i, word ^ Long.MIN_VALUE);
+              keys.set((long) out * stride + row, word ^ Long.MIN_VALUE);
               out++;
               word = 0L;
               filled = 0;
@@ -1004,21 +1010,21 @@ final class DeviceKernels {
       ByteArray valid,
       int stride,
       LongArray keys) {
-    int i = context.globalIdx;
-    if (i < stride) {
-      if (live.get(i) == 0) {
-        keys.set(i, 1L);
+    int row = context.globalIdx;
+    if (row < stride) {
+      if (live.get(row) == 0) {
+        keys.set(row, 1L);
         for (int w = 1; w <= 2 * columns; w++) {
-          keys.set((long) w * stride + i, Long.MAX_VALUE);
+          keys.set((long) w * stride + row, Long.MAX_VALUE);
         }
       } else {
-        keys.set(i, 0L);
+        keys.set(row, 0L);
         for (int c = 0; c < columns; c++) {
           int validSlot = spec.get(3 * c + 2);
           int flags = orders.get(c);
           long nullWord = 0L;
           long word = 0L;
-          if (validSlot >= 0 && valid.get(validSlot * stride + i) == 0) {
+          if (validSlot >= 0 && valid.get(validSlot * stride + row) == 0) {
             if ((flags & 2) == 0) {
               nullWord = 1L;
             }
@@ -1026,14 +1032,14 @@ final class DeviceKernels {
             if ((flags & 2) != 0) {
               nullWord = 1L;
             }
-            word = orderedBits(spec, c, columns, i, ints, longs, doubles, valid, stride);
+            word = orderedBits(spec, c, columns, row, ints, longs, doubles, valid, stride);
             word = word ^ Long.MIN_VALUE;
             if ((flags & 1) == 1) {
               word = ~word;
             }
           }
-          keys.set((long) (1 + 2 * c) * stride + i, nullWord);
-          keys.set((long) (2 + 2 * c) * stride + i, word);
+          keys.set((long) (1 + 2 * c) * stride + row, nullWord);
+          keys.set((long) (2 + 2 * c) * stride + row, word);
         }
       }
     }
@@ -1043,26 +1049,26 @@ final class DeviceKernels {
   @SuppressWarnings("IdentityBinaryExpression")
   private static long orderedBits(
       IntArray spec,
-      int c,
+      int column,
       int columns,
-      int i,
+      int row,
       IntArray ints,
       LongArray longs,
       DoubleArray doubles,
       ByteArray valid,
       int stride) {
     long bits = 0L;
-    if (c < columns) {
-      int kind = spec.get(3 * c);
-      int slot = spec.get(3 * c + 1);
-      int validSlot = spec.get(3 * c + 2);
-      if (validSlot < 0 || valid.get(validSlot * stride + i) == 1) {
+    if (column < columns) {
+      int kind = spec.get(3 * column);
+      int slot = spec.get(3 * column + 1);
+      int validSlot = spec.get(3 * column + 2);
+      if (validSlot < 0 || valid.get(validSlot * stride + row) == 1) {
         if (kind == 0) {
-          bits = ((long) ints.get(slot * stride + i)) ^ Long.MIN_VALUE;
+          bits = ((long) ints.get(slot * stride + row)) ^ Long.MIN_VALUE;
         } else if (kind == 1) {
-          bits = longs.get(slot * stride + i) ^ Long.MIN_VALUE;
+          bits = longs.get(slot * stride + row) ^ Long.MIN_VALUE;
         } else {
-          double value = doubles.get(slot * stride + i);
+          double value = doubles.get(slot * stride + row);
           long raw = value != value ? 0x7ff8000000000000L : Double.doubleToRawLongBits(value);
           bits = raw ^ ((raw >> 63) | Long.MIN_VALUE);
         }
@@ -1080,12 +1086,12 @@ final class DeviceKernels {
       int slots,
       int stride,
       LongArray target) {
-    int j = context.globalIdx;
-    if (j < stride) {
-      if (j < count.get(0)) {
-        int row = positions.get(j);
+    int index = context.globalIdx;
+    if (index < stride) {
+      if (index < count.get(0)) {
+        int row = positions.get(index);
         for (int s = 0; s < slots; s++) {
-          target.set(s * stride + j, source.get(s * stride + row));
+          target.set(s * stride + index, source.get(s * stride + row));
         }
       }
     }
@@ -1100,12 +1106,12 @@ final class DeviceKernels {
       int slots,
       int stride,
       DoubleArray target) {
-    int j = context.globalIdx;
-    if (j < stride) {
-      if (j < count.get(0)) {
-        int row = positions.get(j);
+    int index = context.globalIdx;
+    if (index < stride) {
+      if (index < count.get(0)) {
+        int row = positions.get(index);
         for (int s = 0; s < slots; s++) {
-          target.set(s * stride + j, source.get(s * stride + row));
+          target.set(s * stride + index, source.get(s * stride + row));
         }
       }
     }
@@ -1120,12 +1126,12 @@ final class DeviceKernels {
       int slots,
       int stride,
       ByteArray target) {
-    int j = context.globalIdx;
-    if (j < stride) {
-      if (j < count.get(0)) {
-        int row = positions.get(j);
+    int index = context.globalIdx;
+    if (index < stride) {
+      if (index < count.get(0)) {
+        int row = positions.get(index);
         for (int s = 0; s < slots; s++) {
-          target.set(s * stride + j, source.get(s * stride + row));
+          target.set(s * stride + index, source.get(s * stride + row));
         }
       }
     }
@@ -1144,33 +1150,33 @@ final class DeviceKernels {
       int offset,
       int buckets,
       IntArray groups) {
-    int i = context.globalIdx;
-    if (i < groups.getSize()) {
+    int row = context.globalIdx;
+    if (row < groups.getSize()) {
       int key = DEAD_GROUP;
-      if (live.get(i) == 1) {
-        long value = longs.get(offset + i);
+      if (live.get(row) == 1) {
+        long value = longs.get(offset + row);
         int h1 = mixH1(0, mixK1((int) value));
         h1 = mixH1(h1, mixK1((int) (value >>> 32)));
         key = (fmix(h1, 8) & Integer.MAX_VALUE) % buckets;
       }
-      groups.set(i, key);
+      groups.set(row, key);
     }
   }
 
-  private static int mixK1(int k) {
-    int k1 = k * 0xcc9e2d51;
+  private static int mixK1(int value) {
+    int k1 = value * 0xcc9e2d51;
     k1 = (k1 << 15) | (k1 >>> 17);
     return k1 * 0x1b873593;
   }
 
-  private static int mixH1(int h, int k1) {
-    int h1 = h ^ k1;
+  private static int mixH1(int hash, int k1) {
+    int h1 = hash ^ k1;
     h1 = (h1 << 13) | (h1 >>> 19);
     return h1 * 5 + 0xe6546b64;
   }
 
-  private static int fmix(int h, int length) {
-    int h1 = h ^ length;
+  private static int fmix(int hash, int length) {
+    int h1 = hash ^ length;
     h1 ^= h1 >>> 16;
     h1 *= 0x85ebca6b;
     h1 ^= h1 >>> 13;

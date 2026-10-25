@@ -64,6 +64,7 @@ final class StarStage implements GroupedStage {
   private double[] folded;
   private int[] foldedCounts;
 
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   StarStage(
       List<DeviceDimension> dimensions,
       List<DeviceDimension.Key> keys,
@@ -480,28 +481,28 @@ final class StarStage implements GroupedStage {
         offset += dimension.keys();
       }
     }
-    int g = 0;
+    int gather = 0;
     for (int k = 0; k < keys.size(); k++) {
       DeviceDimension.Key key = keys.get(k);
       if (key.isAttribute()) {
         DeviceDimension dimension = dimensions.get(key.dimension());
-        int base = g * JoinKernels.GATHER_SPEC_INTS;
+        int base = gather * JoinKernels.GATHER_SPEC_INTS;
         gatherSpec.set(base, k);
         gatherSpec.set(base + 1, dimension.firstKey());
         gatherSpec.set(base + 2, dimension.keys());
         gatherSpec.set(base + 3, attributeOffset(key.dimension(), key.attribute()));
-        g++;
+        gather++;
       }
     }
   }
 
   /** Where attribute {@code attribute} of dimension {@code d} starts in the dimensions' data. */
-  private int attributeOffset(int d, int attribute) {
+  private int attributeOffset(int dimension, int attribute) {
     int offset = 0;
-    for (int i = 0; i < d; i++) {
+    for (int i = 0; i < dimension; i++) {
       offset += (int) dimensions.get(i).ints();
     }
-    return offset + (1 + attribute) * dimensions.get(d).keys();
+    return offset + (1 + attribute) * dimensions.get(dimension).keys();
   }
 
   private void fillProbe(

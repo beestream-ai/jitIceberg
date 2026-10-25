@@ -105,26 +105,28 @@ public final class CdcBench {
         dkGpu.deleteKeys("id", ids);
         double deleteMillis = (System.nanoTime() - start) / 1e6;
         append(dk, ids, round);
-        double[] a = report(round, "eq", eq, eqGpu, threads, 0);
-        double[] b = report(round, "dv", dv, dvGpu, threads, convertMillis);
-        double[] c = report(round, "dk", dk, dkGpu, threads, deleteMillis);
-        if (a[0] != c[0] || Math.abs(a[1] - c[1]) > 1e-6 * Math.abs(a[1])) {
+        double[] eqResult = report(round, "eq", eq, eqGpu, threads, 0);
+        double[] dvResult = report(round, "dv", dv, dvGpu, threads, convertMillis);
+        double[] dkResult = report(round, "dk", dk, dkGpu, threads, deleteMillis);
+        if (eqResult[0] != dkResult[0]
+            || Math.abs(eqResult[1] - dkResult[1]) > 1e-6 * Math.abs(eqResult[1])) {
           throw new IllegalStateException(
               "round "
                   + round
                   + ": keys deleted as vectors read differently: "
-                  + a[0]
+                  + eqResult[0]
                   + " vs "
-                  + c[0]);
+                  + dkResult[0]);
         }
-        if (a[0] != b[0] || Math.abs(a[1] - b[1]) > 1e-6 * Math.abs(a[1])) {
+        if (eqResult[0] != dvResult[0]
+            || Math.abs(eqResult[1] - dvResult[1]) > 1e-6 * Math.abs(eqResult[1])) {
           throw new IllegalStateException(
               "round "
                   + round
                   + ": the converted table reads differently: "
-                  + a[0]
+                  + eqResult[0]
                   + " vs "
-                  + b[0]);
+                  + dvResult[0]);
         }
       }
     }

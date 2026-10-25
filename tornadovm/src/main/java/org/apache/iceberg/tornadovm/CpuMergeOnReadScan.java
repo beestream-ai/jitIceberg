@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -311,6 +310,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
   }
 
   /** {@code include}: which planned tasks to read. */
+  @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:MethodLength"})
   private <S extends Sink> long run(
       List<String> projection,
       SinkFactory<S> factory,
@@ -371,7 +371,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
 
     boolean keyIsInt = keyName != null && layout.type(equalityKeyId) == CudfType.INT32;
     Integer keyColumn = keyName == null ? null : columnIndex.get(keyName);
-    Map<String, PrimitiveHash.LongSet> sets = new ConcurrentHashMap<>();
+    Map<String, PrimitiveHash.LongSet> sets = Maps.newConcurrentMap();
 
     ExecutorService pool = Executors.newFixedThreadPool(threads);
     long live = 0;
@@ -509,6 +509,7 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       }
     }
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     boolean test(ColumnarBatch batch, int row) {
       for (int t = 0; t < ops.length; t++) {
         int op = ops[t];
@@ -618,16 +619,16 @@ public final class CpuMergeOnReadScan implements MergeOnReadScan {
       } else {
         key = batch.column(groupColumn).getInt(row);
       }
-      int g = groups.indexOf(key);
-      if (g == counts.length) {
+      int groupIndex = groups.indexOf(key);
+      if (groupIndex == counts.length) {
         counts = java.util.Arrays.copyOf(counts, counts.length * 2);
         sums = java.util.Arrays.copyOf(sums, sums.length * 2);
       }
-      counts[g]++;
+      counts[groupIndex]++;
       for (int c = 0; c < sumColumns.length; c++) {
         ColumnVector vector = batch.column(sumColumns[c]);
         if (!vector.isNullAt(row)) {
-          sums[g * sumColumns.length + c] += vector.getDouble(row);
+          sums[groupIndex * sumColumns.length + c] += vector.getDouble(row);
         }
       }
       rows++;

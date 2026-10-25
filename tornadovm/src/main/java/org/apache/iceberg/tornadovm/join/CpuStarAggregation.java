@@ -64,6 +64,7 @@ public final class CpuStarAggregation {
   }
 
   /** What every visitor shares: the inputs and how they map onto the scan's columns. */
+  @SuppressWarnings("checkstyle:VisibilityModifier")
   private static final class Plan {
     final List<DeviceDimension> dimensions;
     final List<DeviceDimension.Key> keys;
@@ -122,8 +123,8 @@ public final class CpuStarAggregation {
       }
       this.denseGroups = (int) groups;
       // Per group: the values' sums, the row count, the values' non-null counts.
-      int n = values.size() + probeSums.size();
-      this.width = 2 * n + 1;
+      int valueCount = values.size() + probeSums.size();
+      this.width = 2 * valueCount + 1;
     }
 
     private void add(String column) {
@@ -133,9 +134,9 @@ public final class CpuStarAggregation {
     }
 
     void finish(List<Visitor> visitors, GroupedAggregate result) {
-      int n = values.size() + probeSums.size();
-      double[] sums = new double[n];
-      double[] nonNull = new double[n];
+      int valueCount = values.size() + probeSums.size();
+      double[] sums = new double[valueCount];
+      double[] nonNull = new double[valueCount];
       if (denseGroups > 0) {
         double[] total = new double[denseGroups * width];
         for (Visitor v : visitors) {
@@ -144,7 +145,7 @@ public final class CpuStarAggregation {
           }
         }
         for (int g = 0; g < denseGroups; g++) {
-          double rows = total[g * width + n];
+          double rows = total[g * width + valueCount];
           if (rows == 0) {
             continue;
           }
@@ -152,17 +153,17 @@ public final class CpuStarAggregation {
           for (int k = 0; k < keys.size(); k++) {
             key.add((long) ((g / multipliers[k]) % cardinalities[k]));
           }
-          System.arraycopy(total, g * width, sums, 0, n);
-          System.arraycopy(total, g * width + n + 1, nonNull, 0, n);
+          System.arraycopy(total, g * width, sums, 0, valueCount);
+          System.arraycopy(total, g * width + valueCount + 1, nonNull, 0, valueCount);
           result.add(key, sums, rows, nonNull);
         }
       } else {
         for (Visitor v : visitors) {
           v.hashed.forEach(
               (key, totals) -> {
-                System.arraycopy(totals, 0, sums, 0, n);
-                System.arraycopy(totals, n + 1, nonNull, 0, n);
-                result.add(key, sums, totals[n], nonNull);
+                System.arraycopy(totals, 0, sums, 0, valueCount);
+                System.arraycopy(totals, valueCount + 1, nonNull, 0, valueCount);
+                result.add(key, sums, totals[valueCount], nonNull);
               });
         }
       }
@@ -170,6 +171,7 @@ public final class CpuStarAggregation {
   }
 
   /** One data file's live rows, on the scan thread that reads it. */
+  @SuppressWarnings("checkstyle:VisibilityModifier")
   private static final class Visitor implements CpuMergeOnReadScan.RowVisitor {
     private final Plan plan;
     private final int[] dimensionColumn;
@@ -231,7 +233,7 @@ public final class CpuStarAggregation {
     // must never be read directly.
     private final int[] kind = new int[64];
 
-    private int kind(ColumnVector vector, int column, int r) {
+    private int kind(ColumnVector vector, int column, int rowIndex) {
       if (kind[column] == 0) {
         int[] order =
             vector.getFieldVector() instanceof org.apache.arrow.vector.Float8Vector
@@ -240,11 +242,11 @@ public final class CpuStarAggregation {
         for (int k : order) {
           try {
             if (k == 'd') {
-              vector.getDouble(r);
+              vector.getDouble(rowIndex);
             } else if (k == 8) {
-              vector.getLong(r);
+              vector.getLong(rowIndex);
             } else {
-              vector.getInt(r);
+              vector.getInt(rowIndex);
             }
             kind[column] = k;
             break;
@@ -260,30 +262,33 @@ public final class CpuStarAggregation {
       return kind[column];
     }
 
-    private long integer(ColumnVector vector, int column, int r) {
-      int k = kind(vector, column, r);
-      if (k == 'd') {
+    private long integer(ColumnVector vector, int column, int rowIndex) {
+      int valueKind = kind(vector, column, rowIndex);
+      if (valueKind == 'd') {
         throw new UnsupportedOperationException(
             "not an integer column: " + vector.getFieldVector().getField());
       }
-      return k == 4 ? vector.getInt(r) : vector.getLong(r);
+      return valueKind == 4 ? vector.getInt(rowIndex) : vector.getLong(rowIndex);
     }
 
-    private double number(ColumnVector vector, int column, int r) {
-      int k = kind(vector, column, r);
-      return k == 'd' ? vector.getDouble(r) : k == 4 ? vector.getInt(r) : vector.getLong(r);
+    private double number(ColumnVector vector, int column, int rowIndex) {
+      int valueKind = kind(vector, column, rowIndex);
+      return valueKind == 'd'
+          ? vector.getDouble(rowIndex)
+          : valueKind == 4 ? vector.getInt(rowIndex) : vector.getLong(rowIndex);
     }
 
     @Override
-    public void accept(ColumnarBatch batch, int r) {
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    public void accept(ColumnarBatch batch, int rowIndex) {
       // The dimensions' masks: a null, out-of-range or masked-out key drops the row.
       for (int d = 0; d < dimensionKey.length; d++) {
         ColumnVector vector = batch.column(dimensionColumn[d]);
-        if (vector.isNullAt(r)) {
+        if (vector.isNullAt(rowIndex)) {
           return;
         }
         DeviceDimension dimension = plan.dimensions.get(d);
-        long at = integer(vector, dimensionColumn[d], r) - dimension.firstKey();
+        long at = integer(vector, dimensionColumn[d], rowIndex) - dimension.firstKey();
         if (at < 0 || at >= dimension.keys() || dimension.keep()[(int) at] == 0) {
           return;
         }
@@ -291,15 +296,15 @@ public final class CpuStarAggregation {
       }
       // The probe: the packed key, the matching build rows that pass the comparison.
       double weight = 1;
-      int n = plan.values.size();
+      int valueCount = plan.values.size();
       if (plan.probe != null) {
-        weight = probe(batch, r, dimensionKey);
+        weight = probe(batch, rowIndex, dimensionKey);
         if (weight == 0) {
           return;
         }
       }
       Arrays.fill(row, 0);
-      for (int v = 0; v < n; v++) {
+      for (int v = 0; v < valueCount; v++) {
         double value = 0;
         double term = 0;
         boolean isNull = false;
@@ -307,16 +312,17 @@ public final class CpuStarAggregation {
         for (int f = 0; f < factors.size(); f++) {
           DeviceValue.Factor factor = factors.get(f);
           ColumnVector vector = batch.column(valueColumn[v][f]);
-          if (vector.isNullAt(r)) {
+          if (vector.isNullAt(rowIndex)) {
             isNull = true;
             break;
           }
-          double x = factor.offset() + factor.scale() * number(vector, valueColumn[v][f], r);
+          double operand =
+              factor.offset() + factor.scale() * number(vector, valueColumn[v][f], rowIndex);
           if (factor.coefficient() != 0) {
             value += term;
-            term = factor.coefficient() * x;
+            term = factor.coefficient() * operand;
           } else {
-            term *= x;
+            term *= operand;
           }
         }
         if (!isNull) {
@@ -341,11 +347,11 @@ public final class CpuStarAggregation {
         boolean kept =
             sum.maskedBy() < 0
                 || row[plan.values.size() + plan.probeSums.size() + 1 + sum.maskedBy()] != 0;
-        row[n + s] = kept ? rowSums[sum.column()] : 0;
-        row[2 * (n + plan.probeSums.size()) - (plan.probeSums.size() - s) + 1] =
+        row[valueCount + s] = kept ? rowSums[sum.column()] : 0;
+        row[2 * (valueCount + plan.probeSums.size()) - (plan.probeSums.size() - s) + 1] =
             kept ? rowCounts[sum.column()] : 0;
       }
-      row[n + plan.probeSums.size()] = weight;
+      row[valueCount + plan.probeSums.size()] = weight;
       if (dense != null) {
         int group = 0;
         for (int k = 0; k < plan.keys.size(); k++) {
@@ -374,7 +380,10 @@ public final class CpuStarAggregation {
                         .get(spec.attribute())[(int) dimensionKey[spec.dimension()]]);
           } else {
             ColumnVector vector = batch.column(keyColumn[k]);
-            key.add(vector.isNullAt(r) ? null : (Object) integer(vector, keyColumn[k], r));
+            key.add(
+                vector.isNullAt(rowIndex)
+                    ? null
+                    : (Object) integer(vector, keyColumn[k], rowIndex));
           }
         }
         double[] totals = hashed.computeIfAbsent(key, ignored -> new double[plan.width]);
@@ -385,7 +394,8 @@ public final class CpuStarAggregation {
     }
 
     /** The row's join weight, and its build sums in rowSums and rowCounts; 0 drops the row. */
-    private double probe(ColumnarBatch batch, int r, long[] dimensionKey) {
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private double probe(ColumnarBatch batch, int rowIndex, long[] dimensionKeys) {
       DeviceProbe probe = plan.probe;
       long key = 0;
       boolean inRange = true;
@@ -398,14 +408,14 @@ public final class CpuStarAggregation {
               plan.dimensions
                   .get(part.dimension())
                   .attributes()
-                  .get(part.attribute())[(int) dimensionKey[part.dimension()]];
+                  .get(part.attribute())[(int) dimensionKeys[part.dimension()]];
         } else {
           ColumnVector vector = batch.column(partColumn[p]);
-          if (vector.isNullAt(r)) {
+          if (vector.isNullAt(rowIndex)) {
             inRange = false;
             continue;
           }
-          value = integer(vector, partColumn[p], r);
+          value = integer(vector, partColumn[p], rowIndex);
         }
         long shifted = value - part.offset();
         if (shifted < 0 || shifted >= part.range()) {
@@ -417,8 +427,8 @@ public final class CpuStarAggregation {
       long rowValue = 0;
       if (compareColumn >= 0) {
         ColumnVector vector = batch.column(compareColumn);
-        rowNull = vector.isNullAt(r);
-        rowValue = rowNull ? 0 : integer(vector, compareColumn, r);
+        rowNull = vector.isNullAt(rowIndex);
+        rowValue = rowNull ? 0 : integer(vector, compareColumn, rowIndex);
       }
       Arrays.fill(rowSums, 0);
       Arrays.fill(rowCounts, 0);
@@ -426,18 +436,18 @@ public final class CpuStarAggregation {
       if (inRange) {
         long[] keys = probe.keys();
         long[] values = probe.values();
-        int j = Arrays.binarySearch(keys, key);
-        if (j >= 0) {
-          while (j > 0 && keys[j - 1] == key) {
-            j--;
+        int match = Arrays.binarySearch(keys, key);
+        if (match >= 0) {
+          while (match > 0 && keys[match - 1] == key) {
+            match--;
           }
-          for (; j < keys.length && keys[j] == key; j++) {
-            if (passes(probe.comparison(), rowNull, rowValue, values[j])) {
+          for (; match < keys.length && keys[match] == key; match++) {
+            if (passes(probe.comparison(), rowNull, rowValue, values[match])) {
               weight += 1;
               for (int s = 0; s < rowSums.length; s++) {
-                double v = probe.sums().get(s)[j];
-                if (!Double.isNaN(v)) {
-                  rowSums[s] += v;
+                double buildSum = probe.sums().get(s)[match];
+                if (!Double.isNaN(buildSum)) {
+                  rowSums[s] += buildSum;
                   rowCounts[s] += 1;
                 }
               }

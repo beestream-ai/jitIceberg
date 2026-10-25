@@ -66,13 +66,13 @@ public class TestDeviceMergeOnRead {
         .isTrue();
   }
 
-  private static Record row(Schema schema, long fileIndex, long i) {
+  private static Record row(Schema schema, long fileIndex, long rowIndex) {
     GenericRecord record = GenericRecord.create(schema);
-    record.setField("id", fileIndex * 1_000_000L + i);
-    record.setField("k", (int) (i % 7));
-    record.setField("v1", i * 0.25);
-    record.setField("v2", (double) -i);
-    record.setField("v3", (double) (i % 3));
+    record.setField("id", fileIndex * 1_000_000L + rowIndex);
+    record.setField("k", (int) (rowIndex % 7));
+    record.setField("v1", rowIndex * 0.25);
+    record.setField("v2", (double) -rowIndex);
+    record.setField("v3", (double) (rowIndex % 3));
     record.setField("v4", 1.0);
     return record;
   }
@@ -87,8 +87,8 @@ public class TestDeviceMergeOnRead {
     return files;
   }
 
-  private static long[] everyNth(long rows, int n) {
-    return LongStream.range(0, rows).filter(i -> i % n == 0).toArray();
+  private static long[] everyNth(long rows, int every) {
+    return LongStream.range(0, rows).filter(i -> i % every == 0).toArray();
   }
 
   private static long[] randomPositions(long rows, double fraction, long seed) {
@@ -222,11 +222,11 @@ public class TestDeviceMergeOnRead {
             (Double) r.getField("v1")
                 - (Double) r.getField("v2")
                 + (Double) r.getField("v3") * (Double) r.getField("v4");
-        double[] t =
+        double[] totals =
             expected.computeIfAbsent(
                 ImmutableList.of((long) (Integer) r.getField("k")), ignored -> new double[2]);
-        t[0] += value;
-        t[1] += 1;
+        totals[0] += value;
+        totals[1] += 1;
       }
     }
     try (DeviceMergeOnReadScan device =
@@ -366,9 +366,9 @@ public class TestDeviceMergeOnRead {
           Object value = r.getField(key);
           List<Object> group = Lists.newArrayList();
           group.add(value == null ? null : ((Number) value).longValue());
-          double[] t = expected.computeIfAbsent(group, ignored -> new double[2]);
-          t[0] += (Double) r.getField("v1");
-          t[1] += 1;
+          double[] totals = expected.computeIfAbsent(group, ignored -> new double[2]);
+          totals[0] += (Double) r.getField("v1");
+          totals[1] += 1;
         }
       }
       try (DeviceMergeOnReadScan device = DeviceMergeOnReadScan.of(table)) {
@@ -427,8 +427,8 @@ public class TestDeviceMergeOnRead {
     keys.add(new Object[] {null, 0}); // every row with a null id and k 0
     for (int j = 0; j < 5000; j++) {
       long id = random.nextInt(3) * 1_000_000L + random.nextInt(4000);
-      int k = random.nextBoolean() ? (int) ((id % 1_000_000L) % 7) : random.nextInt(7);
-      keys.add(new Object[] {id, k});
+      int kValue = random.nextBoolean() ? (int) ((id % 1_000_000L) % 7) : random.nextInt(7);
+      keys.add(new Object[] {id, kValue});
     }
     MorTables.deleteEqualRows(table, ImmutableList.of("id", "k"), keys);
     writeFiles(table, 0, 500); // after the deletes: (3, 3) survives here
@@ -547,6 +547,7 @@ public class TestDeviceMergeOnRead {
    * under position and equality deletes. A float filter runs on the device; a filter on the long
    * string column is refused, not compared cut.
    */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   @Test
   public void testFloatsTimestampsAndLongStrings() throws IOException {
     Schema schema =
@@ -1191,13 +1192,13 @@ public class TestDeviceMergeOnRead {
                             schema, fileSchema))
                 .build()) {
           for (Record record : records) {
-            byte[] z = zorder((Integer) record.getField("k"), (Double) record.getField("v1"));
+            byte[] zvalue = zorder((Integer) record.getField("k"), (Double) record.getField("v1"));
             if (previous != null) {
-              assertThat(java.util.Arrays.compareUnsigned(previous, z))
+              assertThat(java.util.Arrays.compareUnsigned(previous, zvalue))
                   .as("row %d of %s", checked, task.file().location())
                   .isLessThanOrEqualTo(0);
             }
-            previous = z;
+            previous = zvalue;
             checked++;
           }
         }
@@ -1372,10 +1373,10 @@ public class TestDeviceMergeOnRead {
     }
   }
 
-  private static byte[] zorder(int k, Double v1) {
+  private static byte[] zorder(int kValue, Double v1) {
     byte[] key =
         org.apache.iceberg.util.ZOrderByteUtils.intToOrderedBytes(
-                k, java.nio.ByteBuffer.allocate(8))
+                kValue, java.nio.ByteBuffer.allocate(8))
             .array()
             .clone();
     byte[] value =
@@ -1648,11 +1649,11 @@ public class TestDeviceMergeOnRead {
                 org.apache.datasketches.memory.Memory.wrap(
                     org.apache.iceberg.util.ByteBuffers.toByteArray(blob.second())));
         // The hash port: our hashes are the reference sketch's smallest ones.
-        java.util.TreeSet<Long> mine = new java.util.TreeSet<>();
+        java.util.NavigableSet<Long> mine = new java.util.TreeSet<>();
         for (org.apache.datasketches.theta.HashIterator it = ours.iterator(); it.next(); ) {
           mine.add(it.get());
         }
-        java.util.TreeSet<Long> theirs = new java.util.TreeSet<>();
+        java.util.NavigableSet<Long> theirs = new java.util.TreeSet<>();
         for (org.apache.datasketches.theta.HashIterator it =
                 reference.get(column).compact().iterator();
             it.next(); ) {
@@ -1697,8 +1698,9 @@ public class TestDeviceMergeOnRead {
     List<String> expectedRows = Lists.newArrayList();
     try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
       for (Record record : records) {
-        int k = (Integer) record.getField("k");
-        double[] totals = expectedByK.computeIfAbsent(k, ignored -> new double[1 + SUMS.length]);
+        int kValue = (Integer) record.getField("k");
+        double[] totals =
+            expectedByK.computeIfAbsent(kValue, ignored -> new double[1 + SUMS.length]);
         totals[0] += 1;
         for (int c = 0; c < SUMS.length; c++) {
           Object value = record.getField(SUMS[c]);
@@ -1707,7 +1709,7 @@ public class TestDeviceMergeOnRead {
         expectedAll[0] += 1;
         Object v1 = record.getField("v1");
         expectedAll[1] += v1 == null ? 0.0 : (Double) v1;
-        expectedRows.add(record.getField("id") + "/" + k + "/" + v1);
+        expectedRows.add(record.getField("id") + "/" + kValue + "/" + v1);
         if (record.getField("id") != null) {
           double[] byBucket =
               expectedByBucket.computeIfAbsent(

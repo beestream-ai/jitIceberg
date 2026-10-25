@@ -43,11 +43,11 @@ import org.apache.iceberg.tornadovm.MergeOnReadScan;
  * </pre>
  *
  * <p>Each named table is a v2 table of {@link GenerateTables} with equality deletes ({@code eq10k},
- * {@code eq1m}, {@code eq10m}). Its v3 twin {@code <table>_v3} holds the same data files and the
- * same equality-delete files, added in a later commit, so they apply exactly as they do in the v2
- * table; nothing is copied. A run converts the twin, checks with a CPU scan that the live rows and
- * their sums did not change, times a scan before and after, then rolls the twin back and deletes
- * the deletion vectors it wrote, so every run starts from the same equality deletes.
+ * {@code eq1m}, {@code eq10m}). Its v3 twin, named with {@code _v3} appended, holds the same data
+ * files and the same equality-delete files, added in a later commit, so they apply exactly as they
+ * do in the v2 table; nothing is copied. A run converts the twin, checks with a CPU scan that the
+ * live rows and their sums did not change, times a scan before and after, then rolls the twin back
+ * and deletes the deletion vectors it wrote, so every run starts from the same equality deletes.
  *
  * <p>Output, one CSV line a run: table, engine, run, warm-up, conversion ms, data files, equality
  * files removed, vectors, deleted rows, scan ms with equality deletes, scan ms with vectors.
@@ -59,6 +59,7 @@ public final class ConvertBench {
       (com.sun.management.OperatingSystemMXBean)
           java.lang.management.ManagementFactory.getOperatingSystemMXBean();
 
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
   public static void main(String[] args) throws Exception {
     String warehouse = args[0];
     String engine = args[1];

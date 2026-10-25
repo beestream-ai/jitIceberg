@@ -118,16 +118,16 @@ public final class DeviceProbe {
    * millions of rows, and boxed indices sorted by a comparator cost ~0.5 s a million).
    */
   private static int[] sortedOrder(long[] keys) {
-    int n = keys.length;
-    int[] order = new int[n];
-    int[] other = new int[n];
-    for (int i = 0; i < n; i++) {
+    int size = keys.length;
+    int[] order = new int[size];
+    int[] other = new int[size];
+    for (int i = 0; i < size; i++) {
       order[i] = i;
     }
-    for (int width = 1; width < n; width *= 2) {
-      for (int low = 0; low < n; low += 2 * width) {
-        int mid = Math.min(low + width, n);
-        int high = Math.min(low + 2 * width, n);
+    for (int width = 1; width < size; width *= 2) {
+      for (int low = 0; low < size; low += 2 * width) {
+        int mid = Math.min(low + width, size);
+        int high = Math.min(low + 2 * width, size);
         int left = low;
         int right = mid;
         for (int at = low; at < high; at++) {

@@ -30,10 +30,15 @@ import org.apache.iceberg.tornadovm.join.DeviceDimension;
 import org.apache.iceberg.tornadovm.join.StarAggregation;
 
 /**
- * Device time of a star aggregate by the shape of its joins: {@code StarProbe <table> <runs>
- * <value> <column:first:keys:keepEvery:codes>...}, a dimension on a fact column over keys {@code
- * first..first+keys-1} keeping every {@code keepEvery}-th key and grouping by {@code key % codes}
- * (no attribute when codes is 0).
+ * Device time of a star aggregate by the shape of its joins:
+ *
+ * <pre>
+ *   StarProbe &lt;table&gt; &lt;runs&gt; &lt;value&gt; &lt;column:first:keys:keepEvery:codes&gt;...
+ * </pre>
+ *
+ * <p>Each {@code column:first:keys:keepEvery:codes} is a dimension on a fact column over keys
+ * {@code first..first+keys-1} keeping every {@code keepEvery}-th key and grouping by {@code key %
+ * codes} (no attribute when codes is 0).
  */
 public final class StarProbe {
   private StarProbe() {}
@@ -42,18 +47,18 @@ public final class StarProbe {
     List<DeviceDimension> dimensions = Lists.newArrayList();
     List<DeviceDimension.Key> keys = Lists.newArrayList();
     for (int a = 3; a < args.length; a++) {
-      List<String> p = Splitter.on(':').splitToList(args[a]);
-      int first = Integer.parseInt(p.get(1));
-      int count = Integer.parseInt(p.get(2));
-      int every = Integer.parseInt(p.get(3));
-      int codes = Integer.parseInt(p.get(4));
+      List<String> parts = Splitter.on(':').splitToList(args[a]);
+      int first = Integer.parseInt(parts.get(1));
+      int count = Integer.parseInt(parts.get(2));
+      int every = Integer.parseInt(parts.get(3));
+      int codes = Integer.parseInt(parts.get(4));
       boolean[] keep = new boolean[count];
       int[] code = new int[count];
       for (int k = 0; k < count; k++) {
         keep[k] = k % every == 0;
         code[k] = codes == 0 ? 0 : k % codes;
       }
-      DeviceDimension dimension = DeviceDimension.of(p.get(0), first, keep);
+      DeviceDimension dimension = DeviceDimension.of(parts.get(0), first, keep);
       if (codes > 0) {
         keys.add(DeviceDimension.Key.attribute(dimensions.size(), 0));
         dimension = dimension.withAttribute(code);

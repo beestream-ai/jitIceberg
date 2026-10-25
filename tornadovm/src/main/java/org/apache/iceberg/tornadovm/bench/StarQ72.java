@@ -21,9 +21,7 @@ package org.apache.iceberg.tornadovm.bench;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
-import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -34,6 +32,8 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.tornadovm.CpuMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceMergeOnReadScan;
 import org.apache.iceberg.tornadovm.DeviceValue;
@@ -79,7 +79,7 @@ public final class StarQ72 {
   /** A dimension's rows as maps of key to the named columns. */
   private static Map<Long, Record> rows(String warehouse, String table, String... columns)
       throws java.io.IOException {
-    Map<Long, Record> rows = new HashMap<>();
+    Map<Long, Record> rows = Maps.newHashMap();
     try (CloseableIterable<Record> records =
         IcebergGenerics.read(MorTables.load(warehouse + "/" + table)).select(columns).build()) {
       for (Record r : records) {
@@ -101,6 +101,7 @@ public final class StarQ72 {
     return DeviceDimension.of(factColumn, (int) first, kept);
   }
 
+  @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:MethodLength"})
   public static void main(String[] args) throws Exception {
     String warehouse = args[0];
     int runs = Integer.parseInt(args[1]);
@@ -154,12 +155,12 @@ public final class StarQ72 {
 
         // Build rows: (item, week) and the quantity, once a sale shipped more than 5 days after.
         long firstWeek = Long.MAX_VALUE;
-        List<long[]> build = new ArrayList<>();
+        List<long[]> build = Lists.newArrayList();
         for (Map.Entry<List<Object>, double[]> e : sold.groups().entrySet()) {
-          List<Object> k = e.getKey();
-          Record d1 = dates.get(((Number) k.get(1)).longValue());
-          Record d3 = dates.get(((Number) k.get(2)).longValue());
-          if (k.get(3) == null || !day(d3).isAfter(day(d1).plusDays(5))) {
+          List<Object> key = e.getKey();
+          Record d1 = dates.get(((Number) key.get(1)).longValue());
+          Record d3 = dates.get(((Number) key.get(2)).longValue());
+          if (key.get(3) == null || !day(d3).isAfter(day(d1).plusDays(5))) {
             continue;
           }
           long week = number(d1, "d_week_seq");
@@ -167,7 +168,7 @@ public final class StarQ72 {
           for (int n = 0; n < (int) e.getValue()[1]; n++) {
             build.add(
                 new long[] {
-                  ((Number) k.get(0)).longValue(), week, ((Number) k.get(3)).longValue()
+                  ((Number) key.get(0)).longValue(), week, ((Number) key.get(3)).longValue()
                 });
           }
         }
@@ -195,19 +196,19 @@ public final class StarQ72 {
                 "inv_date_sk",
                 dates,
                 r -> {
-                  long w = number(r, "d_week_seq");
-                  return w >= lowWeek && w <= highWeek;
+                  long week = number(r, "d_week_seq");
+                  return week >= lowWeek && week <= highWeek;
                 });
         int[] weekCodes =
             codes(
                 dates,
                 r -> {
-                  long w = number(r, "d_week_seq");
-                  return (int) (w >= lowWeek && w <= highWeek ? w - lowWeek : 0);
+                  long week = number(r, "d_week_seq");
+                  return (int) (week >= lowWeek && week <= highWeek ? week - lowWeek : 0);
                 });
-        List<String> descs = new ArrayList<>();
+        List<String> descs = Lists.newArrayList();
         int[] descCodes = dictionary(items, "i_item_desc", descs);
-        List<String> names = new ArrayList<>();
+        List<String> names = Lists.newArrayList();
         int[] nameCodes = dictionary(warehouses, "w_warehouse_name", names);
         GroupedAggregate counts =
             star(
@@ -229,15 +230,15 @@ public final class StarQ72 {
                 ImmutableList.of());
         long t4 = System.nanoTime();
 
-        List<Object[]> result = new ArrayList<>();
+        List<Object[]> result = Lists.newArrayList();
         for (Map.Entry<List<Object>, double[]> e : counts.groups().entrySet()) {
-          List<Object> k = e.getKey();
+          List<Object> key = e.getKey();
           long total = (long) e.getValue()[1];
           result.add(
               new Object[] {
-                descs.get(((Number) k.get(0)).intValue()),
-                names.get(((Number) k.get(1)).intValue()),
-                ((Number) k.get(2)).longValue() + lowWeek,
+                descs.get(((Number) key.get(0)).intValue()),
+                names.get(((Number) key.get(1)).intValue()),
+                ((Number) key.get(2)).longValue() + lowWeek,
                 total
               });
         }
@@ -245,11 +246,11 @@ public final class StarQ72 {
             Comparator.nullsFirst((a, b) -> ((Comparable) a).compareTo(b));
         result.sort(
             (a, b) -> {
-              int c = Long.compare((Long) b[3], (Long) a[3]);
-              for (int i = 0; c == 0 && i < 3; i++) {
-                c = nullsFirst.compare(a[i], b[i]);
+              int cmp = Long.compare((Long) b[3], (Long) a[3]);
+              for (int i = 0; cmp == 0 && i < 3; i++) {
+                cmp = nullsFirst.compare(a[i], b[i]);
               }
-              return c;
+              return cmp;
             });
         long t5 = System.nanoTime();
         System.out.printf(
@@ -284,13 +285,13 @@ public final class StarQ72 {
     }
   }
 
-  private static long number(Record r, String column) {
-    Object v = r.getField(column);
-    return v == null ? Long.MIN_VALUE : ((Number) v).longValue();
+  private static long number(Record record, String column) {
+    Object value = record.getField(column);
+    return value == null ? Long.MIN_VALUE : ((Number) value).longValue();
   }
 
-  private static LocalDate day(Record r) {
-    return (LocalDate) r.getField("d_date");
+  private static LocalDate day(Record record) {
+    return (LocalDate) record.getField("d_date");
   }
 
   /** A code a key from 0, over the rows' key range. */
@@ -305,7 +306,7 @@ public final class StarQ72 {
 
   /** Dictionary codes of a string column, its values in {@code values}. */
   private static int[] dictionary(Map<Long, Record> rows, String column, List<String> values) {
-    Map<String, Integer> index = new HashMap<>();
+    Map<String, Integer> index = Maps.newHashMap();
     return codes(
         rows,
         r ->
