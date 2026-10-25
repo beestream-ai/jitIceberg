@@ -67,7 +67,7 @@ public final class TpcdsBench {
             long snapshot = table.currentSnapshot().snapshotId();
             long cpu = PROCESS.getProcessCpuTime();
             long start = System.nanoTime();
-            String detail =
+            String operationDetail =
                 switch (operation) {
                   case "agg" -> {
                     answer = sales(table, device);
@@ -95,8 +95,10 @@ public final class TpcdsBench {
                 };
             double millis = (System.nanoTime() - start) / 1e6;
             double cpuSeconds = (PROCESS.getProcessCpuTime() - cpu) / 1e9;
+            String detail = operationDetail;
             if (!"agg".equals(operation)) {
               table.refresh();
+              detail += String.format(Locale.ROOT, ", %.2f GB written", writtenBytes(table) / 1e9);
               double[] after = sales(table, device);
               if (after[0] != answer[0] || Math.abs(after[1] - answer[1]) > 1e-6 * answer[1]) {
                 throw new IllegalStateException(
@@ -151,6 +153,18 @@ public final class TpcdsBench {
       }
     }
     return new double[] {result.rows(), checksum};
+  }
+
+  /** The bytes of the files the current snapshot added. */
+  private static long writtenBytes(Table table) {
+    long bytes = 0;
+    for (DataFile file : table.currentSnapshot().addedDataFiles(table.io())) {
+      bytes += file.fileSizeInBytes();
+    }
+    for (DeleteFile file : table.currentSnapshot().addedDeleteFiles(table.io())) {
+      bytes += file.fileSizeInBytes();
+    }
+    return bytes;
   }
 
   /** Back to the snapshot before the run; the files the run wrote are deleted. */

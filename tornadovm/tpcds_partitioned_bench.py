@@ -72,6 +72,8 @@ for name in tables:
                 raise SystemExit(f"{name}: {operation} changed the answer: {after} vs {answer}")
             added = [r[0] for r in spark.sql(f"SELECT file_path FROM {table}.all_files").collect()
                      if r[0] not in before]
+            written = sum(os.path.getsize(p[len("file:"):] if p.startswith("file:") else p) for p in added)
+            detail += f", {written / 1e9:.2f} GB written"
             spark.sql(f"CALL local.system.set_current_snapshot('{namespace}.{name}', {snapshot})").collect()
             for path in added:
                 local = path[len("file:"):] if path.startswith("file:") else path
