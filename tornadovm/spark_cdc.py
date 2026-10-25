@@ -47,7 +47,7 @@ for mode in modes:
     for r in range(1, rounds + 1):
         # The same ids in both modes: a seeded sample of existing ids, new values. MERGE needs a
         # deterministic source, so the new values are hashes of (id, round), not rand().
-        values = ", ".join(f"pmod(hash(id, {r}, {j}), 1000000) / 1000000.0 AS v{j}" for j in range(1, 5))
+        values = ", ".join(f"CAST(pmod(hash(id, {r}, {j}), 1000000) AS DOUBLE) / 1e6 AS v{j}" for j in range(1, 5))
         spark.sql(
             f"SELECT id, k, {values} FROM {source} WHERE pmod(hash(id, {r}), {rows}) < {upserts}"
         ).createOrReplaceTempView("updates")
