@@ -19,12 +19,16 @@
 # MorBench's Q1 (count + sum) and Q2 (grouped sums) through DuckDB's Iceberg extension, on the
 # benchmark tables with their deletes applied by DuckDB: a CPU engine baseline. One CSV line a run,
 # with live rows and a checksum to compare against MorBench; a run past the time limit is reported
-# as a timeout and the table's remaining runs are skipped.
+# as a timeout, a run whose process dies (DuckDB out of memory) as failed with its exit code, and in
+# either case the table's remaining runs are skipped. DUCKDB_MEMORY caps DuckDB's own memory limit, so
+# that it spills or fails cleanly before the operating system kills it.
 #
-#   python3 duckdb_bench.py <warehouse> <runs> <table>...    [DUCKDB_THREADS=n] [DUCKDB_TIMEOUT_S=600]
+#   python3 duckdb_bench.py <warehouse> <runs> <table>...
+#       [DUCKDB_THREADS=n] [DUCKDB_TIMEOUT_S=600] [DUCKDB_MEMORY=40GB]
 import glob
 import multiprocessing
 import os
+import queue
 import sys
 import time
 
@@ -38,10 +42,15 @@ def run(meta, sql, threads, out):
     import duckdb
     con = duckdb.connect()
     con.execute(f"SET threads={threads}")
+    con.execute(f"SET memory_limit='{os.environ.get('DUCKDB_MEMORY', '40GB')}'")
     con.execute("LOAD iceberg")
     con.execute(f"CREATE VIEW t AS SELECT * FROM iceberg_scan('{meta}')")
     start = time.perf_counter()
-    rows = con.execute(sql).fetchall()
+    try:
+        rows = con.execute(sql).fetchall()
+    except duckdb.Error as e:
+        out.put(("error", type(e).__name__ + ": " + str(e).splitlines()[0]))
+        return
     ms = (time.perf_counter() - start) * 1000
     live = sum(r[1] if len(r) > 2 else r[0] for r in rows)
     checksum = sum(sum(float(x or 0) for x in (r[2:] if len(r) > 2 else r[1:])) for r in rows)
@@ -67,7 +76,15 @@ def main():
                     proc.join()
                     print(f"{table},duckdb,{query},{r},{'yes' if r == 0 else 'no'},timeout>{limit:.0f}s,,", flush=True)
                     break
-                ms, live, checksum = out.get()
+                try:
+                    result = out.get(timeout=10)
+                except queue.Empty:
+                    result = ("died", f"exit code {proc.exitcode}")
+                if isinstance(result[0], str):
+                    detail = result[1].replace(",", ";").replace('"', "'")
+                    print(f"{table},duckdb,{query},{r},{'yes' if r == 0 else 'no'},failed,,,\"{result[0]}: {detail}\"", flush=True)
+                    break
+                ms, live, checksum = result
                 print(f"{table},duckdb,{query},{r},{'yes' if r == 0 else 'no'},{ms:.1f},{live},{checksum:.6e}", flush=True)
 
 
