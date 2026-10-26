@@ -22,7 +22,10 @@
 # UPDATE, keyed by ticket or order number so that every data file carries position deletes (and,
 # for updates, the rewritten rows in new files).
 #
+# With FORMAT_VERSION=3 the tables are version 3, so the same DELETE and UPDATE write deletion vectors.
+#
 #   BENCH_SCRIPT=tpcds_setup.py run.sh spark <warehouse>/<namespace> <parquet dir: a directory a table>
+#       [FORMAT_VERSION=2]
 import os
 import sys
 
@@ -32,7 +35,8 @@ warehouse, source = sys.argv[1:3]
 namespace = os.path.basename(warehouse.rstrip("/"))
 spark = SparkSession.builder.appName("tpcds-setup").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
-props = ("'format-version'='2','write.delete.mode'='merge-on-read','write.update.mode'='merge-on-read',"
+version = os.environ.get("FORMAT_VERSION", "2")
+props = (f"'format-version'='{version}','write.delete.mode'='merge-on-read','write.update.mode'='merge-on-read',"
          "'write.merge.mode'='merge-on-read','write.target-file-size-bytes'='134217728',"
          "'write.parquet.compression-codec'='zstd'")
 spark.sql(f"CREATE NAMESPACE IF NOT EXISTS local.{namespace}")
