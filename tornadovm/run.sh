@@ -94,7 +94,7 @@ case "$mode" in
     spark)
         : "${SPARK_HOME:?set SPARK_HOME}"; : "${ICEBERG_SPARK_JAR:?set ICEBERG_SPARK_JAR}"
         exec "$SPARK_HOME/bin/spark-submit" --master "local[${THREADS:-$(nproc)}]" \
-            --driver-memory "$HEAP" --jars "$ICEBERG_SPARK_JAR" \
+            --driver-memory "$HEAP" --jars "$ICEBERG_SPARK_JAR" ${SPARK_CONF:-} \
             --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
             --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
             --conf spark.sql.catalog.local.type=hadoop \
