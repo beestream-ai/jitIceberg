@@ -145,8 +145,8 @@ The benchmarks print each answer's row count and checksum, and every engine must
 
 1. **libcudf** from NVIDIA's wheels (about 1.3 GB, once; no conda): `source tornadovm/cudf-env.sh`.
    `CUDF_PACKAGE=libcudf-cu13` selects the CUDA 13 build.
-2. **TornadoVM 7.3.1 or later with the cuDF shim**: the released CUDA SDK
-   (`tornadovm-7.3.1-jdk21-cuda-linux-amd64`), whose native libraries need glibc 2.38
+2. **TornadoVM 8.0.0 or later with the cuDF shim**: the released CUDA SDK
+   (`tornadovm-8.0.0-jdk21-cuda-linux-amd64`, also `sdk install tornadovm 8.0.0-jdk21-cuda`), whose native libraries need glibc 2.38
    (beehive-lab/TornadoVM#1282, fix in #1283), or, on older systems, built from source:
    ```bash
    make BACKEND=cuda && source setvars.sh      # with CUDF_HOME from step 1; JDK 21
