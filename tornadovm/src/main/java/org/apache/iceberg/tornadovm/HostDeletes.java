@@ -461,10 +461,15 @@ final class HostDeletes {
     return LocalFiles.path(location, table.io());
   }
 
-  /** Where the file stores the projected columns, -1 for one it lacks: what a batch must share. */
+  /**
+   * Where the file stores the projected columns, -1 for one it lacks, and how many columns it has:
+   * what a batch must share. cuDF reads several files as one source only when they have the same
+   * number of columns, and a version-3 table's updated files carry the row-lineage columns too.
+   */
   String columnLayout(FileScanTask task) {
     String location = task.file().location();
-    return Arrays.toString(layout.parquetColumns(footerSchema(localPath(location)), location));
+    MessageType footer = footerSchema(localPath(location));
+    return Arrays.toString(layout.parquetColumns(footer, location)) + "/" + footer.getFieldCount();
   }
 
   /** One data file. */
