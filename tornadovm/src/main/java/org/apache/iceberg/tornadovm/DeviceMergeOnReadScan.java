@@ -147,6 +147,10 @@ public final class DeviceMergeOnReadScan implements MergeOnReadScan, AutoCloseab
 
   private static final Logger LOG = LoggerFactory.getLogger(DeviceMergeOnReadScan.class);
 
+  static {
+    TornadoStart.ensureStarted();
+  }
+
   private static final boolean DEBUG = Boolean.getBoolean("iceberg.tornadovm.debug");
 
   /**
