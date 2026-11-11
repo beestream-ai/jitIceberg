@@ -17,7 +17,7 @@
   - under the License.
   -->
 
-# Iceberg on the GPU for Spark 3.5
+# Iceberg on the GPU for Spark 4.2
 
 This module plugs the GPU merge-on-read scan of `iceberg-tornadovm` (TornadoVM + cuDF, NVIDIA GPUs
 only) into unmodified Spark SQL. It does three things, and in each case anything it cannot do
@@ -25,9 +25,14 @@ exactly is left to Spark:
 
 | What | How it hooks in | When it is used |
 |---|---|---|
-| **Reads**: a Spark task's data files are read on the GPU with their position, deletion-vector and equality deletes applied and Spark's pushed filters evaluated, and come back as `ColumnarBatch`es | `ColumnarReaderProvider`, a ServiceLoader SPI in Iceberg's Spark module | Parquet files read whole; columns are int, bigint, float, double, date, timestamp, string or decimal up to 18 digits, and at least one is not a string; a task of at least `spark.iceberg.gpu.minRows` rows |
+| **Reads**: a Spark task's data files are read on the GPU with their position, deletion-vector and equality deletes applied and Spark's pushed filters evaluated, and come back as `ColumnarBatch`es | `PartitionReaderFactoryProvider` (`spark.sql.iceberg.partition-reader-factory-provider=tornadovm`) | Parquet files read whole; columns are int, bigint, float, double, date, timestamp, string or decimal up to 18 digits, and at least one is not a string; a task of at least `spark.iceberg.gpu.minRows` rows |
 | **Grouped aggregates**: an `Aggregate` over filters and projections of one Iceberg table runs as a single GPU scan, and only the groups come back | planner strategy (`GpuAggregateExtensions`) | SUM / AVG / COUNT of products of double columns and `1 - c` / `1 + c`; integer and decimal sums the files' bounds prove exact; up to 4 group columns or Iceberg's `bucket(n, bigint)`; value columns null-free by metrics |
-| **Compaction**: `rewrite_data_files` (bin-pack) rewrites each file group on the GPU, and Iceberg's action plans and commits as usual | `FileRewriteRunnerProvider`, a ServiceLoader SPI in Iceberg's Spark module | unsorted tables, partitioned or not (one partition spec), whose columns are int, bigint, float, double, date, timestamp, string or decimal up to 18 digits |
+| **Compaction**: `rewrite_data_files` (bin-pack) rewrites each file group on the GPU, and Iceberg's action plans and commits as usual | `FileRewriteRunnerProvider` (`spark.sql.iceberg.rewrite-runner-provider=tornadovm`) | unsorted tables, partitioned or not (one partition spec), whose columns are int, bigint, float, double, date, timestamp, string or decimal up to 18 digits |
+
+The two providers are the engine-neutral extension points this branch adds to Iceberg's Spark 4.2
+module (commit "Spark 4.2: Add pluggable partition reader factory and rewrite runner providers",
+proposed to Apache Iceberg). Both are off unless a provider is named, and this module is the
+provider called `tornadovm`; `spark-submit-gpu` names it.
 
 All three work on tables on local disk or on an object store (S3, GCS, ADLS: anything Iceberg's
 `FileIO` reads), with merge-on-read deletes of every kind, and on evolved schemas: columns added
@@ -63,12 +68,11 @@ readers (`spark.iceberg.gpu.scanLog`, `tornadovm/scanfit.py`) showed why:
 
 ## Requirements
 
-- An NVIDIA GPU (compute capability 7.0 or newer), CUDA 12 driver, Linux x86_64.
+- An NVIDIA GPU (compute capability 7.0 or newer), CUDA 13 driver, Linux x86_64.
 - JDK 21. The device scan uses Java's foreign-memory API, which needs `--enable-preview` on 21.
-- Spark 3.5 (Scala 2.12), **local mode**: the GPU work runs in the driver JVM.
-- libcudf 26.08 and a TornadoVM SDK built with the cuDF shim, including TornadoVM #1215
-  (decimals), #1219 (cuDF's memory pool gives memory back), #1220 (evolved schemas) and #1221
-  (strings in compaction). The steps are in [../README.md](../README.md#set-up).
+- Spark 4.2 (Scala 2.13), **local mode**: the GPU work runs in the driver JVM.
+- TornadoVM 8.1.0 (`sdk install tornadovm 8.1.0-jdk21-cuda`) and libcudf 26.08 with the CUDA 13
+  runtime (`source tornadovm/cudf-env.sh`): the steps are in [../README.md](../README.md#set-up).
 
 Check all of it, and whether your tables qualify, with:
 
@@ -76,11 +80,39 @@ Check all of it, and whether your tables qualify, with:
 tornadovm/preflight.sh /data/wh/db/sales        # table directories are optional
 ```
 
+## Quick start
+
+```bash
+# Set up as in ../README.md (TORNADOVM_HOME, JAVA_HOME, source tornadovm/cudf-env.sh), then:
+export SPARK_HOME=/opt/spark-4.2.1-bin-hadoop3   # https://spark.apache.org/downloads.html
+./gradlew -DsparkVersions=4.2 :iceberg-tornadovm-spark:sparkGpuBundle
+tornadovm/spark/build/spark-gpu/bin/spark-submit-gpu --driver-memory 16g \
+    tornadovm/spark/examples/quickstart.py /tmp/quickstart-wh
+```
+
+[examples/quickstart.py](examples/quickstart.py) creates a v3 merge-on-read table of 20M rows,
+deletes every 20th row (deletion vectors), runs a grouped aggregate on the GPU and on Spark's CPU
+path and compares the answers, then compacts the table with `rewrite_data_files`. On an RTX 4090:
+
+```
+aggregate: GPU 0.09 s (on the GPU: True), Spark 0.21 s, same answer: True
+... INFO GpuFileRewriteRunnerProvider: Rewriting local.db.sales on the GPU
+... Rewriting 8 files (GPU-BIN-PACK, file group 1/1) in local.db.sales
+compaction: 0.54 s
+rows after compaction: 19000000 (expected 19000000)
+```
+
+In your own job, nothing changes but the launcher: run it with `spark-submit-gpu` instead of
+`spark-submit`. Queries, `CALL ... rewrite_data_files` and the catalog configuration stay as they
+are, and whatever the GPU cannot do exactly runs on Spark. To see what ran where, look for
+`GpuIcebergAggregate` in a query's executed plan, `GPU-BIN-PACK` in compaction logs, and set
+`spark.iceberg.gpu.scanLog` for reads.
+
 ## Build and run
 
 ```
 export TORNADOVM_HOME=...        # the SDK above
-./gradlew -DsparkVersions=3.5 :iceberg-tornadovm-spark:sparkGpuBundle
+./gradlew -DsparkVersions=4.2 :iceberg-tornadovm-spark:sparkGpuBundle
 build=tornadovm/spark/build/spark-gpu
 SPARK_HOME=... $build/bin/spark-submit-gpu --driver-memory 24g my_job.py
 ```

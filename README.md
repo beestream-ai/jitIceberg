@@ -26,6 +26,29 @@ Iceberg is a high-performance format for huge analytic tables. Iceberg brings th
 
 Background and documentation is available at <https://iceberg.apache.org>
 
+## Iceberg on the GPU (this branch)
+
+This branch is Apache Iceberg's `main` plus Iceberg's per-row work on an NVIDIA GPU through
+[TornadoVM](https://github.com/beehive-lab/TornadoVM) and [cuDF](https://github.com/rapidsai/cudf):
+merge-on-read scans with every kind of delete, compaction, equality deletes converted to deletion
+vectors, and, in Spark 4.2, reads, grouped aggregates and `rewrite_data_files` on the GPU. It adds:
+
+| Where | What |
+|---|---|
+| [`tornadovm/`](tornadovm/README.md) | `iceberg-tornadovm`: the GPU library on Iceberg's public APIs, with set-up and a quick start |
+| [`tornadovm/spark/`](tornadovm/spark/README.md) | `iceberg-tornadovm-spark`: Spark 4.2 on the GPU, `spark-submit-gpu` and a runnable example |
+| `spark/v4.2` | two engine-neutral extension points the Spark integration plugs into (proposed to Apache Iceberg): `PartitionReaderFactoryProvider` and `FileRewriteRunnerProvider` |
+
+In short, with an NVIDIA GPU, JDK 21 and SDKMAN:
+
+```bash
+sdk install tornadovm 8.1.0-jdk21-cuda
+export TORNADOVM_HOME=~/.sdkman/candidates/tornadovm/8.1.0-jdk21-cuda
+source tornadovm/cudf-env.sh          # libcudf + CUDA 13 runtime from NVIDIA's wheels
+tornadovm/preflight.sh                # checks everything
+./gradlew :iceberg-tornadovm:test
+```
+
 
 ## Status
 

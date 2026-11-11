@@ -143,19 +143,56 @@ The benchmarks print each answer's row count and checksum, and every engine must
 
 ## Set up
 
-1. **libcudf** from NVIDIA's wheels (about 1.3 GB, once; no conda): `source tornadovm/cudf-env.sh`.
-   `CUDF_PACKAGE=libcudf-cu13` selects the CUDA 13 build.
-2. **TornadoVM 8.0.0 or later with the cuDF shim**: the released CUDA SDK
-   (`tornadovm-8.0.0-jdk21-cuda-linux-amd64`, also `sdk install tornadovm 8.0.0-jdk21-cuda`), whose native libraries need glibc 2.38
-   (beehive-lab/TornadoVM#1282, fix in #1283), or, on older systems, built from source:
-   ```bash
-   make BACKEND=cuda && source setvars.sh      # with CUDF_HOME from step 1; JDK 21
-   ```
-3. **Check** the JDK, SDK, shim, libcudf and GPU: `tornadovm/preflight.sh` (OK / WARN / FAIL a
-   line).
+You need an NVIDIA GPU (compute capability 7.0+) with a CUDA 13 driver, Linux x86_64 with glibc
+2.34 or newer, JDK 21 and Python 3 (only to unpack NVIDIA's wheels).
 
-The module is part of the build only when `TORNADOVM_HOME` is set. Run `./gradlew
-:iceberg-tornadovm:test`, then the benchmarks:
+```bash
+# 1. JDK 21 and TornadoVM 8.1.0 (the CUDA SDK ships the cuDF shim)
+sdk install java 21.0.2-open
+sdk install tornadovm 8.1.0-jdk21-cuda
+export JAVA_HOME=~/.sdkman/candidates/java/21.0.2-open
+export TORNADOVM_HOME=~/.sdkman/candidates/tornadovm/8.1.0-jdk21-cuda
+
+# 2. libcudf 26.08 and the CUDA 13 runtime from NVIDIA's wheels (about 1.5 GB, once; no conda,
+#    no CUDA toolkit). Sets CUDF_HOME, RMM_HOME and LD_LIBRARY_PATH; source it in every shell.
+source tornadovm/cudf-env.sh
+
+# 3. Check the JDK, SDK, shim, libcudf and GPU (OK / WARN / FAIL a line)
+tornadovm/preflight.sh
+```
+
+Without SDKMAN, unpack `tornadovm-8.1.0-jdk21-cuda-linux-amd64.tar.gz` from TornadoVM's release
+page and point `TORNADOVM_HOME` at it. A TornadoVM built from source against CUDA 12 works too
+(`make BACKEND=cuda` with `CUDF_HOME` set), with `CUDF_PACKAGE=libcudf-cu12 source
+tornadovm/cudf-env.sh`.
+
+## Quick start
+
+The module is part of the build only when `TORNADOVM_HOME` is set.
+
+```bash
+./gradlew :iceberg-tornadovm:test                     # 38 tests, each checked against Iceberg's reader
+
+tornadovm/run.sh gen /tmp/wh 4 1000000                # 4M rows, one table per delete layout
+tornadovm/run.sh gpu /tmp/wh q2 3 none pos05 dv05 eq1m
+```
+
+`run.sh gpu` prints one CSV line a run: the table, the query, the time, the live rows and a
+checksum (`run.sh cpu` runs the CPU twin, which must print the same answers):
+
+```
+table,engine,query,run,warmup,millis,live_rows,checksum,breakdown,cpu_seconds
+pos05,gpu,q2,1,no,32.4,3801069,7.604363e+06,"total 32.2 ms | plan 4.5, ...
+eq1m,gpu,q2,1,no,24.2,3115737,6.233407e+06,"total 24.0 ms | plan 3.4, ...
+```
+
+From your own Java code, put `iceberg-tornadovm` on the class path, start the JVM with TornadoVM's
+argfile (`@$TORNADOVM_HOME/tornado-argfile`, or its `tornado-argfile.template` with
+`${TORNADOVM_HOME}` expanded) and `--enable-native-access=ALL-UNNAMED`, and use
+`DeviceMergeOnReadScan` as in [What it does](#what-it-does). For Spark SQL, see
+[spark/README.md](spark/README.md).
+
+The benchmarks at full size (100M rows a table) and the maintenance operations:
 
 ```bash
 tornadovm/run.sh gen /data/wh 64 1562500                    # 100M rows, a table per delete layout
