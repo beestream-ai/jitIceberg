@@ -114,5 +114,8 @@ configure(jmhProjects) {
     tasks.matching { it.name == 'jmhRunBytecodeGenerator' }.configureEach {
       jvmArgs.add('--enable-preview')
     }
+  } else if (project.name.startsWith('iceberg-spark-4.2_')) {
+    // Without the GPU module (no TORNADOVM_HOME), its benchmarks are left out.
+    sourceSets.jmh.java.exclude '**/*GpuBenchmark.java'
   }
 }
