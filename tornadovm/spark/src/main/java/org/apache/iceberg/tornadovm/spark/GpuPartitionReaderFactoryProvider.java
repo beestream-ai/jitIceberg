@@ -116,7 +116,7 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
             reader(
                 iceberg.table(),
                 group,
-                iceberg.expectedSchema(),
+                iceberg.projection(),
                 iceberg.isCaseSensitive(),
                 () -> delegate.createColumnarReader(partition));
         return ScanLog.timed(
@@ -124,7 +124,7 @@ public class GpuPartitionReaderFactoryProvider implements PartitionReaderFactory
             reader != null ? "gpu" : "cpu",
             iceberg.table(),
             group,
-            iceberg.expectedSchema());
+            iceberg.projection());
       }
       return delegate.createColumnarReader(partition);
     }

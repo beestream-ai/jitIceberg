@@ -25,8 +25,8 @@ import org.apache.iceberg.tornadovm.join.StarAggregation.ProbeSum
 import org.apache.iceberg.tornadovm.DeviceValue
 import org.apache.iceberg.tornadovm.spark.GpuAggregates
 import org.apache.iceberg.types.Type.TypeID
-import org.apache.spark.sql.Dataset
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.classic.Dataset
+import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Left => _, Right => _, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression

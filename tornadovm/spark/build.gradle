@@ -17,11 +17,13 @@
  * under the License.
  */
 
-// Spark 3.5 reads of Iceberg tables on the GPU: a ColumnarReaderProvider that hands a Spark task's
-// files to the merge-on-read scan in :iceberg-tornadovm. Java 21 with preview, as that module.
+// Spark 4.2 on the GPU: reads through Spark 4.2's PartitionReaderFactoryProvider, rewrites through its
+// FileRewriteRunnerProvider, both handing files to the merge-on-read scan in :iceberg-tornadovm. Java 21
+// with preview, as that module.
 
 def tornadoHome = System.getenv('TORNADOVM_HOME')
-def scalaVersion = System.getProperty("scalaVersion") != null ? System.getProperty("scalaVersion") : System.getProperty("defaultScalaVersion")
+// Spark 4 is built for Scala 2.13 only.
+def scalaVersion = '2.13'
 def tornadoApi = fileTree("${tornadoHome}/share/java/tornado") {
   include 'tornado-api-*.jar'
   include 'tornado-cudf-*.jar'
@@ -54,13 +56,13 @@ dependencies {
   implementation project(':iceberg-api')
   implementation project(':iceberg-core')
   implementation project(':iceberg-tornadovm')
-  implementation project(":iceberg-spark:iceberg-spark-3.5_${scalaVersion}")
+  implementation project(":iceberg-spark:iceberg-spark-4.2_${scalaVersion}")
   // CALL system.rewrite_data_files and the other procedures, for spark-submit-gpu
-  runtimeOnly(project(":iceberg-spark:iceberg-spark-extensions-3.5_${scalaVersion}")) {
+  runtimeOnly(project(":iceberg-spark:iceberg-spark-extensions-4.2_${scalaVersion}")) {
     transitive = false
   }
 
-  compileOnly("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark35.get()}") {
+  compileOnly("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark42.get()}") {
     exclude group: 'org.apache.avro', module: 'avro'
     exclude group: 'org.apache.arrow'
     exclude group: 'org.apache.parquet'
@@ -68,7 +70,7 @@ dependencies {
   }
   compileOnly tornadoApi
 
-  testImplementation("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark35.get()}") {
+  testImplementation("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark42.get()}") {
     exclude group: 'org.apache.avro', module: 'avro'
     exclude group: 'org.apache.arrow'
     exclude group: 'org.apache.parquet'
@@ -94,7 +96,12 @@ tasks.register('tornadoModules') {
     file("${tornadoHome}/share/java/tornado").listFiles().findAll {
       it.name.endsWith('.jar') && !(it.name ==~ /(jmh-core|jopt-simple|junit|hamcrest|log4j-|commons-lang3|tornado-benchmarks|tornado-unittests|tornado-examples).*/)
     }.each { java.nio.file.Files.createSymbolicLink(new File(dir, it.name).toPath(), it.toPath()) }
-    tornadoArgfile.get().asFile.text = file("${tornadoHome}/tornado-argfile").text
+    // SDKMAN installs ship only the argfile's template, with ${TORNADOVM_HOME} to expand.
+    def sdkArgfile = file("${tornadoHome}/tornado-argfile")
+    def text = sdkArgfile.exists()
+        ? sdkArgfile.text
+        : file("${tornadoHome}/tornado-argfile.template").text.replace('${TORNADOVM_HOME}', tornadoHome)
+    tornadoArgfile.get().asFile.text = text
         .replace("--module-path .:${tornadoHome}/share/java/tornado", "--module-path ${dir}")
   }
 }
@@ -121,7 +128,7 @@ tasks.register('printSparkClasspath') {
 }
 
 // A ready-to-use directory for spark-submit: build/spark-gpu/{jars, tornado-modules, tornado-argfile,
-// bin/spark-submit-gpu}. The jars are this module's runtime class path less what a Spark 3.5
+// bin/spark-submit-gpu}. The jars are this module's runtime class path less what a Spark 4.2
 // distribution already ships (Hadoop, Jackson, Netty, Guava, logging, commons, ...); Iceberg's
 // modules and the Parquet, Avro, Arrow and ORC versions they need stay, ahead of Spark's.
 def sparkProvided = [

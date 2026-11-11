@@ -25,10 +25,10 @@
 #   spark-submit-gpu --driver-memory 24g [--conf ...] app.py|--class ... app.jar
 #   SPARK_MASTER=spark://host:7077 spark-submit-gpu ...    (cluster: one executor per GPU)
 #
-# Needs SPARK_HOME (Spark 3.5, Scala 2.12), JAVA_HOME (JDK 21), and libcudf and TornadoVM's native
+# Needs SPARK_HOME (Spark 4.2, Scala 2.13), JAVA_HOME (JDK 21), and libcudf and TornadoVM's native
 # libraries on LD_LIBRARY_PATH (see the README).
 set -euo pipefail
-: "${SPARK_HOME:?set SPARK_HOME to a Spark 3.5 distribution}"
+: "${SPARK_HOME:?set SPARK_HOME to a Spark 4.2 distribution}"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CP=$(ls "$HERE"/jars/*.jar | paste -sd: -)
 GPU_JVM="--enable-preview @$HERE/tornado-argfile --enable-native-access=ALL-UNNAMED -Dtornado.device.memory=${GPU_DEVICE_MEMORY:-20GB} -da:tornado... -da:uk.ac.manchester.tornado... ${GPU_JAVA_OPTS:-}"

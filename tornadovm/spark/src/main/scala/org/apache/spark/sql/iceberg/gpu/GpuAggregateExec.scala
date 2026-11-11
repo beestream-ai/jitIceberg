@@ -22,7 +22,7 @@ import org.apache.iceberg.expressions.{Expression => IcebergExpression}
 import org.apache.iceberg.tornadovm.DeviceValue
 import org.apache.iceberg.tornadovm.spark.GpuAggregates
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.Dataset
+import org.apache.spark.sql.classic.Dataset
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Left => _, Right => _, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression

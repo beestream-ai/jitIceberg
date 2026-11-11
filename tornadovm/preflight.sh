@@ -31,7 +31,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 JDK=21                    # the module and TornadoVM's JDK 21 SDK use preview features of exactly this JDK
 MIN_COMPUTE=7.0           # libcudf 26.08 ships code for sm_70 and newer
 MIN_DRIVER=525            # CUDA 12
-SPARK_LINE=3.5            # Spark 3.5, Scala 2.12
+SPARK_LINE=4.2            # Spark 4.2, Scala 2.13
 DEVICE_MEMORY=${GPU_DEVICE_MEMORY:-20GB}   # spark-submit-gpu's tornado.device.memory
 DRIVER_GB=24              # the driver memory the README uses
 
@@ -139,10 +139,10 @@ if [ -z "${SPARK_HOME:-}" ] || [ ! -x "$SPARK_HOME/bin/spark-submit" ]; then
 else
     core=$(ls "$SPARK_HOME"/jars/spark-core_*.jar 2>/dev/null | head -1)
     sv=$(basename "$core" .jar | sed 's/spark-core_//')
-    if [[ "$sv" == 2.12-$SPARK_LINE.* ]]; then
-        ok spark "Spark ${sv#2.12-} (Scala 2.12) at $SPARK_HOME"
+    if [[ "$sv" == 2.13-$SPARK_LINE.* ]]; then
+        ok spark "Spark ${sv#2.13-} (Scala 2.13) at $SPARK_HOME"
     else
-        fail spark "Spark '$sv' at $SPARK_HOME; need Spark $SPARK_LINE with Scala 2.12"
+        fail spark "Spark '$sv' at $SPARK_HOME; need Spark $SPARK_LINE with Scala 2.13"
     fi
     leftover=$(pgrep -f 'org.apache.spark.deploy.SparkSubmit' | paste -sd' ')
     [ -n "$leftover" ] && warn spark "SparkSubmit JVMs already running (pids $leftover): they hold the GPU and memory"
@@ -151,7 +151,7 @@ fi
 # --- the bundle, and whether it is older than the sources it is built from
 BUNDLE="$HERE/spark/build/spark-gpu/bin/spark-submit-gpu"
 if [ ! -x "$BUNDLE" ]; then
-    warn bundle "not built: ./gradlew -DsparkVersions=3.5 :iceberg-tornadovm-spark:sparkGpuBundle (needed for Spark)"
+    warn bundle "not built: ./gradlew -DsparkVersions=4.2 :iceberg-tornadovm-spark:sparkGpuBundle (needed for Spark)"
 else
     newer=$(find "$HERE/src/main" "$HERE/spark/src/main" -newer "$BUNDLE" -type f 2>/dev/null | head -1)
     if [ -n "$newer" ]; then

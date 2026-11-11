@@ -28,7 +28,7 @@ import org.apache.iceberg.types.Type.TypeID
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.Strategy
+import org.apache.spark.sql.classic.Strategy
 import org.apache.spark.sql.catalyst.expressions.{Left => _, Right => _, _}
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -270,8 +270,11 @@ object GpuAggregateStrategy extends Strategy with PredicateHelper with Logging {
   private[gpu] def currentTable(
       relation: DataSourceV2ScanRelation): Either[String, org.apache.iceberg.Table] =
     relation.relation.table match {
+      // Spark 4.2's SparkTable pins the snapshot it was loaded at, also when not time travelling:
+      // the scan reads the current state when that snapshot is the table's current one.
       case t: SparkTable
-          if t.snapshotId() == null &&
+          if (t.snapshotId() == null ||
+            Option(t.table().currentSnapshot()).exists(_.snapshotId() == t.snapshotId())) &&
             (t.branch() == null || t.branch() == "main") &&
             !relation.relation.options.keySet().asScala.exists(TimeTravel.contains) =>
         Right(t.table())

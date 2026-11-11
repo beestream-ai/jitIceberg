@@ -98,8 +98,8 @@ configure(jmhProjects) {
     }
   }
 
-  // The Spark 3.5 merge-on-read benchmarks also run on the GPU scan when that module is built.
-  if (project.name.startsWith('iceberg-spark-3.5_') && rootProject.findProject(':iceberg-tornadovm') != null) {
+  // The Spark 4.2 merge-on-read benchmarks also run on the GPU scan when that module is built.
+  if (project.name.startsWith('iceberg-spark-4.2_') && rootProject.findProject(':iceberg-tornadovm') != null) {
     dependencies {
       jmh project(':iceberg-tornadovm')
     }
