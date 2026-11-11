@@ -77,14 +77,25 @@ dependencies {
   testImplementation project(path: ':iceberg-core', configuration: 'testArtifacts')
 }
 
+// The SDK's argfile. SDKMAN installs ship only its template, with ${TORNADOVM_HOME} to expand.
+def tornadoArgfile = layout.buildDirectory.file('tornado-argfile')
+tasks.register('tornadoArgfile') {
+  outputs.file tornadoArgfile
+  doLast {
+    def argfile = file("${tornadoHome}/tornado-argfile")
+    tornadoArgfile.get().asFile.text = argfile.exists()
+        ? argfile.text
+        : file("${tornadoHome}/tornado-argfile.template").text.replace('${TORNADOVM_HOME}', tornadoHome)
+  }
+}
+
 test {
+  dependsOn 'tornadoArgfile'
   useJUnitPlatform()
-  // Device tests run in a TornadoVM JVM: the SDK's argfile puts TornadoVM on the module path and
-  // enables JVMCI. libcudf has to be on LD_LIBRARY_PATH (see tornadovm/README.md).
-  jvmArgs "@${tornadoHome}/tornado-argfile"
-  // With assertions on, Graal checks that every plugin the CUDA backend registers resolves, and one
-  // (TileContext.view over a ByteArray) does not in this TornadoVM build. Iceberg's own assertions
-  // stay on.
+  // Device tests run in a TornadoVM JVM: the SDK's argfile puts TornadoVM on the module path.
+  // libcudf has to be on LD_LIBRARY_PATH (see tornadovm/README.md).
+  jvmArgs "@${tornadoArgfile.get().asFile}"
+  // TornadoVM's own assertions are off; Iceberg's stay on.
   jvmArgs '-da:tornado...', '-da:uk.ac.manchester.tornado...', '--enable-native-access=ALL-UNNAMED'
   maxParallelForks = 1
 }

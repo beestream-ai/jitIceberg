@@ -75,7 +75,13 @@ case "$mode" in
         # plan released stay counted against it until reused by the same access type.
         # The heap stays under 32 GB: TornadoVM serializes object arguments (the path holders)
         # assuming compressed oops, which a larger heap turns off.
-        exec "$JAVA_HOME/bin/java" @"$TORNADOVM_HOME/tornado-argfile" --enable-native-access=ALL-UNNAMED -Xmx"${GPU_HEAP:-24g}" \
+        # SDKMAN installs ship only the argfile's template, with ${TORNADOVM_HOME} to expand.
+        ARGFILE="$TORNADOVM_HOME/tornado-argfile"
+        if [ ! -f "$ARGFILE" ]; then
+            ARGFILE="${TMPDIR:-/tmp}/tornado-argfile.$$"
+            sed "s|\${TORNADOVM_HOME}|$TORNADOVM_HOME|g" "$TORNADOVM_HOME/tornado-argfile.template" > "$ARGFILE"
+        fi
+        exec "$JAVA_HOME/bin/java" @"$ARGFILE" --enable-native-access=ALL-UNNAMED -Xmx"${GPU_HEAP:-24g}" \
             -Dtornado.device.memory="${TORNADO_DEVICE_MEMORY:-20GB}" --add-opens=java.base/java.nio=ALL-UNNAMED \
             -da:tornado... -da:uk.ac.manchester.tornado... -cp "$CP" \
             ${MAIN:-org.apache.iceberg.tornadovm.bench.MorBench} $( [ -n "${MAIN:-}" ] && echo "$@" || echo "$1 gpu ${*:2}" )
