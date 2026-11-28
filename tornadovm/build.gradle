@@ -80,6 +80,9 @@ dependencies {
 // The SDK's argfile. SDKMAN installs ship only its template, with ${TORNADOVM_HOME} to expand.
 def tornadoArgfile = layout.buildDirectory.file('tornado-argfile')
 tasks.register('tornadoArgfile') {
+  // The SDK path is an input, so pointing TORNADOVM_HOME at another SDK regenerates the argfile
+  // instead of reusing one that loads the previous SDK's modules.
+  inputs.property 'tornadoHome', tornadoHome ?: ''
   outputs.file tornadoArgfile
   doLast {
     def argfile = file("${tornadoHome}/tornado-argfile")
